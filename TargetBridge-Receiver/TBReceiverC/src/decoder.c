@@ -1,8 +1,12 @@
-/* decoder.c — FFmpeg HEVC hardware decoder.
+/* decoder.c — FFmpeg HEVC/H.264 hardware decoder (+ experimental ProRes).
  *
  * Strategy: VideoToolbox HW decode → av_hwframe_transfer_data → NV12 in CPU
  * memory → upload to SDL texture (Metal renderer). Single GPU→CPU→GPU hop,
  * acceptable for ~30 fps 2560×1440. Zero ObjC at this layer.
+ *
+ * ProRes (experimental fast path): no VideoToolbox hwaccel is exposed through
+ * FFmpeg, so ProRes decodes in software to a 4:2:2 (often 10-bit) frame, which
+ * libswscale then converts to the NV12 the renderer expects.
  */
 
 #include "decoder.h"
@@ -11,6 +15,7 @@
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
+#include <libswscale/swscale.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,11 +44,49 @@ struct tb_decoder {
     uint8_t          *scratch;
     size_t            scratch_cap;
 
+    /* software-decode → NV12 conversion (ProRes and other non-NV12 output) */
+    struct SwsContext *sws;
+    AVFrame          *nv12;
+    int               nv12_w;
+    int               nv12_h;
+    enum AVPixelFormat nv12_src_fmt;
+
     tb_frame_cb       cb;
     void             *ud;
 
     int               opened;
 };
+
+/* Lazily (re)build the NV12 scaler and convert `src` into d->nv12.
+ * Rebuilds whenever the source geometry or pixel format changes. */
+static int convert_to_nv12(struct tb_decoder *d, AVFrame *src) {
+    if (!d->nv12) {
+        d->nv12 = av_frame_alloc();
+        if (!d->nv12) return -1;
+    }
+    if (!d->sws || d->nv12_w != src->width || d->nv12_h != src->height ||
+        d->nv12_src_fmt != src->format) {
+        d->sws = sws_getCachedContext(d->sws,
+                                      src->width, src->height, src->format,
+                                      src->width, src->height, AV_PIX_FMT_NV12,
+                                      SWS_BILINEAR, NULL, NULL, NULL);
+        if (!d->sws) return -1;
+        av_frame_unref(d->nv12);
+        d->nv12->format = AV_PIX_FMT_NV12;
+        d->nv12->width  = src->width;
+        d->nv12->height = src->height;
+        if (av_frame_get_buffer(d->nv12, 32) < 0) return -1;
+        d->nv12_w       = src->width;
+        d->nv12_h       = src->height;
+        d->nv12_src_fmt = src->format;
+    }
+    if (av_frame_make_writable(d->nv12) < 0) return -1;
+    sws_scale(d->sws,
+              (const uint8_t * const *)src->data, src->linesize,
+              0, src->height,
+              d->nv12->data, d->nv12->linesize);
+    return 0;
+}
 
 /* Detect available HW device type (platform-specific). */
 static enum AVHWDeviceType pick_hwdev(void) {
@@ -130,6 +173,8 @@ void tb_dec_destroy(struct tb_decoder *d) {
     if (d->hw_frame) av_frame_free(&d->hw_frame);
     if (d->sw_frame) av_frame_free(&d->sw_frame);
     if (d->pkt)      av_packet_free(&d->pkt);
+    if (d->sws)      sws_freeContext(d->sws);
+    if (d->nv12)     av_frame_free(&d->nv12);
     av_free(d->extradata);   /* allocated with av_malloc */
     free(d->scratch);
     free(d);
@@ -146,6 +191,10 @@ static int build_extradata(struct tb_decoder *d,
         break;
     case 2:
         d->codec_id = AV_CODEC_ID_HEVC;
+        break;
+    case 3:
+        /* ProRes: software decode, no param sets (count is 0). */
+        d->codec_id = AV_CODEC_ID_PRORES;
         break;
     default:
         fprintf(stderr, "[dec] unsupported codec marker %u\n", (unsigned)payload[0]);
@@ -321,12 +370,20 @@ static int avcc_to_annexb(struct tb_decoder *d,
 int tb_dec_feed_frame(struct tb_decoder *d, const uint8_t *avcc, size_t len) {
     if (!d->opened) return -1;
 
-    uint8_t *anb = NULL;
-    size_t   anb_len = 0;
-    if (avcc_to_annexb(d, avcc, len, &anb, &anb_len) < 0) return -1;
-
-    d->pkt->data = anb;
-    d->pkt->size = (int)anb_len;
+    if (d->codec_id == AV_CODEC_ID_PRORES) {
+        /* ProRes frames are self-contained bitstreams, not AVCC/Annex B NAL
+         * units — feed the payload straight through. avcodec_send_packet
+         * consumes it synchronously here, so referencing the caller's buffer
+         * for the duration of the call is safe. */
+        d->pkt->data = (uint8_t *)avcc;
+        d->pkt->size = (int)len;
+    } else {
+        uint8_t *anb = NULL;
+        size_t   anb_len = 0;
+        if (avcc_to_annexb(d, avcc, len, &anb, &anb_len) < 0) return -1;
+        d->pkt->data = anb;
+        d->pkt->size = (int)anb_len;
+    }
 
     int r = avcodec_send_packet(d->ctx, d->pkt);
     if (r < 0 && r != AVERROR(EAGAIN)) {
@@ -375,7 +432,15 @@ int tb_dec_feed_frame(struct tb_decoder *d, const uint8_t *avcc, size_t len) {
         }
 
         if (out->format != AV_PIX_FMT_NV12) {
-            fprintf(stderr, "[dec] unexpected pix fmt %d\n", out->format);
+            /* Software-decoded output (e.g. ProRes → yuv422p / yuv422p10le)
+             * isn't NV12; convert before handing it to the renderer. */
+            if (convert_to_nv12(d, out) == 0) {
+                d->cb(d->nv12->data[0], d->nv12->linesize[0],
+                      d->nv12->data[1], d->nv12->linesize[1],
+                      d->nv12->width,   d->nv12->height, d->ud);
+            } else {
+                fprintf(stderr, "[dec] NV12 convert failed (pix fmt %d)\n", out->format);
+            }
         } else {
             d->cb(out->data[0], out->linesize[0],
                   out->data[1], out->linesize[1],

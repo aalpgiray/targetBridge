@@ -483,18 +483,26 @@ private final class TBVideoPipeline: @unchecked Sendable {
             return
         }
 
+        // ProRes is intra-only with a fixed profile-driven bitrate: it rejects
+        // rate control (AverageBitRate), profile levels, and keyframe-interval
+        // knobs. Only the timing/latency properties apply.
+        let isProRes = codecType == kCMVideoCodecType_AppleProRes422LT
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        if codecType == kCMVideoCodecType_HEVC {
-            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_HEVC_Main_AutoLevel)
-        } else {
-            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
+        if !isProRes {
+            if codecType == kCMVideoCodecType_HEVC {
+                VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_HEVC_Main_AutoLevel)
+            } else {
+                VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
+            }
         }
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: preset.expectedFrameRate))
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: preset.maxKeyFrameInterval))
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: NSNumber(value: preset.maxKeyFrameIntervalDuration))
+        if !isProRes {
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: preset.maxKeyFrameInterval))
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: NSNumber(value: preset.maxKeyFrameIntervalDuration))
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: preset.averageBitRate))
+        }
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: NSNumber(value: preset.maxFrameDelayCount))
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: preset.averageBitRate))
         if preset.prioritizeSpeed {
             VTSessionSetProperty(session, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
         }
@@ -623,6 +631,13 @@ private final class TBVideoPipeline: @unchecked Sendable {
     }
 
     private func buildParamSetsPacket(from format: CMVideoFormatDescription, codecType: CMVideoCodecType) -> Data? {
+        if codecType == kCMVideoCodecType_AppleProRes422LT {
+            // ProRes bitstreams are self-describing — no VPS/SPS/PPS. Emit only
+            // the codec marker (3) with a zero param-set count so the receiver
+            // can select the ProRes decoder. Sent every keyframe (every ProRes
+            // frame); the receiver de-dupes identical param sets without a rebuild.
+            return TBMonitorProtocol.makePacket(type: .paramSets, payload: Data([3, 0]))
+        }
         if codecType == kCMVideoCodecType_HEVC {
             var count = 0
             CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
@@ -1040,6 +1055,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// raw trigger key never reaches the slave.
     private var suppressedTriggerKeyCode: UInt16?
     private static var cachedSupportsHEVCHardwareEncode: Bool?
+    private static var cachedSupportsProResHardwareEncode: Bool?
     private var receivedInputEventCount: UInt64 = 0
     var onRemoteSwitchRequest: ((Int) -> Void)?
     var onRemoteDeactivateInputRequest: (() -> Void)?
@@ -1137,6 +1153,46 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         return supported
     }
 
+    /// Experimental intra-only ProRes fast path for the heaviest (5K) preset,
+    /// gated behind the `PRORES=1` environment toggle (matching the `QD`/`MPVP`/
+    /// `MIFEF` tunable convention). ProRes is all-keyframe, so it skips inter-frame
+    /// prediction — much faster to encode on the dedicated ProRes engine — at the
+    /// cost of far higher bitrate, which a Thunderbolt link can absorb.
+    private static let proResExperimentEnabled: Bool =
+        ProcessInfo.processInfo.environment["PRORES"] == "1"
+
+    private static func probeProResHardwareEncoderSupport() -> Bool {
+        if let cachedSupportsProResHardwareEncode {
+            return cachedSupportsProResHardwareEncode
+        }
+
+        let encoderSpecification: CFDictionary = [
+            kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String: true,
+            kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true
+        ] as CFDictionary
+
+        var session: VTCompressionSession?
+        let status = VTCompressionSessionCreate(
+            allocator: kCFAllocatorDefault,
+            width: 1920,
+            height: 1080,
+            codecType: kCMVideoCodecType_AppleProRes422LT,
+            encoderSpecification: encoderSpecification,
+            imageBufferAttributes: nil,
+            compressedDataAllocator: nil,
+            outputCallback: nil,
+            refcon: nil,
+            compressionSessionOut: &session
+        )
+        if let session {
+            VTCompressionSessionInvalidate(session)
+        }
+
+        let supported = status == noErr
+        cachedSupportsProResHardwareEncode = supported
+        return supported
+    }
+
     private func resolvedCodecType(for preset: TBDisplayCapturePreset, profile: TBMonitorDisplayProfile?) -> CMVideoCodecType {
         switch preset {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
@@ -1145,13 +1201,20 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return kCMVideoCodecType_HEVC
             }
             return kCMVideoCodecType_H264
-        case .crisp2160p60, .native5k:
+        case .crisp2160p60:
+            return preset.codecType
+        case .native5k:
+            if Self.proResExperimentEnabled, Self.probeProResHardwareEncoderSupport() {
+                return kCMVideoCodecType_AppleProRes422LT
+            }
             return preset.codecType
         }
     }
 
     private func codecName(for codecType: CMVideoCodecType) -> String {
-        codecType == kCMVideoCodecType_HEVC ? "HEVC" : "H.264"
+        if codecType == kCMVideoCodecType_AppleProRes422LT { return "ProRes 422 LT" }
+        if codecType == kCMVideoCodecType_HEVC { return "HEVC" }
+        return "H.264"
     }
 
     private func refreshLocalizedText() {

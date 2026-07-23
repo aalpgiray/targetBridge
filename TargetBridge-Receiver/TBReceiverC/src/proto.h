@@ -8,12 +8,14 @@
  * type 0x12 = create session ack (JSON)
  * type 0x13 = ui language update (JSON)
  * type 0x20 = parameter sets (H.264: SPS/PPS; HEVC: VPS/SPS/PPS)
- *   payload = [1 byte codec marker: 1=H.264, 2=HEVC][1 byte count]
+ *   payload = [1 byte codec marker: 1=H.264, 2=HEVC, 3=ProRes][1 byte count]
  *             then for each set: [4 bytes BE uint32 size][size bytes]
  *   (see build_extradata in decoder.c)
+ *   ProRes (marker 3) is self-describing and carries no param sets: count = 0.
  *
  * type 0x21 = video frame
  *   payload = AVCC-formatted NAL units, 4-byte BE length prefixes (no start codes)
+ *   for ProRes (marker 3): payload = one raw self-contained ProRes frame
  *
  * type 0x30 = heartbeat (JSON)
  * type 0x31 = teardown (JSON)
