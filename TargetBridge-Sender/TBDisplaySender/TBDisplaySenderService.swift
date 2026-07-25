@@ -16,6 +16,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     case smooth1800p60
     case crisp2160p60
     case native5k
+    case native5k60Experimental
 
     var id: String { rawValue }
 
@@ -31,6 +32,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "Crisp"
         case .native5k:
             return "5K"
+        case .native5k60Experimental:
+            return "5K 60 Experimental"
         }
     }
 
@@ -46,6 +49,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "3840 × 2160 @ 60"
         case .native5k:
             return "5120 × 2880 @ 48"
+        case .native5k60Experimental:
+            return "5120 × 2880 @ 60"
         }
     }
 
@@ -57,7 +62,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 3200
         case .crisp2160p60:
             return 3840
-        case .native5k:
+        case .native5k, .native5k60Experimental:
             return 5120
         }
     }
@@ -70,7 +75,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 1800
         case .crisp2160p60:
             return 2160
-        case .native5k:
+        case .native5k, .native5k60Experimental:
             return 2880
         }
     }
@@ -87,6 +92,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 105_000_000
         case .native5k:
             return 120_000_000
+        case .native5k60Experimental:
+            return 150_000_000
         }
     }
 
@@ -94,7 +101,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
             return "H.264"
-        case .crisp2160p60, .native5k:
+        case .crisp2160p60, .native5k, .native5k60Experimental:
             return "HEVC"
         }
     }
@@ -103,7 +110,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
             return kCMVideoCodecType_H264
-        case .crisp2160p60, .native5k:
+        case .crisp2160p60, .native5k, .native5k60Experimental:
             return kCMVideoCodecType_HEVC
         }
     }
@@ -127,6 +134,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .native5k:
             return 48
+        case .native5k60Experimental:
+            return 60
         }
     }
 
@@ -142,6 +151,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .native5k:
             return 48
+        case .native5k60Experimental:
+            return 60
         }
     }
 
@@ -153,7 +164,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 1
         case .smooth1800p60, .crisp2160p60:
             return 1
-        case .native5k:
+        case .native5k, .native5k60Experimental:
             return 1
         }
     }
@@ -162,7 +173,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return false
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5k60Experimental:
             return true
         }
     }
@@ -178,7 +189,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return 1
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5k60Experimental:
             return 0
         }
     }
@@ -187,7 +198,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return false
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5k60Experimental:
             return true
         }
     }
@@ -203,7 +214,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
             return .nominal
-        case .crisp2160p60, .native5k:
+        case .crisp2160p60, .native5k, .native5k60Experimental:
             return .best
         }
     }
@@ -218,6 +229,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .native5k:
             return 48
+        case .native5k60Experimental:
+            return 60
         }
     }
 
@@ -1145,7 +1158,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return kCMVideoCodecType_HEVC
             }
             return kCMVideoCodecType_H264
-        case .crisp2160p60, .native5k:
+        case .crisp2160p60, .native5k, .native5k60Experimental:
             return preset.codecType
         }
     }
@@ -2962,7 +2975,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 guard isStreaming, !sessionAckSent else { return }
                 let sentFrames = self.pipeline?.sentFramesSnapshot ?? 0
                 TBLog.connection.error("capture: first-frame timeout preset=\(self.capturePreset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) connected=\(self.isConnected, privacy: .public) sentFrames=\(sentFrames, privacy: .public)")
-                if self.capturePreset == .native5k {
+                if self.capturePreset == .native5k || self.capturePreset == .native5k60Experimental {
                     setStatus(.hevcNoFrames)
                 } else {
                     setStatus(.noFirstFrame)
