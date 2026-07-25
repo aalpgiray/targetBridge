@@ -15,10 +15,12 @@ enum TBTransportKind: String, CaseIterable, Identifiable {
         case (.thunderboltBridge, .italian): return "Thunderbolt Bridge"
         case (.thunderboltBridge, .english): return "Thunderbolt Bridge"
         case (.thunderboltBridge, .german): return "Thunderbolt Bridge"
+        case (.thunderboltBridge, .french): return "Thunderbolt Bridge"
         case (.thunderboltBridge, .chinese): return "Thunderbolt Bridge"
         case (.networkLink, .italian): return "Network Link (sperimentale)"
         case (.networkLink, .english): return "Network Link (experimental)"
         case (.networkLink, .german): return "Network Link (experimentell)"
+        case (.networkLink, .french): return "Network Link (expérimental)"
         case (.networkLink, .chinese): return "Network Link（实验性）"
         }
     }
@@ -189,6 +191,30 @@ final class TBDisplaySenderService: ObservableObject {
             return
         }
         NSWorkspace.shared.open(url)
+    }
+
+    func configurationChecks(for session: TBDisplaySenderSession) -> [TBConfigurationCheck] {
+        let interfaces = TBConnectionDiagnostics.currentIPv4Interfaces()
+        let role = session.inputControlRole
+        let snapshot = TBConfigurationDiagnosticSnapshot(
+            hasScreenRecording: CGPreflightScreenCaptureAccess(),
+            transportIsThunderbolt: session.transportKind == .thunderboltBridge,
+            localInterfaceName: TBConnectionDiagnostics.interfaceName(forLocalIP: session.localInterfaceIP, in: interfaces),
+            receiverAddress: session.receiverIP.trimmingCharacters(in: .whitespacesAndNewlines),
+            receiverProfileAvailable: session.receiverSupportsHEVCDecodeHint != nil,
+            receiverSupportsHEVC: session.receiverSupportsHEVCDecodeHint,
+            requiresHEVC: session.capturePreset.codecName == "HEVC",
+            cableRate: session.cableTestResult,
+            requiresSenderInputMonitoring: role == .senderMaster,
+            senderInputMonitoringGranted: localInputMonitoringTrusted,
+            requiresSenderAccessibility: role == .receiverMaster,
+            senderAccessibilityGranted: localInputInjectionTrusted,
+            requiresReceiverInputMonitoring: role == .receiverMaster,
+            receiverInputMonitoringGranted: session.receiverInputMonitoringTrustedHint,
+            requiresReceiverAccessibility: role == .senderMaster,
+            receiverAccessibilityGranted: session.receiverAccessibilityTrustedHint
+        )
+        return TBConfigurationDiagnostics.checks(for: snapshot)
     }
 
     func addSession() {

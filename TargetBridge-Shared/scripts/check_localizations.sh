@@ -4,7 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 languages_dir="$repo_root/TargetBridge-Shared/Languages"
 source_language="$languages_dir/en.json"
-languages=(de en it zh)
+languages=(de en fr it zh)
 status=0
 
 fail() {

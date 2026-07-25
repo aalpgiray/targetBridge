@@ -46,13 +46,14 @@ hardware-free Receiver testing:
 
 - Overview hub: [docs/Features.md](docs/Features.md)
 - Mirror mode and Extended Desktop: [docs/Features.md#display-modes](docs/Features.md#display-modes)
+- Guided configuration check: [docs/Features.md#guided-configuration-check](docs/Features.md#guided-configuration-check)
 - Multi-receiver layouts: [docs/Features.md#multi-receiver-workflows](docs/Features.md#multi-receiver-workflows)
 - Network Link (experimental): [docs/Features.md#network-link-experimental](docs/Features.md#network-link-experimental)
 - Audio Relay: [docs/Features.md#audio-relay](docs/Features.md#audio-relay)
 - Input Dockstation, clipboard sync, master/slave roles, and Receiver Master shortcuts: [docs/Features.md#input-dockstation](docs/Features.md#input-dockstation)
 - Remote brightness control: [docs/Features.md#remote-brightness-control](docs/Features.md#remote-brightness-control)
 - Remote connection & automation (URL scheme, launch args, SSH, login/wake): [docs/Automation.md](docs/Automation.md)
-- Shared translations and language files: [docs/Features.md#shared-translations](docs/Features.md#shared-translations)
+- Shared translations (English, Italian, German, French, and Chinese): [docs/Features.md#shared-translations](docs/Features.md#shared-translations)
 - Thunderbolt networking extras (SSH/SFTP, file sharing, Internet Sharing): [docs/Features.md#thunderbolt-networking-extras](docs/Features.md#thunderbolt-networking-extras)
 
 ## Core Features

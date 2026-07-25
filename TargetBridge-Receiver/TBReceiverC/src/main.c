@@ -194,6 +194,7 @@ static int tb_receiver_is_valid_language_pref(const char *language_pref) {
             strcmp(language_pref, "it") == 0 ||
             strcmp(language_pref, "en") == 0 ||
             strcmp(language_pref, "de") == 0 ||
+            strcmp(language_pref, "fr") == 0 ||
             strcmp(language_pref, "zh") == 0);
 }
 
@@ -270,6 +271,7 @@ static const char *tb_receiver_language_display_name(const char *language_code) 
     if (!language_code || !*language_code) language_code = "en";
     if (strcmp(language_code, "it") == 0) return tb_i18n_get("common.language.italian");
     if (strcmp(language_code, "de") == 0) return tb_i18n_get("common.language.german");
+    if (strcmp(language_code, "fr") == 0) return tb_i18n_get("common.language.french");
     if (strcmp(language_code, "zh") == 0) return tb_i18n_get("common.language.chinese");
     return tb_i18n_get("common.language.english");
 }
@@ -397,6 +399,8 @@ static void tb_receiver_cycle_language_preference(struct app *a) {
     } else if (strcmp(a->language_pref, "en") == 0) {
         snprintf(a->language_pref, sizeof(a->language_pref), "%s", "de");
     } else if (strcmp(a->language_pref, "de") == 0) {
+        snprintf(a->language_pref, sizeof(a->language_pref), "%s", "fr");
+    } else if (strcmp(a->language_pref, "fr") == 0) {
         snprintf(a->language_pref, sizeof(a->language_pref), "%s", "zh");
     } else {
         snprintf(a->language_pref, sizeof(a->language_pref), "%s", "auto");
