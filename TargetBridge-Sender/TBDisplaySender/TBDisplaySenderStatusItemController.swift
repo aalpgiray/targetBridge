@@ -7,6 +7,9 @@ final class TBDisplaySenderStatusItemController: NSObject {
     nonisolated(unsafe) private var statusItem: NSStatusItem?
     private var cancellables = Set<AnyCancellable>()
     private var hasActivated = false
+    // Retains the target objects for the current menu's sliders (NSSlider holds
+    // its target weakly). Cleared and rebuilt each time the menu opens.
+    private var sliderTargets: [TBMenuSliderTarget] = []
 
     init(service: TBDisplaySenderService) {
         self.service = service
@@ -94,6 +97,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
 
     private func rebuildMenuItems(in menu: NSMenu) {
         menu.removeAllItems()
+        sliderTargets.removeAll()
 
         let titleItem = NSMenuItem(title: "TargetBridge", action: nil, keyEquivalent: "")
         titleItem.isEnabled = false
@@ -103,17 +107,27 @@ final class TBDisplaySenderStatusItemController: NSObject {
         statusItem.isEnabled = false
         menu.addItem(statusItem)
 
-        if !service.localInterfaces.isEmpty {
-            let ipItem = NSMenuItem(title: TBDisplaySenderL10n.topBarIP(service.language, service.localInterfaceSummaryText), action: nil, keyEquivalent: "")
-            ipItem.isEnabled = false
-            menu.addItem(ipItem)
-        }
-
-        for session in service.sessions {
-            let line = "\(service.sessionTitle(for: session)): \(session.statusText)"
-            let sessionItem = NSMenuItem(title: line, action: nil, keyEquivalent: "")
-            sessionItem.isEnabled = false
-            menu.addItem(sessionItem)
+        // Brightness / volume sliders for each connected session. Reliable and
+        // native-feeling: they drive the receiver directly via the existing
+        // brightness/volume path — no event taps, no cursor/keyboard routing.
+        let connectedSessions = service.sessions.filter { $0.isConnected }
+        if !connectedSessions.isEmpty {
+            menu.addItem(.separator())
+            for session in connectedSessions {
+                if connectedSessions.count > 1 {
+                    let header = NSMenuItem(title: service.sessionTitle(for: session), action: nil, keyEquivalent: "")
+                    header.isEnabled = false
+                    menu.addItem(header)
+                }
+                menu.addItem(makeSliderItem(symbol: "sun.max", label: brightnessMenuLabel(), value: session.brightness) { [weak session] value in
+                    session?.brightness = value
+                })
+                if session.audioEnabled {
+                    menu.addItem(makeSliderItem(symbol: "speaker.wave.2.fill", label: volumeMenuLabel(), value: session.volume) { [weak session] value in
+                        session?.volume = value
+                    })
+                }
+            }
         }
 
         menu.addItem(.separator())
@@ -143,6 +157,26 @@ final class TBDisplaySenderStatusItemController: NSObject {
         stopAllItem.isEnabled = service.anyConnected
         menu.addItem(stopAllItem)
 
+        // The verbose connection/IP details live behind a submenu so the default
+        // menu stays focused on the useful actions.
+        if !service.localInterfaces.isEmpty || !service.sessions.isEmpty {
+            let infoItem = NSMenuItem(title: connectionInfoMenuLabel(), action: nil, keyEquivalent: "")
+            let infoSubmenu = NSMenu()
+            if !service.localInterfaces.isEmpty {
+                let ipItem = NSMenuItem(title: TBDisplaySenderL10n.topBarIP(service.language, service.localInterfaceSummaryText), action: nil, keyEquivalent: "")
+                ipItem.isEnabled = false
+                infoSubmenu.addItem(ipItem)
+            }
+            for session in service.sessions {
+                let line = "\(service.sessionTitle(for: session)): \(session.statusText)"
+                let sessionItem = NSMenuItem(title: line, action: nil, keyEquivalent: "")
+                sessionItem.isEnabled = false
+                infoSubmenu.addItem(sessionItem)
+            }
+            infoItem.submenu = infoSubmenu
+            menu.addItem(infoItem)
+        }
+
         let hideItem = NSMenuItem(
             title: TBDisplaySenderL10n.hideMenuBarIcon(service.language),
             action: #selector(hideStatusItem),
@@ -156,6 +190,64 @@ final class TBDisplaySenderStatusItemController: NSObject {
         let quitItem = NSMenuItem(title: TBDisplaySenderL10n.quitApp(service.language), action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
+    }
+
+    /// Builds a menu row with an icon and a 0…1 slider whose changes are pushed
+    /// live to `onChange` (which sets `session.brightness`/`.volume`, forwarding
+    /// to the receiver).
+    private func makeSliderItem(symbol: String, label: String, value: Double, onChange: @escaping (Double) -> Void) -> NSMenuItem {
+        let width: CGFloat = 240
+        let height: CGFloat = 24
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+
+        let icon = NSImageView(frame: NSRect(x: 14, y: (height - 15) / 2, width: 15, height: 15))
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+        icon.contentTintColor = .secondaryLabelColor
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        container.addSubview(icon)
+
+        let slider = NSSlider(frame: NSRect(x: 38, y: (height - 19) / 2, width: width - 38 - 14, height: 19))
+        slider.minValue = 0
+        slider.maxValue = 1
+        slider.doubleValue = value
+        slider.isContinuous = true
+        let target = TBMenuSliderTarget(onChange)
+        slider.target = target
+        slider.action = #selector(TBMenuSliderTarget.changed(_:))
+        sliderTargets.append(target)
+        container.addSubview(slider)
+
+        let item = NSMenuItem()
+        item.view = container
+        item.toolTip = label
+        return item
+    }
+
+    private func brightnessMenuLabel() -> String {
+        switch service.language {
+        case .italian: return "Luminosità"
+        case .english: return "Brightness"
+        case .german: return "Helligkeit"
+        case .chinese: return "亮度"
+        }
+    }
+
+    private func volumeMenuLabel() -> String {
+        switch service.language {
+        case .italian: return "Volume"
+        case .english: return "Volume"
+        case .german: return "Lautstärke"
+        case .chinese: return "音量"
+        }
+    }
+
+    private func connectionInfoMenuLabel() -> String {
+        switch service.language {
+        case .italian: return "Info connessione"
+        case .english: return "Connection info"
+        case .german: return "Verbindungsinfo"
+        case .chinese: return "连接信息"
+        }
     }
 
     // Menu-item handlers run while the menu is still dismissing. Doing work
@@ -210,5 +302,20 @@ final class TBDisplaySenderStatusItemController: NSObject {
 extension TBDisplaySenderStatusItemController: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         rebuildMenuItems(in: menu)
+    }
+}
+
+/// Target for a menu slider. NSSlider holds its target weakly, so the controller
+/// retains these for the lifetime of the open menu.
+@MainActor
+final class TBMenuSliderTarget: NSObject {
+    private let onChange: (Double) -> Void
+
+    init(_ onChange: @escaping (Double) -> Void) {
+        self.onChange = onChange
+    }
+
+    @objc func changed(_ sender: NSSlider) {
+        onChange(sender.doubleValue)
     }
 }
