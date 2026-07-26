@@ -288,6 +288,8 @@ private struct TBDisplaySenderSessionCard: View {
                     infoRow(TBDisplaySenderL10n.receiverLabel(service.language), session.receiverPanelText)
                     infoRow(TBDisplaySenderL10n.virtualDisplayLabel(service.language), session.virtualDisplayText)
                     infoRow(TBDisplaySenderL10n.streamLabel(service.language), session.streamResolutionText)
+                    infoRow(TBDisplaySenderL10n.videoPathLabel(service.language),
+                            TBDisplaySenderL10n.videoPathValue(isRaw: session.videoPathIsRaw, service.language))
                     infoRow(TBDisplaySenderL10n.fpsLabel(service.language), "\(session.senderFPS)")
                 }
             }

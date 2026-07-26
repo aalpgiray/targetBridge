@@ -16,8 +16,21 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     case smooth1800p60
     case crisp2160p60
     case native5k
+    case native5kRaw60
 
     var id: String { rawValue }
+
+    /// Raw NV12 passthrough presets stream uncompressed frames (no encoder on the
+    /// sender, no decoder on the receiver). Meant for a fat, direct Thunderbolt
+    /// link to a receiver that can't decode HEVC at this resolution/rate.
+    var isRawPassthrough: Bool {
+        switch self {
+        case .native5kRaw60:
+            return true
+        default:
+            return false
+        }
+    }
 
     var title: String {
         switch self {
@@ -31,6 +44,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "Crisp"
         case .native5k:
             return "5K"
+        case .native5kRaw60:
+            return "5K RAW"
         }
     }
 
@@ -46,6 +61,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "3840 × 2160 @ 60"
         case .native5k:
             return "5120 × 2880 @ 48"
+        case .native5kRaw60:
+            return "5120 × 2880 @ 60 (RAW)"
         }
     }
 
@@ -57,7 +74,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 3200
         case .crisp2160p60:
             return 3840
-        case .native5k:
+        case .native5k, .native5kRaw60:
             return 5120
         }
     }
@@ -70,7 +87,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 1800
         case .crisp2160p60:
             return 2160
-        case .native5k:
+        case .native5k, .native5kRaw60:
             return 2880
         }
     }
@@ -85,7 +102,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 78_000_000
         case .crisp2160p60:
             return 105_000_000
-        case .native5k:
+        case .native5k, .native5kRaw60:
             return 120_000_000
         }
     }
@@ -96,6 +113,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "H.264"
         case .crisp2160p60, .native5k:
             return "HEVC"
+        case .native5kRaw60:
+            return "RAW NV12"
         }
     }
 
@@ -103,7 +122,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
             return kCMVideoCodecType_H264
-        case .crisp2160p60, .native5k:
+        case .crisp2160p60, .native5k, .native5kRaw60:
             return kCMVideoCodecType_HEVC
         }
     }
@@ -127,6 +146,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .native5k:
             return 48
+        case .native5kRaw60:
+            return 60
         }
     }
 
@@ -142,6 +163,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .native5k:
             return 48
+        case .native5kRaw60:
+            return 60
         }
     }
 
@@ -153,7 +176,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 1
         case .smooth1800p60, .crisp2160p60:
             return 1
-        case .native5k:
+        case .native5k, .native5kRaw60:
             return 1
         }
     }
@@ -162,7 +185,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return false
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5kRaw60:
             return true
         }
     }
@@ -178,7 +201,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return 1
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5kRaw60:
             return 0
         }
     }
@@ -187,7 +210,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return false
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5kRaw60:
             return true
         }
     }
@@ -203,7 +226,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
             return .nominal
-        case .crisp2160p60, .native5k:
+        case .crisp2160p60, .native5k, .native5kRaw60:
             return .best
         }
     }
@@ -218,6 +241,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .native5k:
             return 48
+        case .native5kRaw60:
+            return 60
         }
     }
 
@@ -510,10 +535,19 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// an older Intel Mac whose HEVC decoder struggles at high resolutions — at
     /// the price of much higher bandwidth (~10.6 Gb/s for 5K@60 4:2:0), which a
     /// direct Thunderbolt Bridge link comfortably sustains.
-    private var rawEnabled: Bool {
+    /// Env override for power users / automation. The UI toggle is the primary
+    /// switch; `RAW=1` in the environment forces it on regardless of the setting.
+    private var rawEnvOverride: Bool {
         guard let v = ProcessInfo.processInfo.environment["RAW"] else { return false }
         return v == "1" || v.lowercased() == "true"
     }
+
+    private var rawEnabled: Bool { preset.isRawPassthrough || rawEnvOverride }
+
+    /// Read-only view of the active video path, for the UI and telemetry.
+    /// Reports the *same* flag `encode()` branches on, so what the UI shows can
+    /// never disagree with what the wire actually carries.
+    var rawPassthroughActive: Bool { rawEnabled }
 
     /// SCStream capture path. Must be dispatched onto `queue` by the caller.
     func encode(_ sampleBuffer: CMSampleBuffer) {
@@ -996,6 +1030,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     var receiverInputMonitoringTrustedHint: Bool?
     var receiverAccessibilityTrustedHint: Bool?
     @Published var senderFPS = 0
+    /// Active video path for this session, mirrored from the pipeline on the first
+    /// frame. `true` = raw NV12 passthrough (`RAW=1`), `false` = HEVC. Drives the
+    /// "Video path" row in the session card.
+    @Published var videoPathIsRaw = false
     // Live FPS readout. Kept on a dedicated observable so its once-per-second
     // update only re-renders the small FPS subview — not the whole session card
     // or (via the manager's objectWillChange bubble-up) the entire window.
@@ -1220,7 +1258,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return kCMVideoCodecType_HEVC
             }
             return kCMVideoCodecType_H264
-        case .crisp2160p60, .native5k:
+        case .crisp2160p60, .native5k, .native5kRaw60:
             return preset.codecType
         }
     }
@@ -2979,6 +3017,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         isStreaming = false
         liveMetrics.senderFPS = 0
         senderFPS = 0
+        videoPathIsRaw = false
         sentSnapshot = 0
         cursorDisplayID = kCGNullDirectDisplay
         lastCursorPacket = nil
@@ -2995,7 +3034,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         sessionAckSent = true
         firstFrameTimer?.invalidate()
         firstFrameTimer = nil
-        TBLog.connection.info("capture: first encoded frame received")
+        // Mirror the pipeline's actual path so the UI can't misreport it.
+        videoPathIsRaw = pipeline?.rawPassthroughActive ?? false
+        TBLog.connection.info("capture: first frame received path=\(self.videoPathIsRaw ? "raw-nv12" : "hevc", privacy: .public)")
         setStatus(.captureActive(capturePreset.description, activeCodecName ?? capturePreset.codecName, captureSource))
     }
 

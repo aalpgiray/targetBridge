@@ -287,6 +287,14 @@ enum TBDisplaySenderL10n {
         text("sender.label.capture", language)
     }
 
+    static func videoPathLabel(_ language: TBDisplaySenderLanguage) -> String {
+        text("sender.label.video_path", language)
+    }
+
+    static func videoPathValue(isRaw: Bool, _ language: TBDisplaySenderLanguage) -> String {
+        text(isRaw ? "sender.video_path.raw" : "sender.video_path.hevc", language)
+    }
+
     static func stateLabel(_ language: TBDisplaySenderLanguage) -> String {
         text("sender.label.state", language)
     }
@@ -539,6 +547,8 @@ extension TBDisplayCapturePreset {
         case .crisp2160p60:
             return TBDisplaySenderL10n.text("sender.profile.crisp", language)
         case .native5k:
+            return TBDisplaySenderL10n.text("sender.profile.native_5k", language)
+        case .native5kRaw60:
             return TBDisplaySenderL10n.text("sender.profile.native_5k", language)
         }
     }
