@@ -34,6 +34,7 @@ struct tb_display {
     SDL_Texture  *tex;
     SDL_Texture  *status_tex;
     int           tex_w, tex_h;
+    Uint32        tex_format;   /* NV12 (4:2:0) or ARGB8888 (4:4:4 BGRA) */
     int           quit;
     int           preferred_fullscreen;
     int           is_connected;
@@ -640,20 +641,24 @@ void tb_disp_destroy(struct tb_display *d) {
     free(d);
 }
 
-int tb_disp_ensure_texture(struct tb_display *d, int w, int h) {
-    if (d->tex && d->tex_w == w && d->tex_h == h) return 0;
+static int tb_disp_ensure_texture_fmt(struct tb_display *d, int w, int h, Uint32 fmt) {
+    if (d->tex && d->tex_w == w && d->tex_h == h && d->tex_format == fmt) return 0;
     if (d->tex) { SDL_DestroyTexture(d->tex); d->tex = NULL; }
 
-    d->tex = SDL_CreateTexture(d->ren, SDL_PIXELFORMAT_NV12,
-                               SDL_TEXTUREACCESS_STREAMING, w, h);
+    d->tex = SDL_CreateTexture(d->ren, fmt, SDL_TEXTUREACCESS_STREAMING, w, h);
     if (!d->tex) {
-        fprintf(stderr, "[disp] CreateTexture(NV12): %s\n", SDL_GetError());
+        fprintf(stderr, "[disp] CreateTexture(%u): %s\n", (unsigned)fmt, SDL_GetError());
         return -1;
     }
     d->tex_w = w;
     d->tex_h = h;
-    fprintf(stderr, "[disp] texture %dx%d NV12\n", w, h);
+    d->tex_format = fmt;
+    fprintf(stderr, "[disp] texture %dx%d fmt=%s\n", w, h, SDL_GetPixelFormatName(fmt));
     return 0;
+}
+
+int tb_disp_ensure_texture(struct tb_display *d, int w, int h) {
+    return tb_disp_ensure_texture_fmt(d, w, h, SDL_PIXELFORMAT_NV12);
 }
 
 static void tb_disp_draw_poly_outline(SDL_Renderer *ren, const SDL_Point *pts, int count) {
@@ -1133,6 +1138,22 @@ void tb_disp_render_nv12(struct tb_display *d,
                             y,  y_stride,
                             uv, uv_stride) < 0) {
         fprintf(stderr, "[disp] UpdateNVTexture: %s\n", SDL_GetError());
+        return;
+    }
+    d->last_video_frame_time = SDL_GetTicks();
+    tb_disp_render_current(d);
+}
+
+void tb_disp_render_rgba(struct tb_display *d,
+                         const uint8_t *rgba, int stride,
+                         int w, int h) {
+    /* macOS 32BGRA == SDL_PIXELFORMAT_ARGB8888 on little-endian (bytes B,G,R,A).
+     * Full 4:4:4, no chroma reconstruction — a plain packed-RGB blit. */
+    if (tb_disp_ensure_texture_fmt(d, w, h, SDL_PIXELFORMAT_ARGB8888) < 0) return;
+    tb_disp_set_connection_state(d, 1);
+
+    if (SDL_UpdateTexture(d->tex, NULL, rgba, stride) < 0) {
+        fprintf(stderr, "[disp] UpdateTexture(RGBA): %s\n", SDL_GetError());
         return;
     }
     d->last_video_frame_time = SDL_GetTicks();

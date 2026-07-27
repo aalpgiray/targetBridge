@@ -593,6 +593,12 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                         .disabled(session.isConnected || session.isStreaming)
                     }
 
+                    settingRow(fullColorTitle, details: fullColorDetails) {
+                        Toggle("", isOn: $session.fullColor444)
+                            .labelsHidden()
+                            .disabled(session.isConnected || session.isStreaming)
+                    }
+
                     settingRow(dualCableTitle, details: dualCableDetails) {
                         Toggle("", isOn: $session.dualCableEnabled)
                             .labelsHidden()
@@ -1002,6 +1008,20 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         }
     }
 
+    private var fullColorTitle: String {
+        switch service.language {
+        case .italian: return "Colore pieno 4:4:4"
+        case .english: return "Full color (4:4:4)"
+        case .german: return "Vollfarbe (4:4:4)"
+        case .chinese: return "全彩 4:4:4"
+        }
+    }
+    private var fullColorDetails: String {
+        switch service.language {
+        case .english: return "Send uncompressed 8-bit RGB (no chroma subsampling) for crisp colored edges/text. ~28 Gb/s at 5K@60 — pair with Dual cable. Raw presets only."
+        default: return "Invia RGB 8-bit non compresso (nessun sottocampionamento croma). ~28 Gb/s a 5K@60 — usare con Doppio cavo. Solo preset raw."
+        }
+    }
     private var dualCableTitle: String {
         switch service.language {
         case .italian: return "Doppio cavo (dual-link)"

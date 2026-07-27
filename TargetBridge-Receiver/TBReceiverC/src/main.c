@@ -894,18 +894,36 @@ static void on_frame(const uint8_t *y, int y_stride,
  * Payload: [1: format=1(NV12)][BE32 w][BE32 h][BE32 yStride][BE32 uvStride]
  *          [Y plane: yStride*h][CbCr plane: uvStride*(h/2)] */
 static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
-    if (len < 17) return;
-    if (p[0] != 1) return; /* only NV12 is supported */
-    uint32_t w  = ((uint32_t)p[1]  << 24) | ((uint32_t)p[2]  << 16) | ((uint32_t)p[3]  << 8) | (uint32_t)p[4];
-    uint32_t h  = ((uint32_t)p[5]  << 24) | ((uint32_t)p[6]  << 16) | ((uint32_t)p[7]  << 8) | (uint32_t)p[8];
-    uint32_t ys = ((uint32_t)p[9]  << 24) | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 8) | (uint32_t)p[12];
-    uint32_t us = ((uint32_t)p[13] << 24) | ((uint32_t)p[14] << 16) | ((uint32_t)p[15] << 8) | (uint32_t)p[16];
-    if (w == 0 || h == 0 || ys < w || us < w) return;
-    size_t y_size  = (size_t)ys * h;
-    size_t uv_size = (size_t)us * (h / 2);
-    if (len < (size_t)17 + y_size + uv_size) return;
-    const uint8_t *y  = p + 17;
-    const uint8_t *uv = y + y_size;
+    if (len < 13) return;
+    uint8_t format = p[0];  /* 1 = NV12 4:2:0, 2 = BGRA8888 4:4:4 */
+    uint32_t w = ((uint32_t)p[1] << 24) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 8) | (uint32_t)p[4];
+    uint32_t h = ((uint32_t)p[5] << 24) | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 8) | (uint32_t)p[8];
+    /* Sanity bounds: reject implausible dimensions so the size math below can't
+     * overflow on a malformed packet. */
+    if (w == 0 || h == 0 || w > 16384 || h > 16384) return;
+
+    const uint8_t *y = NULL, *uv = NULL, *rgba = NULL;
+    uint32_t ys = 0, us = 0, stride = 0;
+
+    if (format == 1) {
+        if (len < 17) return;
+        ys = ((uint32_t)p[9]  << 24) | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 8) | (uint32_t)p[12];
+        us = ((uint32_t)p[13] << 24) | ((uint32_t)p[14] << 16) | ((uint32_t)p[15] << 8) | (uint32_t)p[16];
+        if (ys < w || us < w) return;
+        size_t y_size  = (size_t)ys * h;
+        size_t uv_size = (size_t)us * (h / 2);
+        if (len < (size_t)17 + y_size + uv_size) return;
+        y  = p + 17;
+        uv = y + y_size;
+    } else if (format == 2) {
+        stride = ((uint32_t)p[9] << 24) | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 8) | (uint32_t)p[12];
+        if ((uint64_t)stride < (uint64_t)w * 4) return;   /* 4 bytes/pixel */
+        size_t size = (size_t)stride * h;
+        if (len < (size_t)13 + size) return;
+        rgba = p + 13;
+    } else {
+        return;  /* unknown format */
+    }
 
     a->have_video_frame = 1;
     tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
@@ -920,7 +938,11 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
         snprintf(height_text, sizeof(height_text), "%u", h);
         tb_format_i18n(a->mode_text, sizeof(a->mode_text), "receiver.mode.receiving", pairs, 2);
     }
-    tb_disp_render_nv12(a->disp, y, (int)ys, uv, (int)us, (int)w, (int)h);
+    if (format == 1) {
+        tb_disp_render_nv12(a->disp, y, (int)ys, uv, (int)us, (int)w, (int)h);
+    } else {
+        tb_disp_render_rgba(a->disp, rgba, (int)stride, (int)w, (int)h);
+    }
     a->frames++;
 }
 

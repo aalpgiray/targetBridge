@@ -700,7 +700,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         guard running,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
-        guard CVPixelBufferGetPlaneCount(pixelBuffer) >= 2 else { return }
+        let planar = CVPixelBufferGetPlaneCount(pixelBuffer) >= 2
 
         // Dual-cable: alternate whole frames across the two links (even →
         // primary, odd → secondary). Backpressure is per-link so a stall on one
@@ -717,39 +717,53 @@ private final class TBVideoPipeline: @unchecked Sendable {
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
-        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
-              let uvBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1)
-        else { return }
-        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
-        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
-        let yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
-        let uvStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
-        let uvHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)
-        let ySize = yStride * height
-        let uvSize = uvStride * uvHeight
-
         // Send the session ack on the first frame, mirroring the encoded path.
         if !ackSent {
             ackSent = true
-            let ack = TBMonitorCreateSessionAck(
-                accepted: true,
-                displayName: displayName,
-                displayID: displayID
-            )
+            let ack = TBMonitorCreateSessionAck(accepted: true, displayName: displayName, displayID: displayID)
             if let packet = TBMonitorProtocol.makeJSONPacket(type: .createSessionAck, value: ack) {
                 connection.send(content: packet, completion: .contentProcessed({ _ in }))
             }
             onFirstFrame()
         }
 
-        var payload = Data(capacity: 17 + ySize + uvSize)
-        payload.append(1) // format: NV12
-        TBMonitorProtocol.appendBE32(&payload, UInt32(width))
-        TBMonitorProtocol.appendBE32(&payload, UInt32(height))
-        TBMonitorProtocol.appendBE32(&payload, UInt32(yStride))
-        TBMonitorProtocol.appendBE32(&payload, UInt32(uvStride))
-        payload.append(UnsafeBufferPointer(start: yBase.assumingMemoryBound(to: UInt8.self), count: ySize))
-        payload.append(UnsafeBufferPointer(start: uvBase.assumingMemoryBound(to: UInt8.self), count: uvSize))
+        let payload: Data
+        if planar {
+            // NV12 (4:2:0) — two planes. format byte = 1.
+            guard let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
+                  let uvBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1)
+            else { return }
+            let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+            let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+            let yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+            let uvStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
+            let uvHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)
+            let ySize = yStride * height
+            let uvSize = uvStride * uvHeight
+            var p = Data(capacity: 17 + ySize + uvSize)
+            p.append(1) // format: NV12 4:2:0
+            TBMonitorProtocol.appendBE32(&p, UInt32(width))
+            TBMonitorProtocol.appendBE32(&p, UInt32(height))
+            TBMonitorProtocol.appendBE32(&p, UInt32(yStride))
+            TBMonitorProtocol.appendBE32(&p, UInt32(uvStride))
+            p.append(UnsafeBufferPointer(start: yBase.assumingMemoryBound(to: UInt8.self), count: ySize))
+            p.append(UnsafeBufferPointer(start: uvBase.assumingMemoryBound(to: UInt8.self), count: uvSize))
+            payload = p
+        } else {
+            // BGRA (4:4:4, 8-bit) — one packed plane. format byte = 2.
+            guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+            let width = CVPixelBufferGetWidth(pixelBuffer)
+            let height = CVPixelBufferGetHeight(pixelBuffer)
+            let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
+            let size = stride * height
+            var p = Data(capacity: 13 + size)
+            p.append(2) // format: BGRA8888 4:4:4
+            TBMonitorProtocol.appendBE32(&p, UInt32(width))
+            TBMonitorProtocol.appendBE32(&p, UInt32(height))
+            TBMonitorProtocol.appendBE32(&p, UInt32(stride))
+            p.append(UnsafeBufferPointer(start: base.assumingMemoryBound(to: UInt8.self), count: size))
+            payload = p
+        }
 
         let packet = TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
         if useSecondary { pendingVideoPacketsSecondary += 1 } else { pendingVideoPackets += 1 }
@@ -1003,6 +1017,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     @Published var dualCableEnabled = false
     @Published var secondaryLocalInterfaceIP = ""
     @Published var secondaryReceiverIP = ""
+    // Full-color 4:4:4: capture 8-bit BGRA instead of 4:2:0 NV12 — no chroma
+    // subsampling, so colored edges/text are crisp. ~28 Gb/s at 5K@60, so it
+    // realistically needs dual-cable. Raw presets only.
+    @Published var fullColor444 = false
     @Published var selectedReceiverID = "" {
         didSet {
             if selectedReceiverID.isEmpty {
@@ -2429,7 +2447,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             configuration.height = preset.height
             configuration.minimumFrameInterval = CMTime(value: 1, timescale: Int32(preset.expectedFrameRate))
             configuration.queueDepth = preset.queueDepth
-            configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            // Full-color 4:4:4 raw = capture packed BGRA; otherwise 4:2:0 NV12.
+            if fullColor444 && preset.isRawPassthrough {
+                configuration.pixelFormat = kCVPixelFormatType_32BGRA
+            } else {
+                configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            }
             configuration.showsCursor = !largeCursor
             configuration.scalesToFit = true
             configuration.captureResolution = preset.captureResolution
