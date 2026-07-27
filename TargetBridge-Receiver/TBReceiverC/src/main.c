@@ -67,6 +67,10 @@ struct app {
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
     int      close_requested;
     int      have_video_frame;
+    /* A real streaming session has begun (the sender sent a session packet, not
+     * just a transient probe like a UI-language push). Gates the fullscreen
+     * "connecting" splash so a bare/short-lived connection doesn't flash it. */
+    int      session_active;
 
     char     ip_text[64];
     char     tb_ip_text[64];
@@ -1013,19 +1017,23 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
 
             tb_set_receiver_mode_requested(a->mode_text, sizeof(a->mode_text), capture_w, capture_h, source, preset, codec);
         }
+        a->session_active = 1;
         fprintf(stderr, "[main] hello from sender\n");
         tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.sender_connected_profile_sent");
         break;
     case TB_PKT_CREATE_SESSION_ACK:
+        a->session_active = 1;
         fprintf(stderr, "[main] sender session ack: %.*s\n", (int)len, (const char *)payload);
         tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.session_accepted_waiting_frames");
         break;
     case TB_PKT_PARAM_SETS:
+        a->session_active = 1;
         /* tb_dec_set_param_sets is now a no-op if the sets are unchanged,
          * so we don't spam a log line per keyframe. */
         tb_dec_set_param_sets(a->dec, payload, len);
         break;
     case TB_PKT_FRAME:
+        a->session_active = 1;
         tb_dec_feed_frame(a->dec, payload, len);
         break;
     case TB_PKT_CURSOR:
@@ -1631,6 +1639,7 @@ static void send_receiver_info(struct app *a) {
 static void close_client(struct app *a) {
     if (a->client_fd >= 0) close(a->client_fd);
     a->client_fd = -1;
+    a->session_active = 0;
     a->close_requested = 0;
     a->have_video_frame = 0;
     snprintf(a->input_control_mode, sizeof(a->input_control_mode), "off");
@@ -1823,6 +1832,7 @@ int main(int argc, char **argv) {
             if (c >= 0) {
                 a.client_fd = c;
                 a.have_video_frame = 0;
+                a.session_active = 0;
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] client connected\n");
@@ -1859,7 +1869,10 @@ int main(int argc, char **argv) {
             tb_receiver_poll_permissions(&a);
         }
 
-        if (a.client_fd < 0) {
+        if (a.client_fd < 0 || !a.session_active) {
+            /* No client, or a connection that hasn't started a real streaming
+             * session (e.g. a transient UI-language push during discovery):
+             * stay on the windowed waiting screen, don't flash fullscreen. */
             tb_disp_render_status(a.disp, a.display_host, a.status_text, a.sender_text, a.panel_text, a.mode_text, a.language_text, a.permissions_text);
         } else if (!a.have_video_frame) {
             tb_disp_render_connecting(a.disp);
