@@ -48,7 +48,9 @@ final class TBDisplaySenderService: ObservableObject {
         didSet {
             language.persist()
             sessions.forEach { $0.language = language }
-            pushLanguageUpdateToDiscoveredReceivers()
+            // Language actually changed: re-sync every discovered receiver.
+            languageSyncedReceiverIDs.removeAll()
+            syncLanguageToNewlyDiscoveredReceivers()
             objectWillChange.send()
         }
     }
@@ -102,6 +104,11 @@ final class TBDisplaySenderService: ObservableObject {
     private let addonStore = TBAddonStore.shared
     private let inputRelayController = TBInputRelayController()
     private var discoveryCancellable: AnyCancellable?
+    // Receivers we've already pushed the current UI language to. Bonjour re-emits
+    // the discovered set repeatedly, so without this we'd reopen a TCP connection
+    // to every receiver on each tick — which makes an idle receiver flash its
+    // fullscreen "connecting" splash even though nothing is streaming.
+    private var languageSyncedReceiverIDs: Set<String> = []
     private var addonCancellable: AnyCancellable?
     private var clipboardTimer: Timer?
     private var lastClipboardChangeCount: Int = NSPasteboard.general.changeCount
@@ -110,7 +117,7 @@ final class TBDisplaySenderService: ObservableObject {
         discoveryCancellable = receiverDiscovery.$receivers.sink { [weak self] receivers in
             guard let self else { return }
             discoveredReceivers = receivers
-            pushLanguageUpdateToDiscoveredReceivers()
+            syncLanguageToNewlyDiscoveredReceivers()
             objectWillChange.send()
         }
         addonCancellable = addonStore.$addons.sink { [weak self] addons in
@@ -623,15 +630,24 @@ final class TBDisplaySenderService: ObservableObject {
         }
     }
 
-    private func pushLanguageUpdateToDiscoveredReceivers() {
-        let receivers = discoveredReceivers
+    /// Pushes the UI language only to receivers we haven't synced yet, so a stable
+    /// Bonjour discovery stream (the same set re-emitted on every tick) doesn't
+    /// reopen a connection to each receiver — the transient connections made an
+    /// idle receiver toggle into its fullscreen "connecting" splash and back.
+    private func syncLanguageToNewlyDiscoveredReceivers() {
+        // Forget receivers that went away so they re-sync if they reappear.
+        languageSyncedReceiverIDs.formIntersection(Set(discoveredReceivers.map(\.id)))
+        let newReceivers = discoveredReceivers.filter { !languageSyncedReceiverIDs.contains($0.id) }
+        guard !newReceivers.isEmpty else { return }
+
         let languageCode = language.fileStem
-        for receiver in receivers {
+        for receiver in newReceivers {
             let candidateIPs = [receiver.preferredIP, receiver.thunderboltIP, receiver.networkIP]
             var sentTo = Set<String>()
             for ip in candidateIPs where !ip.isEmpty && sentTo.insert(ip).inserted {
                 sendLanguageUpdate(to: ip, languageCode: languageCode)
             }
+            languageSyncedReceiverIDs.insert(receiver.id)
         }
     }
 
