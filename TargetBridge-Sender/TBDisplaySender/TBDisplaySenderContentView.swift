@@ -593,6 +593,26 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                         .disabled(session.isConnected || session.isStreaming)
                     }
 
+                    settingRow(dualCableTitle, details: dualCableDetails) {
+                        Toggle("", isOn: $session.dualCableEnabled)
+                            .labelsHidden()
+                            .disabled(session.isConnected || session.isStreaming)
+                    }
+                    if session.dualCableEnabled {
+                        settingRow(dualCableLocalTitle, details: dualCableLocalDetails) {
+                            TextField("10.0.2.1", text: $session.secondaryLocalInterfaceIP)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 150)
+                                .disabled(session.isConnected || session.isStreaming)
+                        }
+                        settingRow(dualCableReceiverTitle, details: dualCableReceiverDetails) {
+                            TextField("10.0.2.2", text: $session.secondaryReceiverIP)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 150)
+                                .disabled(session.isConnected || session.isStreaming)
+                        }
+                    }
+
                     if session.captureSource == .extendedDesktop {
                         settingRow(renderMatchingTitle, details: renderMatchingDetails) {
                             Toggle("", isOn: $session.matchRenderToStream)
@@ -982,6 +1002,50 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         }
     }
 
+    private var dualCableTitle: String {
+        switch service.language {
+        case .italian: return "Doppio cavo (dual-link)"
+        case .english: return "Dual cable (two Thunderbolt links)"
+        case .german: return "Doppelkabel (zwei Thunderbolt-Links)"
+        case .chinese: return "双线缆（双 Thunderbolt 链路）"
+        }
+    }
+    private var dualCableDetails: String {
+        switch service.language {
+        case .italian: return "Divide i fotogrammi su due cavi Thunderbolt per raddoppiare la banda (per formati come 10-bit 4:4:4). Richiede due interfacce con IP separati."
+        case .english: return "Splits frames across two Thunderbolt cables to roughly double bandwidth (for formats like 10-bit 4:4:4). Requires two interfaces on separate subnets."
+        case .german: return "Verteilt Frames auf zwei Thunderbolt-Kabel, um die Bandbreite etwa zu verdoppeln (für Formate wie 10-Bit 4:4:4). Erfordert zwei Schnittstellen in getrennten Subnetzen."
+        case .chinese: return "将帧拆分到两条 Thunderbolt 线缆以大致翻倍带宽（用于 10-bit 4:4:4 等格式）。需要两个位于不同子网的接口。"
+        }
+    }
+    private var dualCableLocalTitle: String {
+        switch service.language {
+        case .italian: return "Cavo 2 · IP locale"
+        case .english: return "Cable 2 · local IP"
+        case .german: return "Kabel 2 · lokale IP"
+        case .chinese: return "线缆 2 · 本机 IP"
+        }
+    }
+    private var dualCableLocalDetails: String {
+        switch service.language {
+        case .english: return "This Mac's second Thunderbolt interface IP (e.g. 10.0.2.1)."
+        default: return "IP della seconda interfaccia Thunderbolt di questo Mac (es. 10.0.2.1)."
+        }
+    }
+    private var dualCableReceiverTitle: String {
+        switch service.language {
+        case .italian: return "Cavo 2 · IP receiver"
+        case .english: return "Cable 2 · receiver IP"
+        case .german: return "Kabel 2 · Empfänger-IP"
+        case .chinese: return "线缆 2 · 接收端 IP"
+        }
+    }
+    private var dualCableReceiverDetails: String {
+        switch service.language {
+        case .english: return "The receiver's second Thunderbolt IP (e.g. 10.0.2.2)."
+        default: return "IP della seconda interfaccia Thunderbolt del receiver (es. 10.0.2.2)."
+        }
+    }
     private var renderMatchingTitle: String {
         switch service.language {
         case .italian: return "Rendering alla risoluzione dello stream"

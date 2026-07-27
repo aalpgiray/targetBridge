@@ -56,9 +56,14 @@ struct app {
     struct tb_display *disp;
     struct tb_decoder *dec;
     struct tb_parser   parser;
+    /* Dual-cable: a second client connection (cable 2) that carries half the
+     * interleaved frames. Fed through its own parser into the same on_packet
+     * handler, so frames from both links render identically. */
+    struct tb_parser   parser2;
 
     int      server_fd;
     int      client_fd;
+    int      client_fd2;
 
     uint64_t frames;
     uint64_t last_fps_tick_ms;
@@ -1152,14 +1157,14 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
 
 /* ---- Networking helpers ---------------------------------------------- */
 
-static int drain_socket(struct app *a) {
+static int drain_fd(int fd, struct tb_parser *parser) {
     uint8_t buf[1024 * 1024];
     int saw_data = 0;
     for (;;) {
-        ssize_t n = read(a->client_fd, buf, sizeof(buf));
+        ssize_t n = read(fd, buf, sizeof(buf));
         if (n > 0) {
             saw_data = 1;
-            if (tb_parser_feed(&a->parser, buf, (size_t)n) < 0) return -1;
+            if (tb_parser_feed(parser, buf, (size_t)n) < 0) return -1;
         } else if (n == 0) {
             return -1;  /* peer closed */
         } else {
@@ -1168,6 +1173,10 @@ static int drain_socket(struct app *a) {
             return -1;
         }
     }
+}
+
+static int drain_socket(struct app *a) {
+    return drain_fd(a->client_fd, &a->parser);
 }
 
 static void write_be32(uint8_t *dst, uint32_t value) {
@@ -1661,7 +1670,17 @@ static void send_receiver_info(struct app *a) {
     free(pkt);
 }
 
+static void close_secondary(struct app *a) {
+    if (a->client_fd2 >= 0) {
+        close(a->client_fd2);
+        a->client_fd2 = -1;
+        tb_parser_free(&a->parser2);
+        fprintf(stderr, "[main] second cable disconnected\n");
+    }
+}
+
 static void close_client(struct app *a) {
+    close_secondary(a);   /* the session is over — drop the second cable too */
     if (a->client_fd >= 0) close(a->client_fd);
     a->client_fd = -1;
     a->close_requested = 0;
@@ -1750,6 +1769,7 @@ int main(int argc, char **argv) {
     memset(&a, 0, sizeof(a));
     a.server_fd = -1;
     a.client_fd = -1;
+    a.client_fd2 = -1;
     {
         char host[96] = {0};
         if (gethostname(host, sizeof(host)) != 0 || host[0] == '\0') {
@@ -1850,7 +1870,8 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Accept new client */
+        /* Accept the primary client, or — once it's connected — the optional
+         * second cable (dual-cable frame pipe). One accept per iteration. */
         if (a.client_fd < 0) {
             int c = tb_net_accept(a.server_fd);
             if (c >= 0) {
@@ -1864,22 +1885,46 @@ int main(int argc, char **argv) {
                 tb_receiver_refresh_input_capture(&a);
                 send_receiver_info(&a);
             }
-        } else {
-            int drain_result = drain_socket(&a);
+        } else if (a.client_fd2 < 0) {
+            int c2 = tb_net_accept(a.server_fd);
+            if (c2 >= 0) {
+                a.client_fd2 = c2;
+                a.last_recv_ms = t;
+                fprintf(stderr, "[main] second cable connected (dual-cable)\n");
+                tb_parser_free(&a.parser2);
+                tb_parser_init(&a.parser2, on_packet, &a);
+                /* No receiver-info on the secondary: it's a send-only frame
+                 * pipe and the sender never reads it. */
+            }
+        }
+
+        if (a.client_fd >= 0) {
+            int drain_result = drain_socket(&a);   /* primary */
             if (drain_result < 0) {
-                close_client(&a);
+                close_client(&a);                   /* also drops the secondary */
             } else {
                 socket_activity = drain_result;
                 if (drain_result > 0) a.last_recv_ms = t;
+
+                /* Drain the second cable's frames into its own parser. If it
+                 * drops, keep the primary alive and fall back to one cable. */
+                if (a.client_fd2 >= 0) {
+                    int d2 = drain_fd(a.client_fd2, &a.parser2);
+                    if (d2 < 0) {
+                        close_secondary(&a);
+                    } else {
+                        if (d2 > 0) { socket_activity = 1; a.last_recv_ms = t; }
+                    }
+                }
+
                 if (a.close_requested) {
                     close_client(&a);
                 } else if (t - a.last_recv_ms >= TB_SENDER_IDLE_TIMEOUT_MS) {
                     /* The sender streams frames continuously and heartbeats
                      * every 2s. Total silence means it died without a FIN
                      * (crash, pulled cable, force sleep). Without this reap,
-                     * the dead fd is held forever and — because the receiver
-                     * is single-client — every future connect is locked out
-                     * until the app is restarted. */
+                     * the dead fd is held forever and every future connect is
+                     * locked out until the app is restarted. */
                     fprintf(stderr, "[main] no data from sender for %llu ms; closing stale session\n",
                             (unsigned long long)(t - a.last_recv_ms));
                     close_client(&a);

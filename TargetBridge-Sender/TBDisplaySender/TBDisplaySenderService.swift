@@ -389,6 +389,14 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private let displayID: CGDirectDisplayID
     private let onFirstFrame: @Sendable () -> Void
 
+    // Dual-cable: an optional second connection (cable 2). When present, raw
+    // frames are interleaved across the two links (even → primary, odd →
+    // secondary) to roughly double throughput. Control packets always go on the
+    // primary. Attached after the primary is streaming; confined to `queue`.
+    private var secondaryConnection: NWConnection?
+    private var pendingVideoPacketsSecondary = 0
+    private var rawFrameCounter = 0
+
     // Confined to `queue`.
     private var vtEncoder: VTCompressionSession?
     private var vtEncoderRef: Unmanaged<TBVideoPipeline>?
@@ -671,6 +679,19 @@ private final class TBVideoPipeline: @unchecked Sendable {
         }
     }
 
+    /// Dual-cable: attach the second cable's connection once it's `ready`.
+    /// From the next frame on, raw frames interleave across both links.
+    func attachSecondaryConnection(_ conn: NWConnection) {
+        queue.async { [weak self] in self?.secondaryConnection = conn }
+    }
+
+    func detachSecondaryConnection() {
+        queue.async { [weak self] in
+            self?.secondaryConnection = nil
+            self?.pendingVideoPacketsSecondary = 0
+        }
+    }
+
     /// Raw passthrough: package the two NV12 planes of the captured pixel buffer
     /// and send them uncompressed. The receiver blits them directly (no decode).
     /// Payload: [1: format=1(NV12)][BE32 w][BE32 h][BE32 yStride][BE32 uvStride]
@@ -679,9 +700,19 @@ private final class TBVideoPipeline: @unchecked Sendable {
         guard running,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
-        // Backpressure: never pile frames on top of a network that can't keep up.
-        if pendingVideoPackets >= preset.maxPendingVideoPackets { return }
         guard CVPixelBufferGetPlaneCount(pixelBuffer) >= 2 else { return }
+
+        // Dual-cable: alternate whole frames across the two links (even →
+        // primary, odd → secondary). Backpressure is per-link so a stall on one
+        // cable drops only its frames. Control packets always use the primary.
+        let useSecondary = (secondaryConnection != nil) && (rawFrameCounter & 1 == 1)
+        rawFrameCounter &+= 1
+        let targetConnection = useSecondary ? (secondaryConnection ?? connection) : connection
+        if useSecondary {
+            if pendingVideoPacketsSecondary >= preset.maxPendingVideoPackets { return }
+        } else if pendingVideoPackets >= preset.maxPendingVideoPackets {
+            return
+        }
 
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
@@ -721,11 +752,15 @@ private final class TBVideoPipeline: @unchecked Sendable {
         payload.append(UnsafeBufferPointer(start: uvBase.assumingMemoryBound(to: UInt8.self), count: uvSize))
 
         let packet = TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
-        pendingVideoPackets += 1
-        connection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
+        if useSecondary { pendingVideoPacketsSecondary += 1 } else { pendingVideoPackets += 1 }
+        targetConnection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
             guard let self else { return }
             self.queue.async {
-                self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+                if useSecondary {
+                    self.pendingVideoPacketsSecondary = max(0, self.pendingVideoPacketsSecondary - 1)
+                } else {
+                    self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+                }
             }
         }))
         lock.lock(); _sentFrames += 1; lock.unlock()
@@ -961,6 +996,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     @Published var statusText: String
     @Published var transportKind: TBTransportKind = .thunderboltBridge
     @Published var localInterfaceIP = ""
+    // Dual-cable: the second cable's local + receiver IPs. When enabled and both
+    // are set, a second connection carries half the frames (interleaved) to
+    // roughly double throughput. Locked while streaming, like the other stream
+    // settings.
+    @Published var dualCableEnabled = false
+    @Published var secondaryLocalInterfaceIP = ""
+    @Published var secondaryReceiverIP = ""
     @Published var selectedReceiverID = "" {
         didSet {
             if selectedReceiverID.isEmpty {
@@ -1103,6 +1145,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     @Published var inputBindings: [TBInputBinding] = []
 
     private var connection: NWConnection?
+    // Dual-cable: the second Thunderbolt link's frame pipe (cable 2). Opened
+    // after the primary is streaming; carries half the frames (interleaved).
+    private var secondaryConnection: NWConnection?
     private let connectionQueue = DispatchQueue(label: "fd.tbmonitor.sender.connection", qos: .userInteractive)
     private var recvBuffer = Data()
 
@@ -1327,6 +1372,52 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
 
         return details
+    }
+
+    /// Dual-cable: open the second Thunderbolt link as a send-only frame pipe and
+    /// hand it to the running pipeline. Bound to `secondaryLocalInterfaceIP`,
+    /// dials `secondaryReceiverIP`. If it never comes up, the pipeline just keeps
+    /// all frames on the primary (graceful single-cable fallback).
+    private func openSecondaryConnection(for pipeline: TBVideoPipeline) {
+        guard secondaryConnection == nil else { return }
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
+        let params = NWParameters(tls: nil, tcp: tcpOptions)
+        params.allowLocalEndpointReuse = true
+        params.serviceClass = .interactiveVideo
+        if let localPort = NWEndpoint.Port(rawValue: 0) {
+            params.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(secondaryLocalInterfaceIP), port: localPort)
+        }
+        let interfaces = TBConnectionDiagnostics.currentIPv4Interfaces()
+        let scopedHost = TBConnectionDiagnostics.scopedReceiverHost(
+            receiverIP: secondaryReceiverIP,
+            localIP: secondaryLocalInterfaceIP,
+            interfaces: interfaces
+        )
+        let dialHost: NWEndpoint.Host
+        if scopedHost != secondaryReceiverIP, let scopedAddress = IPv4Address(scopedHost) {
+            dialHost = .ipv4(scopedAddress)
+        } else {
+            dialHost = NWEndpoint.Host(secondaryReceiverIP)
+        }
+        let conn = NWConnection(host: dialHost, port: NWEndpoint.Port(integerLiteral: TBMonitorProtocol.port), using: params)
+        secondaryConnection = conn
+        TBLog.connection.info("connect(secondary): dialing \(scopedHost, privacy: .public) from \(self.secondaryLocalInterfaceIP, privacy: .public)")
+        conn.stateUpdateHandler = { [weak self, weak conn, weak pipeline] state in
+            Task { @MainActor [weak self, weak conn, weak pipeline] in
+                guard let self, let conn, self.secondaryConnection === conn else { return }
+                switch state {
+                case .ready:
+                    TBLog.connection.info("connect(secondary): ready — cable 2 attached")
+                    pipeline?.attachSecondaryConnection(conn)
+                case .failed(let error), .waiting(let error):
+                    TBLog.connection.warning("connect(secondary): \(error.localizedDescription, privacy: .public)")
+                default:
+                    break
+                }
+            }
+        }
+        conn.start(queue: DispatchQueue.global(qos: .userInteractive))
     }
 
     func connect() {
@@ -1591,6 +1682,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         connection?.stateUpdateHandler = nil
         connection?.cancel()
         connection = nil
+        secondaryConnection?.stateUpdateHandler = nil
+        secondaryConnection?.cancel()
+        secondaryConnection = nil
         let currentSession = session
         Task { @MainActor in
             currentSession.destroy()
@@ -2306,6 +2400,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             guard pipeline.start() else { return false }
             self.pipeline = pipeline
             TBLog.connection.info("capture: pipeline started preset=\(preset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) codec=\(codecName, privacy: .public)")
+
+            if self.dualCableEnabled,
+               !self.secondaryLocalInterfaceIP.isEmpty,
+               !self.secondaryReceiverIP.isEmpty {
+                self.openSecondaryConnection(for: pipeline)
+            }
 
             let display: SCDisplay
             if captureSource == .desktopMirror {
