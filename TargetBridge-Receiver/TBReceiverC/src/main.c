@@ -594,6 +594,7 @@ static void bonjour_update(struct app *a, uint16_t port) {
     TXTRecordSetValue(&txt, "panel", (uint8_t)strlen(a->panel_text), a->panel_text);
     TXTRecordSetValue(&txt, "version", (uint8_t)strlen(TB_RECEIVER_VERSION), TB_RECEIVER_VERSION);
     TXTRecordSetValue(&txt, "supportsHEVCDecode", 1, tb_dec_supports_hevc_hwdecode() ? "1" : "0");
+    TXTRecordSetValue(&txt, "supportsRawNV12", 1, "1");
 
     struct tb_display_info info;
     if (tb_disp_get_info(a->disp, &info) == 0) {
@@ -903,10 +904,16 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
     uint32_t h  = ((uint32_t)p[5]  << 24) | ((uint32_t)p[6]  << 16) | ((uint32_t)p[7]  << 8) | (uint32_t)p[8];
     uint32_t ys = ((uint32_t)p[9]  << 24) | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 8) | (uint32_t)p[12];
     uint32_t us = ((uint32_t)p[13] << 24) | ((uint32_t)p[14] << 16) | ((uint32_t)p[15] << 8) | (uint32_t)p[16];
-    if (w == 0 || h == 0 || ys < w || us < w) return;
+    /* Keep malformed peer data from turning into oversized stride arithmetic or
+     * an out-of-bounds render. TargetBridge RAW is intentionally limited to
+     * practical 4:2:0 display sizes and the protocol packet cap. */
+    if (w == 0 || h == 0 || (w & 1) || (h & 1) ||
+        w > 8192 || h > 8192 || ys < w || us < w ||
+        ys > 16384 || us > 16384) return;
     size_t y_size  = (size_t)ys * h;
     size_t uv_size = (size_t)us * (h / 2);
-    if (len < (size_t)17 + y_size + uv_size) return;
+    size_t payload_size = len - 17;
+    if (y_size > payload_size || uv_size > payload_size - y_size) return;
     const uint8_t *y  = p + 17;
     const uint8_t *uv = y + y_size;
 
@@ -1071,6 +1078,7 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         tb_dec_feed_frame(a->dec, payload, len);
         break;
     case TB_PKT_RAW_FRAME:
+        a->session_active = 1;
         handle_raw_frame(a, payload, len);
         break;
     case TB_PKT_CURSOR:
@@ -1643,7 +1651,7 @@ static void send_receiver_info(struct app *a) {
         "{\"receiverName\":\"%s\",\"panelWidth\":%u,\"panelHeight\":%u,"
         "\"modeWidth\":%u,\"modeHeight\":%u,\"refreshRate\":60,"
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
-        "\"supportsHEVCDecode\":%s,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s}",
+        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s}",
         escaped_name,
         panel_w,
         panel_h,

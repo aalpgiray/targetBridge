@@ -100,7 +100,11 @@ The receiver logs to stderr; under the LaunchAgent that lands in
 
 `native5k60Experimental` is an opt-in HEVC profile for testing recent Apple
 Silicon encoders at 5120 x 2880 and 60 FPS. It does not alter the stable 5K
-profile, which remains at 48 FPS.
+profile, which remains at 48 FPS and is the recommended choice for daily work.
+
+Real-world M4 testing has reached 56-57 FPS but also showed temporary drops
+under mixed workloads and added heat when Input Dockstation is active. Treat
+this profile as a benchmark and feedback tool, not a guaranteed 60 FPS mode.
 
 Use it only for a test session, either from the Sender's stream-profile picker
 or with the automation alias:

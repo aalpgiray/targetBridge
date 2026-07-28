@@ -21,11 +21,10 @@ contributions help keep the project moving forward.
 
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?logo=github)](https://github.com/sponsors/swellweb)
 
-## TargetBridge 3.2
+## TargetBridge 3.3
 
-TargetBridge 3.2 builds on the multi-Mac workspace foundation with more
-reliable display preferences, receiver-driven shortcuts, and repeatable
-hardware-free Receiver testing:
+TargetBridge 3.3 improves the reliability of the display connection while
+keeping the established multi-Mac workspace features:
 
 - mirror mode and extended desktop mode
 - multiple receivers from one sender
@@ -41,6 +40,10 @@ hardware-free Receiver testing:
 - remembers the selected virtual-display resolution for each receiver
 - configurable Receiver Master shortcuts, including protected macOS shortcuts such as Space switching
 - mock sender, parser tests, and a loopback smoke test for Receiver resilience without a second Mac
+- improved direct `Duplicate Desktop` startup, with a short wait for the virtual display to become available
+- permission cards refresh when TargetBridge returns from macOS Privacy & Security settings
+- Receiver stays on its waiting screen until a real session starts, avoiding a distracting fullscreen flash
+- experimental `5K 60` profile for recent Apple Silicon; use `5K 48` for the most stable work sessions
 
 ## Feature Guides
 
@@ -60,7 +63,7 @@ hardware-free Receiver testing:
 
 - Sender can stream either a mirrored desktop or an extended virtual display. See [Display Modes](docs/Features.md#display-modes).
 - One sender can drive multiple receiver Macs over separate cables. See [Multi-Receiver Workflows](docs/Features.md#multi-receiver-workflows).
-- Stream profiles range from `2560 x 1440` to `5120 x 2880` with H.264/HEVC selection based on capability. See [Display Modes](docs/Features.md#display-modes).
+- Stream profiles range from `2560 x 1440` to `5120 x 2880` with H.264/HEVC selection based on capability. `5K 60` is an experimental profile for recent Apple Silicon; `5K 48` remains recommended for reliable daily work. See [Display Modes](docs/Features.md#display-modes).
 - Receiver discovery is automatic over Bonjour. Extended-display arrangement is remembered per receiver when possible. See [Display Modes](docs/Features.md#display-modes).
 - Thunderbolt Bridge remains the primary low-latency path, with `Network Link` available as an experimental addon-gated transport. See [Network Link](docs/Features.md#network-link-experimental).
 

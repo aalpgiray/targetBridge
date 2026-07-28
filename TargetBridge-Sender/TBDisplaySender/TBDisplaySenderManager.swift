@@ -46,6 +46,9 @@ final class TBDisplaySenderService: ObservableObject {
     @Published private(set) var localInterfaces: [TBLocalLinkInterface] = []
     @Published private(set) var discoveredReceivers: [TBDiscoveredReceiver] = []
     @Published private(set) var addons: [TBAddonRecord] = []
+    /// Changes whenever the app returns from System Settings so permission cards
+    /// re-evaluate their live TCC state instead of showing a stale warning.
+    @Published private(set) var privacyPermissionsRevision = 0
     @Published var language: TBDisplaySenderLanguage = .load() {
         didSet {
             language.persist()
@@ -105,6 +108,7 @@ final class TBDisplaySenderService: ObservableObject {
     private let inputRelayController = TBInputRelayController()
     private var discoveryCancellable: AnyCancellable?
     private var addonCancellable: AnyCancellable?
+    private var activationObserver: NSObjectProtocol?
     private var clipboardTimer: Timer?
     private var lastClipboardChangeCount: Int = NSPasteboard.general.changeCount
 
@@ -125,6 +129,19 @@ final class TBDisplaySenderService: ObservableObject {
         addonStore.refresh()
         restorePersistedSessions()
         startClipboardMonitoring()
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshPrivacyPermissions()
+            }
+        }
+    }
+
+    func refreshPrivacyPermissions() {
+        privacyPermissionsRevision &+= 1
     }
 
     var anyConnected: Bool {

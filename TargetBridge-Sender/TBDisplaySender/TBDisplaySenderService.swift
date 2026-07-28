@@ -375,6 +375,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private let connection: NWConnection
     private let displayName: String
     private let displayID: CGDirectDisplayID
+    private let usesRawNV12: Bool
     private let onFirstFrame: @Sendable () -> Void
 
     // Confined to `queue`.
@@ -397,6 +398,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
          connection: NWConnection,
          displayName: String,
          displayID: CGDirectDisplayID,
+         usesRawNV12: Bool,
          ackAlreadySent: Bool,
          onFirstFrame: @escaping @Sendable () -> Void) {
         self.preset = preset
@@ -404,6 +406,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         self.connection = connection
         self.displayName = displayName
         self.displayID = displayID
+        self.usesRawNV12 = usesRawNV12
         self.ackSent = ackAlreadySent
         self.onFirstFrame = onFirstFrame
     }
@@ -414,6 +417,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// could not be created.
     func start() -> Bool {
         queue.sync {
+            if usesRawNV12 {
+                running = true
+                return true
+            }
             setupEncoder()
             running = vtEncoder != nil
             return running
@@ -517,21 +524,16 @@ private final class TBVideoPipeline: @unchecked Sendable {
 
     // MARK: - Encode paths (on `queue`)
 
-    /// Opt-in raw passthrough (`RAW=1`): ScreenCaptureKit already captures NV12,
+    /// Opt-in raw passthrough: ScreenCaptureKit already captures NV12,
     /// so we can forward the planes uncompressed and skip the encoder entirely.
     /// This removes all decode cost on the receiver — useful when the receiver is
     /// an older Intel Mac whose HEVC decoder struggles at high resolutions — at
     /// the price of much higher bandwidth (~10.6 Gb/s for 5K@60 4:2:0), which a
     /// direct Thunderbolt Bridge link comfortably sustains.
-    private var rawEnabled: Bool {
-        guard let v = ProcessInfo.processInfo.environment["RAW"] else { return false }
-        return v == "1" || v.lowercased() == "true"
-    }
-
     /// SCStream capture path. Must be dispatched onto `queue` by the caller.
     func encode(_ sampleBuffer: CMSampleBuffer) {
         markCaptureFrame()
-        if rawEnabled {
+        if usesRawNV12 {
             sendRawFrame(sampleBuffer)
             return
         }
@@ -2216,7 +2218,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return
             }
             if self.captureSource == .desktopMirror {
-                let mirrorConfigured = self.configureDesktopMirror(for: self.session.displayID)
+                let displayReady = await self.waitForOnlineDisplay(self.session.displayID)
+                let mirrorConfigured = displayReady && self.configureDesktopMirror(for: self.session.displayID)
                 if !mirrorConfigured {
                     NSLog(
                         "TargetBridge: unable to enable mirror mode for virtual display %u on first attempt; scheduling retry",
@@ -2259,9 +2262,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private func startCapture(for profile: TBMonitorDisplayProfile) async -> Bool {
         do {
             let preset = capturePreset
+            let usesRawNV12 = rawNV12Enabled(for: profile)
             let codecType = resolvedCodecType(for: preset, profile: profile)
-            let codecName = codecName(for: codecType)
-            activeCodecType = codecType
+            let codecName = usesRawNV12 ? "NV12 RAW" : codecName(for: codecType)
+            activeCodecType = usesRawNV12 ? nil : codecType
             activeCodecName = codecName
             guard let connection else { return false }
 
@@ -2275,6 +2279,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 connection: connection,
                 displayName: session.displayName,
                 displayID: session.displayID,
+                usesRawNV12: usesRawNV12,
                 ackAlreadySent: sessionAckSent,
                 onFirstFrame: { [weak self] in
                     Task { @MainActor in self?.handleFirstEncodedFrame() }
@@ -2282,7 +2287,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             )
             guard pipeline.start() else { return false }
             self.pipeline = pipeline
-            TBLog.connection.info("capture: pipeline started preset=\(preset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) codec=\(codecName, privacy: .public)")
+            TBLog.connection.info("capture: pipeline started preset=\(preset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) codec=\(codecName, privacy: .public) rawNV12=\(usesRawNV12, privacy: .public)")
 
             let display: SCDisplay
             if captureSource == .desktopMirror {
@@ -2467,6 +2472,29 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         } catch {
             return []
         }
+    }
+
+    /// A freshly created virtual display can be reported by CoreGraphics before
+    /// it is usable in a display configuration. Waiting briefly avoids racing
+    /// `CGConfigureDisplayMirrorOfDisplay` on first connect.
+    private func waitForOnlineDisplay(_ displayID: CGDirectDisplayID) async -> Bool {
+        for _ in 0..<20 {
+            if onlineDisplayIDs().contains(displayID) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return onlineDisplayIDs().contains(displayID)
+    }
+
+    /// RAW remains an explicit diagnostic-only transport until a selectable
+    /// profile and sustained hardware tests prove it safe for normal sessions.
+    /// A Receiver must explicitly advertise support before the environment
+    /// override can enable it, so older builds never receive unknown frames.
+    private func rawNV12Enabled(for profile: TBMonitorDisplayProfile) -> Bool {
+        guard profile.supportsRawNV12 == true else { return false }
+        guard let value = ProcessInfo.processInfo.environment["RAW"]?.lowercased() else { return false }
+        return value == "1" || value == "true"
     }
 
     private func configureDesktopMirror(for virtualDisplayID: CGDirectDisplayID) -> Bool {
