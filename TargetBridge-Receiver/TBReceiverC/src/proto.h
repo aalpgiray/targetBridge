@@ -70,6 +70,10 @@
  * Both are private CoreBrightness features, so the receiver reports whether it
  * can honour them in its display profile. */
 #define TB_PKT_DISPLAY_TWEAKS   0x38
+/* Receiver's microphone, flowing receiver -> sender: raw 48 kHz stereo Int16,
+ * no JSON wrapper. The sender feeds it into the virtual audio device's input
+ * stream so the receiver's mic appears as an input on the sender Mac. */
+#define TB_PKT_MIC_FRAME        0x39
 #define TB_PKT_TEST_DATA        0x40
 
 #define TB_HDR_BYTES        5   /* 4 length + 1 type */

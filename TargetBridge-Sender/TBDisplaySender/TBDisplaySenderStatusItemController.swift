@@ -121,7 +121,10 @@ final class TBDisplaySenderStatusItemController: NSObject {
                     header.isEnabled = false
                     menu.addItem(header)
                 }
-                menu.addItem(makeSliderItem(symbol: "sun.max", label: brightnessMenuLabel(), value: session.brightness) { [weak session] value in
+                menu.addItem(makeSliderItem(symbol: "sun.min",
+                                            trailingSymbol: "sun.max",
+                                            label: brightnessMenuLabel(),
+                                            value: session.brightness) { [weak session] value in
                     session?.brightness = value
                 })
                 // No volume slider: with the TargetBridge audio device selected,
@@ -224,22 +227,49 @@ final class TBDisplaySenderStatusItemController: NSObject {
     /// Builds a menu row with an icon and a 0…1 slider whose changes are pushed
     /// live to `onChange` (which sets `session.brightness`/`.volume`, forwarding
     /// to the receiver).
-    private func makeSliderItem(symbol: String, label: String, value: Double, onChange: @escaping (Double) -> Void) -> NSMenuItem {
+    /// Brightness row: a small glyph, the system slider, and a larger glyph
+    /// closing the row. The trailing icon is what stops the track running to the
+    /// edge of the menu.
+    ///
+    /// This uses the stock NSSlider deliberately. A hand-drawn Control Center
+    /// lookalike was tried and looked worse — dated next to the real thing —
+    /// and `trackFillColor` is ignored inside a menu's vibrant context, so the
+    /// accent-filled track is not reachable from here either. The system
+    /// control at least ages with macOS.
+    private func makeSliderItem(symbol: String, trailingSymbol: String, label: String,
+                                value: Double, onChange: @escaping (Double) -> Void) -> NSMenuItem {
         let width: CGFloat = 240
-        let height: CGFloat = 24
+        let height: CGFloat = 28
+        let inset: CGFloat = 14
+        let leadingIcon: CGFloat = 13
+        let trailingIcon: CGFloat = 17
+        let gap: CGFloat = 8
         let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
 
-        let icon = NSImageView(frame: NSRect(x: 14, y: (height - 15) / 2, width: 15, height: 15))
-        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
-        icon.contentTintColor = .secondaryLabelColor
-        icon.imageScaling = .scaleProportionallyUpOrDown
-        container.addSubview(icon)
+        func glyph(_ name: String, size: CGFloat, x: CGFloat) -> NSImageView {
+            let view = NSImageView(frame: NSRect(x: x, y: (height - size) / 2, width: size, height: size))
+            view.image = NSImage(systemSymbolName: name, accessibilityDescription: label)
+            view.contentTintColor = .secondaryLabelColor
+            view.imageScaling = .scaleProportionallyUpOrDown
+            return view
+        }
 
-        let slider = NSSlider(frame: NSRect(x: 38, y: (height - 19) / 2, width: width - 38 - 14, height: 19))
+        container.addSubview(glyph(symbol, size: leadingIcon, x: inset))
+        container.addSubview(glyph(trailingSymbol, size: trailingIcon,
+                                   x: width - inset - trailingIcon))
+
+        let sliderX = inset + leadingIcon + gap
+        let sliderWidth = width - sliderX - gap - trailingIcon - inset
+        let slider = NSSlider(frame: NSRect(x: sliderX, y: (height - 19) / 2,
+                                            width: sliderWidth, height: 19))
         slider.minValue = 0
         slider.maxValue = 1
         slider.doubleValue = value
         slider.isContinuous = true
+        // Set even though menus currently ignore it: harmless, and it is the
+        // supported way to get an accent-filled track if that changes.
+        slider.trackFillColor = .controlAccentColor
+        slider.controlSize = .small
         let target = TBMenuSliderTarget(onChange)
         slider.target = target
         slider.action = #selector(TBMenuSliderTarget.changed(_:))
@@ -366,6 +396,9 @@ final class TBDisplaySenderStatusItemController: NSObject {
     @objc
     private func quitApp() {
         runAfterMenuDismissal {
+            // Quitting with our device still selected would leave the Mac
+            // pointed at a device that no longer carries audio.
+            TBDefaultOutputGuard.shared.restoreIfSelected()
             NSApp.terminate(nil)
         }
     }

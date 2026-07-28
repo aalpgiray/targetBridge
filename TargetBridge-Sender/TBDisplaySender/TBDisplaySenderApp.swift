@@ -11,6 +11,9 @@ struct TBDisplaySenderApp: App {
                 .frame(minWidth: 540)
                 .task {
                     statusItemController.activate()
+                    // Track which output the user was on before selecting ours,
+                    // so we can hand it back rather than leaving them silent.
+                    TBDefaultOutputGuard.shared.begin()
                     TBSenderAutomation.handleLaunchArguments(CommandLine.arguments)
                 }
                 .onOpenURL { url in

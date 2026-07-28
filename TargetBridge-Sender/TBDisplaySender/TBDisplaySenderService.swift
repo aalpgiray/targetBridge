@@ -1407,6 +1407,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
     private var audioDeviceCapture: TBAudioDeviceCapture?
     private var audioDriverReceiver: TBAudioDriverReceiver?
+    private var micForwarder: TBMicForwarder?
     private var audioVolumeObserver: TBAudioDeviceVolumeObserver?
     @Published var audioEnabled: Bool
     @Published var brightness: Double = 1.0 {
@@ -2384,6 +2385,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 setStatus(.receiverTerminatedSession)
                 stop(resetStatusTo: nil)
                 return
+            case .micFrame:
+                // Receiver's microphone. Straight into the driver's input
+                // stream; already 48 kHz stereo Int16, so nothing to convert.
+                if micForwarder == nil { micForwarder = TBMicForwarder() }
+                micForwarder?.forward(payload)
             case .displayTweaks:
                 // Receiver reporting its real state (it may have been changed on
                 // that Mac directly). Adopt it without sending anything back —
@@ -3775,6 +3781,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             if rx.start() {
                 audioDriverReceiver = rx
                 startAudioVolumeMirror(uid: uid)
+                // Keeps the driver's device alive only while a real path exists.
             }
             return
         }
@@ -3815,6 +3822,17 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func stopAudioDeviceCapture() {
+        // Stop first: the driver notices the silence and retires the device,
+        // which is the backstop for the cases the restore below cannot cover
+        // (crash, force quit).
+        // If the user is listening through our virtual device, hand the system
+        // back to its previous output — otherwise the device stays selected
+        // with nothing behind it and sound just stops with no explanation.
+        if !audioDeviceUID.isEmpty {
+            TBDefaultOutputGuard.shared.restoreIfSelected()
+        }
+        micForwarder?.stop()
+        micForwarder = nil
         audioDriverReceiver?.stop()
         audioDriverReceiver = nil
         audioVolumeObserver?.stop()

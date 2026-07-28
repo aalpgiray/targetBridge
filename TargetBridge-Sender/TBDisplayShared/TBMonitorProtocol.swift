@@ -23,6 +23,8 @@ enum TBMonitorPacketType: UInt8 {
     case volume = 0x37
     /// Night Shift / True Tone on the receiver's panel.
     case displayTweaks = 0x38
+    /// Receiver's microphone, receiver -> sender: raw 48 kHz stereo Int16.
+    case micFrame = 0x39
     case testData = 0x40
 }
 

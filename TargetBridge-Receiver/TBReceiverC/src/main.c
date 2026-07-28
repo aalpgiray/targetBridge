@@ -19,6 +19,7 @@
 #include "proto.h"
 #include "tb_gesture_bridge.h"
 #include "tb_display_tweaks.h"
+#include "tb_mic_capture.h"
 #include "tb_i18n.h"
 
 #include <SDL.h>
@@ -280,6 +281,7 @@ static void tb_receiver_set_clipboard_text(const char *text);
 static int tb_receiver_get_clipboard_text(char *dest, size_t size);
 static void tb_receiver_send_clipboard_if_changed(struct app *a);
 static void write_be32(uint8_t *dst, uint32_t value);
+static int send_all(int fd, const uint8_t *buf, size_t len);
 static void tb_receiver_send_display_tweaks_if_changed(struct app *a);
 
 static int tb_receiver_is_valid_language_pref(const char *language_pref) {
@@ -1884,6 +1886,42 @@ static void tb_receiver_send_display_tweaks_if_changed(struct app *a) {
     (void)send_all(a->client_fd, pkt, 5 + (size_t)len);
 }
 
+
+/* Mic frames come from AVFoundation's capture queue, not the main loop, so this
+ * only touches the socket. send_all() on a non-blocking fd may drop under
+ * pressure, which for live audio is the right trade — better a gap than a
+ * growing backlog of stale sound. */
+static struct app *g_mic_app = NULL;
+
+static void tb_mic_frame_cb(const uint8_t *pcm, size_t bytes, void *user_data) {
+    struct app *a = (struct app *)user_data;
+    if (!a || a->client_fd < 0 || bytes == 0) return;
+    /* Cap per packet so one oversized buffer cannot stall the link. */
+    const size_t kMax = 8192;
+    while (bytes > 0) {
+        const size_t chunk = bytes > kMax ? kMax : bytes;
+        uint8_t header[5];
+        write_be32(header, (uint32_t)(1 + chunk));
+        header[4] = TB_PKT_MIC_FRAME;
+        if (send_all(a->client_fd, header, sizeof(header)) < 0) return;
+        if (send_all(a->client_fd, pcm, chunk) < 0) return;
+        pcm += chunk;
+        bytes -= chunk;
+    }
+}
+
+static void tb_mic_start_if_possible(struct app *a) {
+    if (!tb_mic_capture_available()) return;
+    g_mic_app = a;
+    if (tb_mic_capture_start(tb_mic_frame_cb, a) != 0) {
+        /* Permission not granted yet; the prompt has been raised and the next
+         * session will retry. */
+        fprintf(stderr, "[mic] not started (microphone permission pending)\n");
+    } else {
+        fprintf(stderr, "[mic] capturing and streaming to sender\n");
+    }
+}
+
 static void send_receiver_info(struct app *a) {
     struct tb_display_info info;
     if (tb_disp_get_info(a->disp, &info) < 0) return;
@@ -2197,6 +2235,8 @@ static void close_secondary(struct app *a) {
 }
 
 static void close_client(struct app *a) {
+    tb_mic_capture_stop();
+    g_mic_app = NULL;
     close_secondary(a);   /* the session is over — drop the second cable too */
     link_reader_stop(a->reader1);
     drop_pending_network(a);
@@ -2439,6 +2479,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "[main] falling back to inline (single-threaded) receive\n");
                 }
                 tb_receiver_refresh_input_capture(&a);
+                tb_mic_start_if_possible(&a);
                 send_receiver_info(&a);
             }
         } else if (a.client_fd2 < 0) {

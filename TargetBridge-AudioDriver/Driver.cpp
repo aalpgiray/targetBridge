@@ -12,11 +12,14 @@
 //     over. Here the level is published for the sender to read and apply as the
 //     receiver's hardware volume, while the audio itself passes at unity.
 //
-//  2. Audio is pushed straight to the sender over loopback UDP instead of being
-//     exposed as an input device. That means no input stream, and therefore no
-//     microphone permission — capturing a loopback device otherwise counts as
-//     mic access, which is a confusing prompt for something that never touches
-//     a microphone.
+//  2. Output audio is pushed straight to the sender over loopback UDP rather
+//     than being looped back to an input, so selecting this device as *output*
+//     never triggers a microphone permission prompt.
+//
+// The device also exposes an input stream carrying the receiver Mac's
+// microphone, so that mic can be selected here like any local one. Audio for it
+// arrives on a second UDP port and is buffered through a lock-free ring, since
+// the realtime read callback cannot block.
 //
 // Built on libASPL (MIT, vendored under vendor/libASPL).
 
@@ -28,6 +31,7 @@
 #include "VolumeCurve.hpp"
 
 #include <CoreAudio/AudioServerPlugIn.h>
+#include <os/log.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -36,6 +40,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <ctime>
+#include <memory>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -43,8 +52,48 @@ namespace {
 // the datagrams are simply dropped, so audio routed here while TargetBridge is
 // closed is harmless rather than an error.
 constexpr const char* kSinkAddr = "127.0.0.1";
-constexpr short kSinkPort = 51710;
+constexpr unsigned short kSinkPort = 51710;
 constexpr UInt32 kMaxDatagram = 1024;
+
+// Microphone audio arrives from the sender on this port and is presented as
+// this device's input stream, so the receiver Mac's mic can be selected on this
+// Mac like any other input.
+constexpr unsigned short kMicPort = 51711;
+
+// How the driver decides the sender is gone. A virtual device that is still
+// present but no longer carries audio is silently broken — sound just stops
+// with no explanation — so when the sender disappears the device must go too.
+//
+// Detection is by probing kSinkPort, not by listening on a port of our own.
+// The plug-in is hosted in a process we do not control, and a leftover host
+// from a previous load can sit on a fixed port for minutes; bind() then fails
+// with EADDRINUSE and a listener never recovers. Sending has no such failure
+// mode, and a connected UDP socket surfaces ICMP port-unreachable as
+// ECONNREFUSED — so an unanswered probe *is* the "sender is gone" signal.
+constexpr int kProbeIntervalUs = 1000 * 1000;
+// The ICMP reply is asynchronous: send() returns fine and the error is queued
+// for the next call on the socket. Pause before looking for it.
+constexpr int kProbeReplyWaitUs = 200 * 1000;
+constexpr int kProbeStrikes = 3;
+// ~0.5s at 48 kHz stereo Int16. Large enough to ride out scheduling jitter,
+// small enough that latency stays reasonable if the producer runs ahead.
+constexpr size_t kMicRingBytes = 96000;
+
+// The plug-in is hosted by audiomxd, so stderr goes nowhere useful; os_log is
+// the only way to see what it is doing. Read with:
+//   log stream --predicate 'subsystem == "com.targetbridge.audiodriver"'
+static os_log_t TBLog()
+{
+    static os_log_t log = os_log_create("com.targetbridge.audiodriver", "driver");
+    return log;
+}
+
+static double MonotonicSeconds()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return double(ts.tv_sec) + double(ts.tv_nsec) / 1e9;
+}
 
 constexpr UInt32 kSampleRate = 48000;   // matches the wire format the receiver expects
 constexpr UInt32 kChannelCount = 2;
@@ -66,6 +115,181 @@ public:
     }
 };
 
+
+// Single-producer / single-consumer ring. The producer is a plain socket
+// thread; the consumer is the realtime I/O callback, which must never block or
+// allocate — hence atomics and a fixed buffer rather than a mutex.
+class MicRing
+{
+public:
+    MicRing() : buffer_(kMicRingBytes, 0) {}
+
+    void Write(const UInt8* data, size_t size)
+    {
+        const size_t writePos = write_.load(std::memory_order_relaxed);
+        const size_t readPos = read_.load(std::memory_order_acquire);
+        const size_t used = writePos - readPos;
+        const size_t free = kMicRingBytes - used;
+        if (size > free) {
+            // Producer outran the consumer: drop this packet rather than
+            // overwrite audio the RT thread has not read yet.
+            return;
+        }
+        for (size_t i = 0; i < size; ++i) {
+            buffer_[(writePos + i) % kMicRingBytes] = data[i];
+        }
+        write_.store(writePos + size, std::memory_order_release);
+    }
+
+    // Fills `size` bytes, padding with silence when starved. Never blocks.
+    void Read(UInt8* out, size_t size)
+    {
+        const size_t readPos = read_.load(std::memory_order_relaxed);
+        const size_t writePos = write_.load(std::memory_order_acquire);
+        const size_t available = writePos - readPos;
+        const size_t take = std::min(size, available);
+        for (size_t i = 0; i < take; ++i) {
+            out[i] = buffer_[(readPos + i) % kMicRingBytes];
+        }
+        if (take < size) {
+            // Underrun: silence is the right filler — it is inaudible, whereas
+            // repeating the last buffer would sound like a stutter.
+            memset(out + take, 0, size - take);
+        }
+        read_.store(readPos + take, std::memory_order_release);
+    }
+
+private:
+    std::vector<UInt8> buffer_;
+    std::atomic<size_t> write_ { 0 };
+    std::atomic<size_t> read_ { 0 };
+};
+
+
+// Marks the device not-alive when the sender stops heartbeating, and alive
+// again when it returns. Runs for the driver's whole lifetime, independent of
+// I/O — the interesting case (sender quits while music is playing) is precisely
+// when we must react without being driven by the audio callback.
+class LivenessWatcher
+{
+public:
+    void Start(std::shared_ptr<aspl::Plugin> plugin, std::shared_ptr<aspl::Device> device)
+    {
+        os_log_error(TBLog(), "liveness: starting watcher");
+        plugin_ = std::move(plugin);
+        device_ = std::move(device);
+        stop_.store(false);
+        thread_ = std::thread([this] { Run(); });
+    }
+
+    void Stop()
+    {
+        stop_.store(true);
+        const int fd = socket_.exchange(-1);
+        if (fd != -1) {
+            close(fd);
+        }
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+private:
+    void Run()
+    {
+        const int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (fd == -1) {
+            os_log_error(TBLog(), "liveness: socket() failed errno=%{public}d", errno);
+            return;
+        }
+
+        // connect() on a datagram socket only fixes the peer; nothing is sent
+        // and no port is claimed. It is what makes the kernel report the peer's
+        // ICMP unreachable to us instead of discarding it.
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(kSinkPort);
+        inet_pton(AF_INET, kSinkAddr, &addr.sin_addr);
+        if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == -1) {
+            os_log_error(TBLog(), "liveness: connect failed errno=%{public}d", errno);
+            close(fd);
+            return;
+        }
+        socket_.store(fd);
+        os_log_error(TBLog(), "liveness: probing %{public}u", kSinkPort);
+
+        // Start alive: the device is usable until proven otherwise, so a driver
+        // installed before the sender ever runs still behaves normally.
+        bool alive = true;
+        int strikes = 0;
+
+        while (!stop_.load()) {
+            // One byte, because the sender's reader discards anything shorter
+            // than a sample frame — so the probe costs it nothing to ignore.
+            const UInt8 probe = 0;
+            bool refused = false;
+            if (send(fd, &probe, sizeof(probe), 0) == -1 && errno == ECONNREFUSED) {
+                refused = true;   // error queued from the previous round
+            }
+            Nap(kProbeReplyWaitUs);
+            UInt8 sink[64];
+            if (recv(fd, sink, sizeof(sink), MSG_DONTWAIT) == -1 && errno == ECONNREFUSED) {
+                refused = true;
+            }
+
+            // Require several in a row: one lost probe should not yank the
+            // user's output device out from under them.
+            strikes = refused ? strikes + 1 : 0;
+            const bool shouldBeAlive = strikes < kProbeStrikes;
+
+            if (shouldBeAlive != alive) {
+                alive = shouldBeAlive;
+                os_log_error(TBLog(), "liveness: sender %{public}s -> device %{public}s",
+                             alive ? "returned" : "gone",
+                             alive ? "published" : "withdrawn");
+                // Remove the device outright rather than only marking it
+                // not-alive. Real hardware *disappears* when unplugged, and that
+                // is the event macOS reliably reacts to by moving the user to
+                // another output; a device that merely reports not-alive can be
+                // left selected and silent.
+                if (auto plugin = plugin_) {
+                    if (auto device = device_) {
+                        if (alive) {
+                            plugin->AddDevice(device);
+                        } else {
+                            plugin->RemoveDevice(device);
+                        }
+                    }
+                }
+            }
+
+            Nap(kProbeIntervalUs - kProbeReplyWaitUs);
+        }
+
+        const int held = socket_.exchange(-1);
+        if (held != -1) {
+            close(held);
+        }
+    }
+
+    /// Sleep in slices so Stop() is not left waiting a whole probe interval.
+    void Nap(int microseconds)
+    {
+        constexpr int kSlice = 100 * 1000;
+        while (microseconds > 0 && !stop_.load()) {
+            const int chunk = microseconds < kSlice ? microseconds : kSlice;
+            usleep(static_cast<useconds_t>(chunk));
+            microseconds -= chunk;
+        }
+    }
+
+    std::shared_ptr<aspl::Plugin> plugin_;
+    std::shared_ptr<aspl::Device> device_;
+    std::thread thread_;
+    std::atomic<int> socket_ { -1 };
+    std::atomic<bool> stop_ { false };
+};
+
 class TargetBridgeHandler : public aspl::ControlRequestHandler,
                             public aspl::IORequestHandler
 {
@@ -73,6 +297,8 @@ public:
     // Control thread, before the first I/O request.
     OSStatus OnStartIO() override
     {
+        StartMicReceiver();
+
         const int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (fd == -1) {
             return kAudioHardwareUnspecifiedError;
@@ -97,10 +323,22 @@ public:
     // Control thread, after the last I/O request.
     void OnStopIO() override
     {
+        StopMicReceiver();
         const int fd = socket_.exchange(-1);
         if (fd != -1) {
             close(fd);
         }
+    }
+
+    // Realtime I/O thread: hand the client whatever mic audio has arrived.
+    void OnReadClientInput(const std::shared_ptr<aspl::Client>& client,
+        const std::shared_ptr<aspl::Stream>& stream,
+        Float64 zeroTimestamp,
+        Float64 timestamp,
+        void* bytes,
+        UInt32 bytesCount) override
+    {
+        micRing_.Read(reinterpret_cast<UInt8*>(bytes), bytesCount);
     }
 
     // Realtime I/O thread. Must not block, allocate, or lock — hence
@@ -127,11 +365,89 @@ public:
     }
 
 private:
+    void StartMicReceiver()
+    {
+        if (micThread_.joinable()) {
+            return;
+        }
+        micStop_.store(false);
+        micThread_ = std::thread([this] { MicReceiveLoop(); });
+    }
+
+    void StopMicReceiver()
+    {
+        micStop_.store(true);
+        const int fd = micSocket_.exchange(-1);
+        if (fd != -1) {
+            // Closing the socket unblocks the recv() in the loop.
+            close(fd);
+        }
+        if (micThread_.joinable()) {
+            micThread_.join();
+        }
+    }
+
+    void MicReceiveLoop()
+    {
+        const int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (fd == -1) {
+            return;
+        }
+        int yes = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(kMicPort);
+        inet_pton(AF_INET, kSinkAddr, &addr.sin_addr);
+        // A leftover plug-in host from a previous load can hold this port for
+        // minutes. Retry rather than giving up for the lifetime of the process,
+        // which is how the mic silently never worked.
+        bool bound = false;
+        for (int attempt = 0; attempt < 60 && !micStop_.load(); ++attempt) {
+            if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+                bound = true;
+                break;
+            }
+            if (attempt == 0) {
+                os_log_error(TBLog(), "mic: bind(%{public}u) failed errno=%{public}d, retrying",
+                             kMicPort, errno);
+            }
+            sleep(1);
+        }
+        if (!bound) {
+            os_log_error(TBLog(), "mic: gave up binding %{public}u", kMicPort);
+            close(fd);
+            return;
+        }
+        micSocket_.store(fd);
+        os_log_error(TBLog(), "mic: listening on %{public}u", kMicPort);
+
+        UInt8 buf[2048];
+        while (!micStop_.load()) {
+            const ssize_t n = recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) {
+                break;   // socket closed by StopMicReceiver, or a fatal error
+            }
+            micRing_.Write(buf, static_cast<size_t>(n));
+        }
+
+        const int held = micSocket_.exchange(-1);
+        if (held != -1) {
+            close(held);
+        }
+    }
+
     std::atomic<int> socket_ { -1 };
+    MicRing micRing_;
+    std::thread micThread_;
+    std::atomic<int> micSocket_ { -1 };
+    std::atomic<bool> micStop_ { false };
 };
 
 std::shared_ptr<aspl::Driver> CreateTargetBridgeDriver()
 {
+    os_log_error(TBLog(), "driver: creating device");
     auto context = std::make_shared<aspl::Context>();
 
     aspl::DeviceParameters deviceParams;
@@ -183,12 +499,22 @@ std::shared_ptr<aspl::Driver> CreateTargetBridgeDriver()
     auto mute = device->AddMuteControlAsync(kAudioObjectPropertyScopeOutput);
     stream->AttachMuteControl(mute);
 
+    // Input stream carrying the receiver Mac's microphone. Same format as the
+    // output side, so nothing converts anywhere.
+    aspl::StreamParameters micParams = streamParams;
+    micParams.Direction = aspl::Direction::Input;
+    device->AddStreamAsync(micParams);
+
     auto handler = std::make_shared<TargetBridgeHandler>();
     device->SetControlHandler(handler);
     device->SetIOHandler(handler);
 
     auto plugin = std::make_shared<aspl::Plugin>(context);
     plugin->AddDevice(device);
+
+    // Lives as long as the driver; the audio server keeps the plug-in loaded.
+    static LivenessWatcher watcher;
+    watcher.Start(plugin, device);
 
     return std::make_shared<aspl::Driver>(context, plugin);
 }
