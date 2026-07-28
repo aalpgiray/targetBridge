@@ -82,6 +82,11 @@ struct TBMonitorInputEvent: Codable {
     var keyCode: UInt16?
 }
 
+struct TBMonitorInputButtonEvent: Codable {
+    var kind: String
+    var clickCount: Int?
+}
+
 struct TBMonitorInputControlMode: Codable {
     var mode: String
 }

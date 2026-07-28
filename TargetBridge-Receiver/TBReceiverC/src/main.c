@@ -1265,6 +1265,41 @@ static void tb_receiver_send_input_event(struct app *a,
     (void)send_all(a->client_fd, pkt, 5 + (size_t)len);
 }
 
+static void tb_receiver_send_input_button_event(struct app *a,
+                                                const char *kind,
+                                                int click_count) {
+    if (!a || a->client_fd < 0) return;
+    if (strcmp(a->input_control_mode, "receiverMaster") != 0) return;
+
+    if (click_count < 1) click_count = 1;
+    if (click_count > 3) click_count = 3;
+
+    char json[128];
+    int len = snprintf(json, sizeof(json),
+                       "{\"kind\":\"%s\",\"clickCount\":%d}",
+                       kind ? kind : "",
+                       click_count);
+    if (len <= 0 || (size_t)len >= sizeof(json)) return;
+
+    uint8_t pkt[4 + 1 + sizeof(json)];
+    write_be32(pkt, (uint32_t)(1 + len));
+    pkt[4] = TB_PKT_INPUT_EVENT;
+    memcpy(pkt + 5, json, (size_t)len);
+    a->input_events_sent += 1;
+    if (tb_should_log_input_event(a->input_events_sent)) {
+        tb_receiver_input_log("[input][receiver->sender] send #%llu kind=%s dx=%d dy=%d sx=%d sy=%d key=%u mode=%s",
+                              (unsigned long long)a->input_events_sent,
+                              kind ? kind : "?",
+                              0,
+                              0,
+                              0,
+                              0,
+                              0,
+                              a->input_control_mode);
+    }
+    (void)send_all(a->client_fd, pkt, 5 + (size_t)len);
+}
+
 static void tb_receiver_send_target_switch(struct app *a, int direction) {
     tb_receiver_send_input_event(a,
                                  direction < 0 ? "switchPrevTarget" : "switchNextTarget",
@@ -1375,27 +1410,45 @@ static CGEventRef tb_receiver_input_tap_callback(CGEventTapProxy proxy,
         break;
     }
     case kCGEventLeftMouseDown:
-        tb_receiver_send_input_event(a, "leftDown", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        tb_receiver_send_input_button_event(
+            a,
+            "leftDown",
+            (int)CGEventGetIntegerValueField(event, kCGMouseEventClickState));
         should_consume = a->input_tap_consumes_events;
         break;
     case kCGEventLeftMouseUp:
-        tb_receiver_send_input_event(a, "leftUp", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        tb_receiver_send_input_button_event(
+            a,
+            "leftUp",
+            (int)CGEventGetIntegerValueField(event, kCGMouseEventClickState));
         should_consume = a->input_tap_consumes_events;
         break;
     case kCGEventRightMouseDown:
-        tb_receiver_send_input_event(a, "rightDown", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        tb_receiver_send_input_button_event(
+            a,
+            "rightDown",
+            (int)CGEventGetIntegerValueField(event, kCGMouseEventClickState));
         should_consume = a->input_tap_consumes_events;
         break;
     case kCGEventRightMouseUp:
-        tb_receiver_send_input_event(a, "rightUp", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        tb_receiver_send_input_button_event(
+            a,
+            "rightUp",
+            (int)CGEventGetIntegerValueField(event, kCGMouseEventClickState));
         should_consume = a->input_tap_consumes_events;
         break;
     case kCGEventOtherMouseDown:
-        tb_receiver_send_input_event(a, "otherDown", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        tb_receiver_send_input_button_event(
+            a,
+            "otherDown",
+            (int)CGEventGetIntegerValueField(event, kCGMouseEventClickState));
         should_consume = a->input_tap_consumes_events;
         break;
     case kCGEventOtherMouseUp:
-        tb_receiver_send_input_event(a, "otherUp", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        tb_receiver_send_input_button_event(
+            a,
+            "otherUp",
+            (int)CGEventGetIntegerValueField(event, kCGMouseEventClickState));
         should_consume = a->input_tap_consumes_events;
         break;
     case kCGEventScrollWheel: {
@@ -1947,22 +2000,22 @@ int main(int argc, char **argv) {
                     tb_receiver_send_input_event(&a, "scroll", 0, 0, 0, 0, 1, input_event.scroll_x, 1, input_event.scroll_y, 0, 0);
                     break;
                 case TB_INPUT_EVENT_LEFT_DOWN:
-                    tb_receiver_send_input_event(&a, "leftDown", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                    tb_receiver_send_input_button_event(&a, "leftDown", input_event.click_count);
                     break;
                 case TB_INPUT_EVENT_LEFT_UP:
-                    tb_receiver_send_input_event(&a, "leftUp", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                    tb_receiver_send_input_button_event(&a, "leftUp", input_event.click_count);
                     break;
                 case TB_INPUT_EVENT_RIGHT_DOWN:
-                    tb_receiver_send_input_event(&a, "rightDown", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                    tb_receiver_send_input_button_event(&a, "rightDown", input_event.click_count);
                     break;
                 case TB_INPUT_EVENT_RIGHT_UP:
-                    tb_receiver_send_input_event(&a, "rightUp", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                    tb_receiver_send_input_button_event(&a, "rightUp", input_event.click_count);
                     break;
                 case TB_INPUT_EVENT_OTHER_DOWN:
-                    tb_receiver_send_input_event(&a, "otherDown", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                    tb_receiver_send_input_button_event(&a, "otherDown", input_event.click_count);
                     break;
                 case TB_INPUT_EVENT_OTHER_UP:
-                    tb_receiver_send_input_event(&a, "otherUp", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                    tb_receiver_send_input_button_event(&a, "otherUp", input_event.click_count);
                     break;
                 case TB_INPUT_EVENT_KEY_DOWN:
                     tb_receiver_send_input_event(&a, "keyDown", 0, 0, 0, 0, 0, 0, 0, 0, 1, input_event.key_code);

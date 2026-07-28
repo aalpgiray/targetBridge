@@ -53,6 +53,7 @@ struct tb_input_event {
     int scroll_x;
     int scroll_y;
     uint16_t key_code;
+    int click_count;
 };
 
 struct tb_display *tb_disp_create(int fullscreen);
