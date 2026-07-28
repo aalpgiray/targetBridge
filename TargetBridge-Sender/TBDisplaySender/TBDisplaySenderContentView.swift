@@ -289,7 +289,11 @@ private struct TBDisplaySenderSessionCard: View {
                     infoRow(TBDisplaySenderL10n.virtualDisplayLabel(service.language), session.virtualDisplayText)
                     infoRow(TBDisplaySenderL10n.streamLabel(service.language), session.streamResolutionText)
                     infoRow(TBDisplaySenderL10n.videoPathLabel(service.language),
-                            TBDisplaySenderL10n.videoPathValue(isRaw: session.videoPathIsRaw, service.language))
+                            TBDisplaySenderL10n.videoPathValue(isRaw: session.videoPathIsRaw,
+                                                               isBGRA: session.videoPathIsBGRA,
+                                                               isTenBit: session.videoPathIsTenBit,
+                                                               dualCable: session.videoPathDualCable,
+                                                               service.language))
                     infoRow(TBDisplaySenderL10n.fpsLabel(service.language), "\(session.senderFPS)")
                 }
             }
@@ -597,6 +601,20 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                         Toggle("", isOn: $session.fullColor444)
                             .labelsHidden()
                             .disabled(session.isConnected || session.isStreaming)
+                    }
+
+                    settingRow(damageRectsTitle, details: damageRectsDetails) {
+                        Toggle("", isOn: $session.damageRects)
+                            .labelsHidden()
+                            .disabled(session.isConnected || session.isStreaming)
+                    }
+
+                    if session.fullColor444 {
+                        settingRow(tenBitTitle, details: tenBitDetails) {
+                            Toggle("", isOn: $session.tenBit)
+                                .labelsHidden()
+                                .disabled(session.isConnected || session.isStreaming)
+                        }
                     }
 
                     settingRow(dualCableTitle, details: dualCableDetails) {
@@ -1022,6 +1040,34 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         default: return "Invia RGB 8-bit non compresso (nessun sottocampionamento croma). ~28 Gb/s a 5K@60 — usare con Doppio cavo. Solo preset raw."
         }
     }
+    private var damageRectsTitle: String {
+        switch service.language {
+        case .italian: return "Solo aree modificate"
+        case .english: return "Send changed areas only"
+        case .german: return "Nur geänderte Bereiche"
+        case .chinese: return "仅发送变化区域"
+        }
+    }
+    private var damageRectsDetails: String {
+        switch service.language {
+        case .english: return "Send only the parts of the screen that changed. Large gain for desktop work (60 fps even at 10-bit 4:4:4); no benefit for video or scrolling, where the whole screen changes every frame. Raw presets only."
+        default: return "Invia solo le aree dello schermo che cambiano. Grande vantaggio per il lavoro desktop; nessun beneficio con video o scorrimento. Solo preset raw."
+        }
+    }
+    private var tenBitTitle: String {
+        switch service.language {
+        case .italian: return "10 bit per canale"
+        case .english: return "10-bit color"
+        case .german: return "10-Bit-Farbe"
+        case .chinese: return "10 位色彩"
+        }
+    }
+    private var tenBitDetails: String {
+        switch service.language {
+        case .english: return "Packed 2-10-10-10: also 4 bytes/pixel, so it costs no extra bandwidth over 8-bit 4:4:4 — it only removes gradient banding."
+        default: return "2-10-10-10 compresso: sempre 4 byte/pixel, nessuna banda passante extra rispetto a 8-bit 4:4:4 — elimina solo le bande nei gradienti."
+        }
+    }
     private var dualCableTitle: String {
         switch service.language {
         case .italian: return "Doppio cavo (dual-link)"
@@ -1271,7 +1317,13 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
 
     private var cableRateText: String {
         if let rate = session.cableTestResult {
-            return String(format: "%.2f Gbits/s", rate)
+            let total = String(format: "%.2f Gbits/s", rate)
+            // Dual-cable runs report the combined figure plus each link, so a
+            // cable that is underperforming its partner is visible.
+            if let detail = session.cableTestDetail {
+                return "\(total)  (\(detail))"
+            }
+            return total
         }
         return TBDisplaySenderL10n.noTestResult(service.language)
     }

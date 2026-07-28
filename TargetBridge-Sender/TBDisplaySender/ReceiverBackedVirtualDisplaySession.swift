@@ -107,6 +107,18 @@ final class ReceiverBackedVirtualDisplaySession {
         descriptor.maxPixelsWide = UInt32(profile.panelWidth)
         descriptor.maxPixelsHigh = UInt32(profile.panelHeight)
 
+        // Declare Display P3 primaries + D65. Left unset, the virtual display
+        // advertises no colour characteristics and macOS appears to give it a
+        // plain 8-bit sRGB framebuffer — mirroring shows the same behaviour,
+        // where the framebuffer is 10-bit only when optimised for a display
+        // that declares deep colour. These are the only capability knobs the
+        // private CGVirtualDisplayDescriptor exposes (verified by runtime
+        // introspection: it has no depth or pixel-format property at all).
+        descriptor.redPrimary   = NSPoint(x: 0.680,  y: 0.320)
+        descriptor.greenPrimary = NSPoint(x: 0.265,  y: 0.690)
+        descriptor.bluePrimary  = NSPoint(x: 0.150,  y: 0.060)
+        descriptor.whitePoint   = NSPoint(x: 0.3127, y: 0.3290)
+
         let ppi = 218.0
         descriptor.sizeInMillimeters = CGSize(
             width: Double(profile.panelWidth) / ppi * 25.4,

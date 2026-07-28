@@ -43,6 +43,9 @@
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <time.h>
+#include <poll.h>
+#include <pthread.h>
+#include <time.h>
 #include <unistd.h>
 
 #define AUDIO_BUF_CAP (192000) // 1 second buffer of 48000Hz stereo 16-bit PCM
@@ -51,6 +54,31 @@
  * heartbeats every 2s and streams frames continuously, so 10s of silence
  * (5 missed heartbeats) means it died without a FIN. */
 #define TB_SENDER_IDLE_TIMEOUT_MS 10000
+
+#define TB_CTRL_QUEUE_MAX 512
+
+/* A non-frame packet copied off a reader thread for the main thread to run
+ * through on_packet() unchanged. */
+struct tb_ctrl_msg {
+    uint8_t  type;
+    uint8_t *payload;
+    size_t   len;
+};
+
+struct app;
+
+struct tb_link_reader {
+    pthread_t         thread;
+    int               fd;
+    int               active;
+    volatile int      stop;
+    volatile int      ended;   /* peer closed, or a fatal parse/read error */
+    struct tb_parser  parser;
+    struct app       *app;
+    const uint8_t    *pending_payload;   /* set by the callback, published after commit */
+    size_t            pending_len;
+    uint8_t           pending_type;
+};
 
 struct app {
     struct tb_display *disp;
@@ -65,13 +93,65 @@ struct app {
     int      client_fd;
     int      client_fd2;
 
+    /* Threaded receive. read() of a 5K raw frame costs ~23 ms and the GPU
+     * upload ~13 ms; run on one thread they serialize to ~36 ms/frame. Each
+     * cable gets a reader thread so the two reads run in parallel AND overlap
+     * the main thread's render. Packet handlers stay on the main thread (they
+     * touch SDL and app state), so readers only parse and hand work across. */
+    pthread_mutex_t net_lock;
+    pthread_cond_t   frame_taken;   /* signalled when the main thread consumes */
+    int              threaded_rx;
+
+    /* Newest complete raw-frame packet wins; an unrendered older frame is
+     * dropped. That also repairs out-of-order arrival across two links, which
+     * is what made dual-cable judder at 4:4:4. */
+    /* Owned buffer handed over by a reader, plus where the frame sits inside
+     * it. No copy: the reader yields its whole parser buffer. */
+    uint8_t         *frame_buf;       /* owned allocation */
+    size_t           frame_cap;
+    const uint8_t   *frame_payload;   /* points into frame_buf */
+    size_t           frame_len;
+    uint8_t          frame_type;      /* RAW_FRAME or RAW_DAMAGE */
+    int              frame_ready;
+    uint64_t         frames_dropped;
+
+    /* Recycled buffers handed back to readers so nothing allocates (or
+     * re-faults 59 MB) inside the frame loop. */
+    uint8_t         *pool_buf[6];
+    size_t           pool_cap[6];
+    int              pool_n;
+
+    struct tb_ctrl_msg    *ctrl_q;
+    int              ctrl_head;
+    int              ctrl_count;
+    uint64_t         reader_recv_ms;
+
+    struct tb_link_reader *reader1;
+    struct tb_link_reader *reader2;
+
+    /* Base image for damage updates: TB_PKT_RAW_DAMAGE patches rectangles into
+     * this, so it must persist across frames. Rebuilt whenever a full
+     * TB_PKT_RAW_FRAME arrives. */
+    uint8_t *base_img;
+    size_t   base_cap;
+    uint32_t base_w, base_h;
+    uint8_t  base_format;      /* 2 = BGRA8888, 3 = ARGB2101010 */
+    int      base_valid;
+
     uint64_t frames;
     uint64_t last_fps_tick_ms;
     uint64_t last_fps_count;
     uint64_t last_ip_check_ms;
-    uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
+    /* Idle watchdog: last time the sender sent anything. Reader threads stamp
+     * this asynchronously, so it can be *newer* than the `t` sampled at the top
+     * of a loop iteration — every comparison must be underflow-safe. */
+    uint64_t last_recv_ms;
     int      close_requested;
     int      have_video_frame;
+    /* A real streaming session has begun (the sender sent a session packet, not
+     * just a transient probe like a UI-language push). Gates the fullscreen
+     * "connecting" splash so a bare/short-lived connection doesn't flash it. */
+    int      session_active;
 
     char     ip_text[64];
     char     tb_ip_text[64];
@@ -895,7 +975,7 @@ static void on_frame(const uint8_t *y, int y_stride,
  *          [Y plane: yStride*h][CbCr plane: uvStride*(h/2)] */
 static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
     if (len < 13) return;
-    uint8_t format = p[0];  /* 1 = NV12 4:2:0, 2 = BGRA8888 4:4:4 */
+    uint8_t format = p[0];  /* 1 = NV12 4:2:0, 2 = BGRA8888 4:4:4, 3 = ARGB2101010 4:4:4 */
     uint32_t w = ((uint32_t)p[1] << 24) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 8) | (uint32_t)p[4];
     uint32_t h = ((uint32_t)p[5] << 24) | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 8) | (uint32_t)p[8];
     /* Sanity bounds: reject implausible dimensions so the size math below can't
@@ -915,7 +995,9 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
         if (len < (size_t)17 + y_size + uv_size) return;
         y  = p + 17;
         uv = y + y_size;
-    } else if (format == 2) {
+    } else if (format == 2 || format == 3) {
+        /* Both packed 4:4:4 at 4 bytes/pixel — identical layout, and only the
+         * texture format the receiver picks differs. */
         stride = ((uint32_t)p[9] << 24) | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 8) | (uint32_t)p[12];
         if ((uint64_t)stride < (uint64_t)w * 4) return;   /* 4 bytes/pixel */
         size_t size = (size_t)stride * h;
@@ -939,9 +1021,113 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
         tb_format_i18n(a->mode_text, sizeof(a->mode_text), "receiver.mode.receiving", pairs, 2);
     }
     if (format == 1) {
+        /* Snapshot both planes tightly packed (Y then interleaved UV) so damage
+         * packets can patch them. Chroma is half resolution in both axes. */
+        size_t y_sz = (size_t)w * h;
+        size_t need = y_sz + (size_t)w * (h / 2);
+        if (a->base_cap < need) {
+            uint8_t *nb = (uint8_t *)realloc(a->base_img, need);
+            if (nb) { a->base_img = nb; a->base_cap = need; }
+        }
+        if (a->base_img && a->base_cap >= need) {
+            for (uint32_t row = 0; row < h; ++row)
+                memcpy(a->base_img + (size_t)row * w, y + (size_t)row * ys, w);
+            for (uint32_t row = 0; row < h / 2; ++row)
+                memcpy(a->base_img + y_sz + (size_t)row * w, uv + (size_t)row * us, w);
+            a->base_w = w; a->base_h = h; a->base_format = 1; a->base_valid = 1;
+        } else {
+            a->base_valid = 0;
+        }
         tb_disp_render_nv12(a->disp, y, (int)ys, uv, (int)us, (int)w, (int)h);
     } else {
-        tb_disp_render_rgba(a->disp, rgba, (int)stride, (int)w, (int)h);
+        /* Snapshot as the base image so subsequent damage packets can patch it.
+         * Stored tightly packed (stride == w*4) regardless of the wire stride. */
+        size_t need = (size_t)w * h * 4;
+        if (a->base_cap < need) {
+            uint8_t *nb = (uint8_t *)realloc(a->base_img, need);
+            if (nb) { a->base_img = nb; a->base_cap = need; }
+        }
+        if (a->base_img && a->base_cap >= need) {
+            for (uint32_t row = 0; row < h; ++row) {
+                memcpy(a->base_img + (size_t)row * w * 4,
+                       rgba + (size_t)row * stride, (size_t)w * 4);
+            }
+            a->base_w = w; a->base_h = h; a->base_format = format; a->base_valid = 1;
+        } else {
+            a->base_valid = 0;
+        }
+        tb_disp_render_packed32(a->disp, rgba, (int)stride, (int)w, (int)h, format == 3);
+    }
+    a->frames++;
+}
+
+
+/* TB_PKT_RAW_DAMAGE — patch changed rectangles into the base image, then
+ * render it. Every bounds check matters here: the payload is attacker-shaped
+ * data and a bad rect would write outside the frame buffer. */
+static void handle_raw_damage(struct app *a, const uint8_t *p, size_t len) {
+    if (len < 11) return;
+    uint8_t  format = p[0];
+    uint32_t w = ((uint32_t)p[1] << 24) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 8) | (uint32_t)p[4];
+    uint32_t h = ((uint32_t)p[5] << 24) | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 8) | (uint32_t)p[8];
+    uint16_t rects = (uint16_t)(((uint16_t)p[9] << 8) | (uint16_t)p[10]);
+
+    /* Without a matching base image there is nothing to patch; wait for the
+     * next full frame rather than rendering garbage. */
+    if (!a->base_valid || w != a->base_w || h != a->base_h || format != a->base_format) return;
+    if (format != 1 && format != 2 && format != 3) return;
+    const size_t y_plane = (size_t)w * h;   /* only meaningful for format 1 */
+
+    size_t off = 11;
+    for (uint16_t i = 0; i < rects; ++i) {
+        if (len - off < 16) return;
+        uint32_t rx = ((uint32_t)p[off]   << 24) | ((uint32_t)p[off+1] << 16) | ((uint32_t)p[off+2] << 8) | (uint32_t)p[off+3];
+        uint32_t ry = ((uint32_t)p[off+4] << 24) | ((uint32_t)p[off+5] << 16) | ((uint32_t)p[off+6] << 8) | (uint32_t)p[off+7];
+        uint32_t rw = ((uint32_t)p[off+8] << 24) | ((uint32_t)p[off+9] << 16) | ((uint32_t)p[off+10]<< 8) | (uint32_t)p[off+11];
+        uint32_t rh = ((uint32_t)p[off+12]<< 24) | ((uint32_t)p[off+13]<< 16) | ((uint32_t)p[off+14]<< 8) | (uint32_t)p[off+15];
+        off += 16;
+
+        if (rw == 0 || rh == 0) continue;
+        /* Reject anything that would land outside the frame, using 64-bit maths
+         * so the sum cannot wrap. */
+        if ((uint64_t)rx + rw > (uint64_t)w || (uint64_t)ry + rh > (uint64_t)h) return;
+
+        if (format == 1) {
+            /* Planar: rects are even-aligned by the sender so the half-resolution
+             * chroma rect is exact. Y is rw x rh; UV is rw bytes x rh/2 rows
+             * (rw/2 chroma pairs). */
+            if ((rx | ry | rw | rh) & 1u) return;    /* misaligned: refuse */
+            size_t y_bytes  = (size_t)rw * rh;
+            size_t uv_bytes = (size_t)rw * (rh / 2);
+            if (len - off < y_bytes + uv_bytes) return;
+
+            for (uint32_t row = 0; row < rh; ++row)
+                memcpy(a->base_img + (size_t)(ry + row) * w + rx,
+                       p + off + (size_t)row * rw, rw);
+            off += y_bytes;
+            for (uint32_t row = 0; row < rh / 2; ++row)
+                memcpy(a->base_img + y_plane + (size_t)(ry / 2 + row) * w + rx,
+                       p + off + (size_t)row * rw, rw);
+            off += uv_bytes;
+        } else {
+            size_t bytes = (size_t)rw * rh * 4;
+            if (len - off < bytes) return;
+            for (uint32_t row = 0; row < rh; ++row) {
+                memcpy(a->base_img + ((size_t)(ry + row) * w + rx) * 4,
+                       p + off + (size_t)row * rw * 4,
+                       (size_t)rw * 4);
+            }
+            off += bytes;
+        }
+    }
+
+    a->have_video_frame = 1;
+    tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
+    if (format == 1) {
+        tb_disp_render_nv12(a->disp, a->base_img, (int)w,
+                            a->base_img + y_plane, (int)w, (int)w, (int)h);
+    } else {
+        tb_disp_render_packed32(a->disp, a->base_img, (int)(w * 4), (int)w, (int)h, format == 3);
     }
     a->frames++;
 }
@@ -1070,23 +1256,30 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
 
             tb_set_receiver_mode_requested(a->mode_text, sizeof(a->mode_text), capture_w, capture_h, source, preset, codec);
         }
+        a->session_active = 1;
         fprintf(stderr, "[main] hello from sender\n");
         tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.sender_connected_profile_sent");
         break;
     case TB_PKT_CREATE_SESSION_ACK:
+        a->session_active = 1;
         fprintf(stderr, "[main] sender session ack: %.*s\n", (int)len, (const char *)payload);
         tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.session_accepted_waiting_frames");
         break;
     case TB_PKT_PARAM_SETS:
+        a->session_active = 1;
         /* tb_dec_set_param_sets is now a no-op if the sets are unchanged,
          * so we don't spam a log line per keyframe. */
         tb_dec_set_param_sets(a->dec, payload, len);
         break;
     case TB_PKT_FRAME:
+        a->session_active = 1;
         tb_dec_feed_frame(a->dec, payload, len);
         break;
     case TB_PKT_RAW_FRAME:
         handle_raw_frame(a, payload, len);
+        break;
+    case TB_PKT_RAW_DAMAGE:
+        handle_raw_damage(a, payload, len);
         break;
     case TB_PKT_CURSOR:
         {
@@ -1179,14 +1372,25 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
 
 /* ---- Networking helpers ---------------------------------------------- */
 
+static double now_ms_f(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
 static int drain_fd(int fd, struct tb_parser *parser) {
-    uint8_t buf[1024 * 1024];
+    /* Read straight into the parser buffer: at raw 4:4:4 a 5K frame is ~59 MB,
+     * so a staging buffer would cost a full extra copy of every frame. */
+    const size_t chunk = 1024 * 1024;
     int saw_data = 0;
     for (;;) {
-        ssize_t n = read(fd, buf, sizeof(buf));
+        uint8_t *dst   = NULL;
+        size_t   avail = 0;
+        if (tb_parser_reserve_space(parser, chunk, &dst, &avail) < 0) return -1;
+        ssize_t n = read(fd, dst, avail);
         if (n > 0) {
             saw_data = 1;
-            if (tb_parser_feed(parser, buf, (size_t)n) < 0) return -1;
+            if (tb_parser_commit(parser, (size_t)n) < 0) return -1;
         } else if (n == 0) {
             return -1;  /* peer closed */
         } else {
@@ -1692,7 +1896,242 @@ static void send_receiver_info(struct app *a) {
     free(pkt);
 }
 
+
+/* ---- threaded link readers --------------------------------------------- */
+
+/* Runs on a reader thread. Frames go to the newest-wins mailbox; everything
+ * else is copied into a queue so the main thread can run the existing
+ * handlers unchanged. */
+static void reader_on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud) {
+    struct tb_link_reader *r = (struct tb_link_reader *)ud;
+    struct app *a = r->app;
+
+    if (type == TB_PKT_RAW_FRAME || type == TB_PKT_RAW_DAMAGE) {
+        /* Keep this packet without copying it: ask the parser to yield its
+         * buffer. The `payload` pointer stays valid inside that buffer, which
+         * the reader loop collects and publishes right after commit returns. */
+        r->pending_payload = payload;
+        r->pending_len     = len;
+        r->pending_type    = type;
+        tb_parser_hold_current(&r->parser);
+        return;
+    }
+
+    pthread_mutex_lock(&a->net_lock);
+    if (a->ctrl_count < TB_CTRL_QUEUE_MAX) {
+        uint8_t *copy = (uint8_t *)malloc(len ? len + 1 : 1);
+        if (copy) {
+            if (len) memcpy(copy, payload, len);
+            copy[len] = '\0';   /* preserve on_packet's NUL-sentinel guarantee */
+            int slot = (a->ctrl_head + a->ctrl_count) % TB_CTRL_QUEUE_MAX;
+            a->ctrl_q[slot].type    = type;
+            a->ctrl_q[slot].payload = copy;
+            a->ctrl_q[slot].len     = len;
+            a->ctrl_count++;
+        }
+    }
+    pthread_mutex_unlock(&a->net_lock);
+}
+
+static void *link_reader_main(void *ud) {
+    struct tb_link_reader *r = (struct tb_link_reader *)ud;
+    struct app *a = r->app;
+
+    while (!r->stop) {
+        struct pollfd pfd;
+        pfd.fd = r->fd; pfd.events = POLLIN; pfd.revents = 0;
+        int pr = poll(&pfd, 1, 20);   /* bounded so `stop` is noticed promptly */
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            r->ended = 1; return NULL;
+        }
+        if (pr == 0) continue;
+
+        for (;;) {
+            uint8_t *dst = NULL;
+            size_t   avail = 0;
+            if (tb_parser_reserve_space(&r->parser, 1024 * 1024, &dst, &avail) < 0) {
+                r->ended = 1; return NULL;
+            }
+            ssize_t n = read(r->fd, dst, avail);
+            if (n > 0) {
+                pthread_mutex_lock(&a->net_lock);
+                a->reader_recv_ms = now_ms();
+                pthread_mutex_unlock(&a->net_lock);
+                if (tb_parser_commit(&r->parser, (size_t)n) < 0) { r->ended = 1; return NULL; }
+                if (r->pending_payload) {
+                    size_t held_cap = 0;
+                    uint8_t *held = tb_parser_take_held(&r->parser, &held_cap);
+                    if (held) {
+                        pthread_mutex_lock(&a->net_lock);
+                        /* A full frame is a complete image, so it may safely
+                         * replace anything still pending. A damage packet is an
+                         * increment: discarding it loses those pixels for good,
+                         * so wait for the main thread instead of dropping it.
+                         * Bounded, so a stalled renderer cannot wedge a reader —
+                         * on timeout we lose the update and the sender's ~1s
+                         * resync repairs it. */
+                        if (r->pending_type == TB_PKT_RAW_DAMAGE) {
+                            struct timespec deadline;
+                            clock_gettime(CLOCK_REALTIME, &deadline);
+                            deadline.tv_nsec += 100 * 1000 * 1000;
+                            if (deadline.tv_nsec >= 1000000000) {
+                                deadline.tv_sec += 1;
+                                deadline.tv_nsec -= 1000000000;
+                            }
+                            while (a->frame_ready) {
+                                if (pthread_cond_timedwait(&a->frame_taken, &a->net_lock,
+                                                           &deadline) != 0) break;
+                            }
+                        }
+                        if (a->frame_buf) {
+                            if (a->frame_ready) a->frames_dropped++;
+                            if (a->pool_n < 6) {
+                                a->pool_buf[a->pool_n] = a->frame_buf;
+                                a->pool_cap[a->pool_n] = a->frame_cap;
+                                a->pool_n++;
+                            } else {
+                                free(a->frame_buf);
+                            }
+                        }
+                        a->frame_buf     = held;
+                        a->frame_cap     = held_cap;
+                        a->frame_payload = r->pending_payload;
+                        a->frame_len     = r->pending_len;
+                        a->frame_type    = r->pending_type;
+                        a->frame_ready   = 1;
+                        /* Take a recycled buffer back for the next frame. */
+                        if (a->pool_n > 0) {
+                            a->pool_n--;
+                            tb_parser_set_spare(&r->parser,
+                                                a->pool_buf[a->pool_n],
+                                                a->pool_cap[a->pool_n]);
+                            a->pool_buf[a->pool_n] = NULL;
+                            a->pool_cap[a->pool_n] = 0;
+                        }
+                        pthread_mutex_unlock(&a->net_lock);
+                    }
+                    r->pending_payload = NULL;
+                    r->pending_len = 0;
+                }
+            } else if (n == 0) {
+                r->ended = 1; return NULL;      /* peer closed */
+            } else {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                if (errno == EINTR) continue;
+                r->ended = 1; return NULL;
+            }
+        }
+    }
+    return NULL;
+}
+
+static int link_reader_start(struct tb_link_reader *r, struct app *a, int fd) {
+    memset(r, 0, sizeof(*r));
+    r->app = a; r->fd = fd;
+    tb_parser_init(&r->parser, reader_on_packet, r);
+    if (pthread_create(&r->thread, NULL, link_reader_main, r) != 0) {
+        fprintf(stderr, "[main] reader thread create failed: %s\n", strerror(errno));
+        tb_parser_free(&r->parser);
+        return -1;
+    }
+    r->active = 1;
+    return 0;
+}
+
+static void link_reader_stop(struct tb_link_reader *r) {
+    if (!r || !r->active) return;
+    r->stop = 1;
+    pthread_join(r->thread, NULL);
+    tb_parser_free(&r->parser);
+    r->active = 0;
+}
+
+/* Main thread: run queued control packets, then render at most one frame (the
+ * newest). Returns non-zero if any work was done. */
+static int pump_network(struct app *a) {
+    int worked = 0;
+
+    for (;;) {
+        struct tb_ctrl_msg msg;
+        pthread_mutex_lock(&a->net_lock);
+        if (a->ctrl_count == 0) { pthread_mutex_unlock(&a->net_lock); break; }
+        msg = a->ctrl_q[a->ctrl_head];
+        a->ctrl_head = (a->ctrl_head + 1) % TB_CTRL_QUEUE_MAX;
+        a->ctrl_count--;
+        pthread_mutex_unlock(&a->net_lock);
+
+        on_packet(msg.type, msg.payload, msg.len, a);
+        free(msg.payload);
+        worked = 1;
+    }
+
+    uint8_t       *owned   = NULL;   /* buffer we take responsibility for */
+    size_t         owned_cap = 0;
+    const uint8_t *payload = NULL;
+    size_t         plen    = 0;
+    uint8_t        ptype   = TB_PKT_RAW_FRAME;
+
+    pthread_mutex_lock(&a->net_lock);
+    if (a->reader_recv_ms > a->last_recv_ms) a->last_recv_ms = a->reader_recv_ms;
+    if (a->frame_ready) {
+        owned     = a->frame_buf;
+        owned_cap = a->frame_cap;
+        payload   = a->frame_payload;
+        plen      = a->frame_len;
+        ptype     = a->frame_type;
+        a->frame_buf = NULL;
+        a->frame_cap = 0;
+        a->frame_payload = NULL;
+        a->frame_len = 0;
+        a->frame_ready = 0;
+        pthread_cond_signal(&a->frame_taken);
+    }
+    pthread_mutex_unlock(&a->net_lock);
+
+    if (owned) {
+        /* Frames bypass on_packet, so mark the session live here — otherwise
+         * the fullscreen gate never opens. */
+        a->session_active = 1;
+        if (ptype == TB_PKT_RAW_DAMAGE) handle_raw_damage(a, payload, plen);
+        else                            handle_raw_frame(a, payload, plen);
+        worked = 1;
+
+        /* Return the buffer for a reader to reuse; only free if the pool is
+         * full, so the steady state never allocates. */
+        pthread_mutex_lock(&a->net_lock);
+        if (a->pool_n < 6) {
+            a->pool_buf[a->pool_n] = owned;
+            a->pool_cap[a->pool_n] = owned_cap;
+            a->pool_n++;
+            owned = NULL;
+        }
+        pthread_mutex_unlock(&a->net_lock);
+        free(owned);   /* no-op when pooled */
+    }
+    return worked;
+}
+
+static void drop_pending_network(struct app *a) {
+    pthread_mutex_lock(&a->net_lock);
+    while (a->ctrl_count > 0) {
+        free(a->ctrl_q[a->ctrl_head].payload);
+        a->ctrl_head = (a->ctrl_head + 1) % TB_CTRL_QUEUE_MAX;
+        a->ctrl_count--;
+    }
+    a->frame_ready = 0;
+    a->frame_len = 0;
+    a->frame_payload = NULL;
+    free(a->frame_buf);
+    a->frame_buf = NULL;
+    a->frame_cap = 0;
+    for (int i = 0; i < a->pool_n; ++i) { free(a->pool_buf[i]); a->pool_buf[i] = NULL; }
+    a->pool_n = 0;
+    pthread_mutex_unlock(&a->net_lock);
+}
+
 static void close_secondary(struct app *a) {
+    link_reader_stop(a->reader2);
     if (a->client_fd2 >= 0) {
         close(a->client_fd2);
         a->client_fd2 = -1;
@@ -1703,8 +2142,11 @@ static void close_secondary(struct app *a) {
 
 static void close_client(struct app *a) {
     close_secondary(a);   /* the session is over — drop the second cable too */
+    link_reader_stop(a->reader1);
+    drop_pending_network(a);
     if (a->client_fd >= 0) close(a->client_fd);
     a->client_fd = -1;
+    a->session_active = 0;
     a->close_requested = 0;
     a->have_video_frame = 0;
     snprintf(a->input_control_mode, sizeof(a->input_control_mode), "off");
@@ -1792,6 +2234,15 @@ int main(int argc, char **argv) {
     a.server_fd = -1;
     a.client_fd = -1;
     a.client_fd2 = -1;
+    pthread_mutex_init(&a.net_lock, NULL);
+    pthread_cond_init(&a.frame_taken, NULL);
+    a.reader1 = (struct tb_link_reader *)calloc(1, sizeof(*a.reader1));
+    a.reader2 = (struct tb_link_reader *)calloc(1, sizeof(*a.reader2));
+    a.ctrl_q  = (struct tb_ctrl_msg *)calloc(TB_CTRL_QUEUE_MAX, sizeof(*a.ctrl_q));
+    if (!a.reader1 || !a.reader2 || !a.ctrl_q) {
+        fprintf(stderr, "[main] reader allocation failed\n");
+        return 1;
+    }
     {
         char host[96] = {0};
         if (gethostname(host, sizeof(host)) != 0 || host[0] == '\0') {
@@ -1853,7 +2304,14 @@ int main(int argc, char **argv) {
     a.last_fps_tick_ms = now_ms();
     a.last_ip_check_ms = 0;
 
+    /* Wall-clock accounting: every millisecond of the loop lands in exactly one
+     * bucket, so the bottleneck is read off rather than guessed at. Note the
+     * render runs inside the packet callback, hence inside drain — so
+     * recv+parse == drain - (upload+present) reported by [perf]. */
+    double acc_drain_ms = 0.0, acc_wait_ms = 0.0, acc_other_ms = 0.0;
+    double acc_since_ms = now_ms_f();
     while (!g_term) {
+        double loop_mark_ms = now_ms_f();
         unsigned int disp_actions = tb_disp_poll_actions(a.disp);
         int socket_activity = 0;
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, true);
@@ -1899,11 +2357,29 @@ int main(int argc, char **argv) {
             if (c >= 0) {
                 a.client_fd = c;
                 a.have_video_frame = 0;
+                a.session_active = 0;
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] client connected\n");
                 tb_parser_free(&a.parser);
                 tb_parser_init(&a.parser, on_packet, &a);
+                /* Threaded receive is OFF by default: measured on the 5K iMac
+                 * it moved `upload` from 12.4 ms to 27.9 ms for no fps gain.
+                 * The reader's memcpy into the frame mailbox adds ~118 MB/frame
+                 * of DRAM traffic that competes with the GPU upload's DMA, and
+                 * this machine is memory-bandwidth bound at 59 MB/frame. Worth
+                 * revisiting once the render path stops being the constraint. */
+                /* On by default: the drop rule is now type-aware, so damage
+                 * updates are never discarded (see the publish path). Threading
+                 * overlaps receive with the ~13 ms GPU upload, which is what
+                 * full-frame content — video, scrolling — is bound by.
+                 * TB_RECEIVER_THREADED_RX=0 forces the serial path. */
+                const char *rx_env = getenv("TB_RECEIVER_THREADED_RX");
+                int want_threaded = !(rx_env && (rx_env[0] == '0' || rx_env[0] == 'n'));
+                a.threaded_rx = want_threaded && (link_reader_start(a.reader1, &a, c) == 0);
+                if (want_threaded && !a.threaded_rx) {
+                    fprintf(stderr, "[main] falling back to inline (single-threaded) receive\n");
+                }
                 tb_receiver_refresh_input_capture(&a);
                 send_receiver_info(&a);
             }
@@ -1915,40 +2391,60 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[main] second cable connected (dual-cable)\n");
                 tb_parser_free(&a.parser2);
                 tb_parser_init(&a.parser2, on_packet, &a);
+                if (a.threaded_rx && link_reader_start(a.reader2, &a, c2) != 0) {
+                    fprintf(stderr, "[main] second cable reader failed; dropping cable 2\n");
+                    close(c2);
+                    a.client_fd2 = -1;
+                }
                 /* No receiver-info on the secondary: it's a send-only frame
                  * pipe and the sender never reads it. */
             }
         }
 
+        acc_other_ms += now_ms_f() - loop_mark_ms;
+        double drain_mark_ms = now_ms_f();
         if (a.client_fd >= 0) {
-            int drain_result = drain_socket(&a);   /* primary */
-            if (drain_result < 0) {
-                close_client(&a);                   /* also drops the secondary */
+            int fatal = 0;
+            if (a.threaded_rx) {
+                /* Reader threads own the sockets; here we only consume what
+                 * they produced and watch for a link that ended. */
+                socket_activity = pump_network(&a);
+                if (a.reader2 && a.reader2->active && a.reader2->ended) {
+                    close_secondary(&a);            /* fall back to one cable */
+                }
+                if (a.reader1 && a.reader1->ended) fatal = 1;
             } else {
-                socket_activity = drain_result;
-                if (drain_result > 0) a.last_recv_ms = t;
-
-                /* Drain the second cable's frames into its own parser. If it
-                 * drops, keep the primary alive and fall back to one cable. */
-                if (a.client_fd2 >= 0) {
-                    int d2 = drain_fd(a.client_fd2, &a.parser2);
-                    if (d2 < 0) {
-                        close_secondary(&a);
-                    } else {
-                        if (d2 > 0) { socket_activity = 1; a.last_recv_ms = t; }
+                int drain_result = drain_socket(&a);   /* primary */
+                if (drain_result < 0) {
+                    fatal = 1;
+                } else {
+                    socket_activity = drain_result;
+                    if (drain_result > 0) a.last_recv_ms = t;
+                    if (a.client_fd2 >= 0) {
+                        int d2 = drain_fd(a.client_fd2, &a.parser2);
+                        if (d2 < 0) {
+                            close_secondary(&a);
+                        } else {
+                            if (d2 > 0) { socket_activity = 1; a.last_recv_ms = t; }
+                        }
                     }
                 }
+            }
+            if (fatal) {
+                close_client(&a);                   /* also drops the secondary */
+            } else {
 
                 if (a.close_requested) {
                     close_client(&a);
-                } else if (t - a.last_recv_ms >= TB_SENDER_IDLE_TIMEOUT_MS) {
+                } else if (a.last_recv_ms < t &&
+                           t - a.last_recv_ms >= TB_SENDER_IDLE_TIMEOUT_MS) {
                     /* The sender streams frames continuously and heartbeats
                      * every 2s. Total silence means it died without a FIN
                      * (crash, pulled cable, force sleep). Without this reap,
                      * the dead fd is held forever and every future connect is
                      * locked out until the app is restarted. */
                     fprintf(stderr, "[main] no data from sender for %llu ms; closing stale session\n",
-                            (unsigned long long)(t - a.last_recv_ms));
+                            (unsigned long long)(t > a.last_recv_ms ? t - a.last_recv_ms : 0));
                     close_client(&a);
                 }
             }
@@ -1959,7 +2455,10 @@ int main(int argc, char **argv) {
             tb_receiver_poll_permissions(&a);
         }
 
-        if (a.client_fd < 0) {
+        if (a.client_fd < 0 || !a.session_active) {
+            /* No client, or a connection that hasn't started a real streaming
+             * session (e.g. a transient UI-language push during discovery):
+             * stay on the windowed waiting screen, don't flash fullscreen. */
             tb_disp_render_status(a.disp, a.display_host, a.status_text, a.sender_text, a.panel_text, a.mode_text, a.language_text, a.permissions_text);
         } else if (!a.have_video_frame) {
             tb_disp_render_connecting(a.disp);
@@ -2043,9 +2542,58 @@ int main(int argc, char **argv) {
         }
 
         /* Yield when idle or when a nonblocking active socket had no data,
-         * otherwise the receiver can busy-spin between incoming frame packets. */
-        if (a.client_fd < 0 || !a.have_video_frame || socket_activity == 0) {
-            SDL_Delay(1);
+         * otherwise the receiver can busy-spin between incoming frame packets.
+         *
+         * Wait on the sockets rather than sleeping blindly: a raw 5K frame is
+         * far larger than the socket buffer, so mid-frame the receiver drains
+         * it empty many times while the rest of the frame is still on the wire.
+         * A fixed sleep costs 1-2 ms on each of those, which at ~15-20 per
+         * frame burned ~20 ms — more than the GPU upload itself. poll() returns
+         * the moment bytes land, and the timeout only applies when the sender
+         * really has gone quiet. */
+        acc_drain_ms += now_ms_f() - drain_mark_ms;
+        double wait_mark_ms = now_ms_f();
+        if (a.threaded_rx && a.client_fd >= 0) {
+            /* Sockets belong to the reader threads; waiting on them here too
+             * would just duplicate their wakeups. Yield only when idle. */
+            if (socket_activity == 0) SDL_Delay(1);
+        } else if (a.client_fd < 0 || !a.have_video_frame || socket_activity == 0) {
+            struct pollfd pfds[2];
+            nfds_t npfd = 0;
+            if (a.client_fd >= 0) {
+                pfds[npfd].fd = a.client_fd;
+                pfds[npfd].events = POLLIN;
+                pfds[npfd].revents = 0;
+                npfd++;
+            }
+            if (a.client_fd2 >= 0) {
+                pfds[npfd].fd = a.client_fd2;
+                pfds[npfd].events = POLLIN;
+                pfds[npfd].revents = 0;
+                npfd++;
+            }
+            if (npfd > 0) {
+                /* Bounded so SDL events, the cursor overlay and the fps tick
+                 * stay responsive if the stream stalls. */
+                poll(pfds, npfd, 2);
+            } else {
+                SDL_Delay(1);
+            }
+        }
+        acc_wait_ms += now_ms_f() - wait_mark_ms;
+
+        {
+            double span = now_ms_f() - acc_since_ms;
+            if (span >= 1000.0 && a.client_fd >= 0) {
+                fprintf(stderr,
+                        "[loop] over %.0f ms: drain %.0f ms (%.0f%%) | wait %.0f ms (%.0f%%) | other %.0f ms (%.0f%%)\n",
+                        span,
+                        acc_drain_ms, acc_drain_ms * 100.0 / span,
+                        acc_wait_ms,  acc_wait_ms  * 100.0 / span,
+                        acc_other_ms, acc_other_ms * 100.0 / span);
+                acc_drain_ms = acc_wait_ms = acc_other_ms = 0.0;
+                acc_since_ms = now_ms_f();
+            }
         }
     }
 

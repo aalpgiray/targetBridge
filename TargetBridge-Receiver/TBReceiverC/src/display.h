@@ -75,10 +75,11 @@ void tb_disp_render_nv12(struct tb_display *d,
                          const uint8_t *uv, int uv_stride,
                          int w, int h);
 
-/* Render a packed 8-bit BGRA (4:4:4) frame — full chroma, no subsampling. */
-void tb_disp_render_rgba(struct tb_display *d,
-                         const uint8_t *rgba, int stride,
-                         int w, int h);
+/* Render a packed 4:4:4 frame — full chroma, no subsampling. `ten_bit` selects
+ * ARGB2101010 over 8-bit BGRA; both are 4 bytes/pixel. */
+void tb_disp_render_packed32(struct tb_display *d,
+                             const uint8_t *rgba, int stride,
+                             int w, int h, int ten_bit);
 
 /* Update low-latency local cursor overlay in source-frame coordinates. */
 void tb_disp_set_cursor(struct tb_display *d,

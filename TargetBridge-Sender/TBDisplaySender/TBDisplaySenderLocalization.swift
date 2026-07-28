@@ -291,8 +291,22 @@ enum TBDisplaySenderL10n {
         text("sender.label.video_path", language)
     }
 
-    static func videoPathValue(isRaw: Bool, _ language: TBDisplaySenderLanguage) -> String {
-        text(isRaw ? "sender.video_path.raw" : "sender.video_path.hevc", language)
+    /// Reports the pixel format and link count actually observed on the wire.
+    /// The format names are technical identifiers, so they stay untranslated.
+    static func videoPathValue(
+        isRaw: Bool,
+        isBGRA: Bool,
+        isTenBit: Bool,
+        dualCable: Bool,
+        _ language: TBDisplaySenderLanguage
+    ) -> String {
+        guard isRaw else { return text("sender.video_path.hevc", language) }
+        let links = text(dualCable ? "sender.video_path.two_cables" : "sender.video_path.one_cable", language)
+        let format: String
+        if isTenBit      { format = "10-bit 4:4:4" }
+        else if isBGRA   { format = "BGRA 4:4:4" }
+        else             { format = "NV12 4:2:0" }
+        return text("sender.video_path.raw_fmt", language, ["format": format, "links": links])
     }
 
     static func stateLabel(_ language: TBDisplaySenderLanguage) -> String {

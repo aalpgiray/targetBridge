@@ -47,6 +47,17 @@
 #define TB_PKT_FRAME            0x21
 #define TB_PKT_RAW_FRAME        0x22  /* uncompressed NV12 planes (raw passthrough) */
 #define TB_PKT_AUDIO_FRAME      0x23
+/* Damage update: only the rectangles that changed since the previous frame.
+ * ScreenCaptureKit hands the sender the WindowServer's own dirty rects, so
+ * detection is free; this just avoids resending the ~98% of a 5K desktop that
+ * is usually identical frame to frame.
+ *   [1] format (2 = BGRA8888, 3 = ARGB2101010 — packed 32bpp only)
+ *   [4] frame width   [4] frame height
+ *   [2] rect count
+ *   per rect: [4] x  [4] y  [4] w  [4] h  then w*h*4 bytes, rows packed tight
+ * A full TB_PKT_RAW_FRAME must arrive first (and periodically after) so the
+ * receiver has a complete base image to patch into. */
+#define TB_PKT_RAW_DAMAGE       0x24
 #define TB_PKT_HEARTBEAT        0x30
 #define TB_PKT_TEARDOWN         0x31
 #define TB_PKT_CURSOR           0x32

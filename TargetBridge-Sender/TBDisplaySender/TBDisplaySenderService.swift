@@ -396,6 +396,21 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var secondaryConnection: NWConnection?
     private var pendingVideoPacketsSecondary = 0
     private var rawFrameCounter = 0
+    /// Damage streaming: send whole frames only when we must (first frame,
+    /// format/size change, too much changed, or a periodic resync) and send
+    /// just the changed rectangles otherwise.
+    /// Send only changed rectangles instead of whole frames. Set from the
+    /// session's user-facing toggle before start().
+    var damageEnabled = true
+    private var framesSinceKeyframe = 0
+    /// Set whenever a frame is skipped (backpressure) or anything else could
+    /// have left the receiver's base image stale. Forces one full frame.
+    private var needsKeyframe = true
+    /// Dirty rects from frames we had to skip, folded into the next send.
+    private var carriedDirty: [TBDirtyRect] = []
+    private var lastDamageFormat: UInt8 = 0
+    private var lastDamageW = 0
+    private var lastDamageH = 0
 
     // Confined to `queue`.
     private var vtEncoder: VTCompressionSession?
@@ -557,6 +572,19 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// never disagree with what the wire actually carries.
     var rawPassthroughActive: Bool { rawEnabled }
 
+    /// Pixel format and link usage as *observed while sending*, not as derived
+    /// from configuration. A 4:4:4 session that silently fell back to one cable
+    /// is indistinguishable from a bandwidth fault unless the UI reports what
+    /// actually went out, so these are recorded in `sendRawFrame` itself.
+    private var _rawFormatIsBGRA = false
+    private var _rawFormatIsTenBit = false
+    private var _sentFramesSecondary = 0
+    var rawFormatIsBGRA: Bool { lock.lock(); defer { lock.unlock() }; return _rawFormatIsBGRA }
+    var rawFormatIsTenBit: Bool { lock.lock(); defer { lock.unlock() }; return _rawFormatIsTenBit }
+    var secondaryLinkCarriedFrames: Bool {
+        lock.lock(); defer { lock.unlock() }; return _sentFramesSecondary > 0
+    }
+
     /// SCStream capture path. Must be dispatched onto `queue` by the caller.
     func encode(_ sampleBuffer: CMSampleBuffer) {
         markCaptureFrame()
@@ -681,6 +709,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
 
     /// Dual-cable: attach the second cable's connection once it's `ready`.
     /// From the next frame on, raw frames interleave across both links.
+    /// A new link starts with no base image on the far side.
+    func requestKeyframe() { needsKeyframe = true }
+
     func attachSecondaryConnection(_ conn: NWConnection) {
         queue.async { [weak self] in self?.secondaryConnection = conn }
     }
@@ -708,9 +739,24 @@ private final class TBVideoPipeline: @unchecked Sendable {
         let useSecondary = (secondaryConnection != nil) && (rawFrameCounter & 1 == 1)
         rawFrameCounter &+= 1
         let targetConnection = useSecondary ? (secondaryConnection ?? connection) : connection
-        if useSecondary {
-            if pendingVideoPacketsSecondary >= preset.maxPendingVideoPackets { return }
-        } else if pendingVideoPackets >= preset.maxPendingVideoPackets {
+        let backedUp = useSecondary
+            ? pendingVideoPacketsSecondary >= preset.maxPendingVideoPackets
+            : pendingVideoPackets >= preset.maxPendingVideoPackets
+        if backedUp {
+            // A skipped frame's damage would otherwise be lost for good, since
+            // the receiver cannot know it missed an update. Carry the rects
+            // forward and fold them into the next packet we do send — the
+            // pixels come from the newer frame, which is what we want anyway.
+            // (Forcing a full frame here instead caused a feedback loop: 59 MB
+            // takes longer than a frame period, producing more backpressure,
+            // more drops and more full frames — it pinned the stream at 26 fps.)
+            if lastDamageW > 0,
+               let r = Self.dirtyRects(from: sampleBuffer, width: lastDamageW, height: lastDamageH) {
+                carriedDirty.append(contentsOf: r)
+                if carriedDirty.count > 64 { needsKeyframe = true; carriedDirty.removeAll() }
+            } else {
+                needsKeyframe = true
+            }
             return
         }
 
@@ -740,6 +786,80 @@ private final class TBVideoPipeline: @unchecked Sendable {
             let uvHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)
             let ySize = yStride * height
             let uvSize = uvStride * uvHeight
+
+            // Damage path for NV12. Chroma is half resolution in both axes, so
+            // every rect is snapped outward to even coordinates — an odd edge
+            // would put the chroma rect off by half a sample and fringe the
+            // boundary of each updated region.
+            if damageEnabled,
+               !needsKeyframe,
+               secondaryConnection == nil,
+               lastDamageFormat == 1, width == lastDamageW, height == lastDamageH,
+               framesSinceKeyframe < 60,
+               let fresh = Self.dirtyRects(from: sampleBuffer, width: width, height: height),
+               case let rects = (carriedDirty + fresh).map({ r -> TBDirtyRect in
+                   let x0 = r.x & ~1, y0 = r.y & ~1
+                   let x1 = min(width,  (r.x + r.w + 1) & ~1)
+                   let y1 = min(height, (r.y + r.h + 1) & ~1)
+                   return TBDirtyRect(x: x0, y: y0, w: x1 - x0, h: y1 - y0)
+               }).filter({ $0.w > 0 && $0.h > 0 }),
+               !rects.isEmpty, rects.count <= 64,
+               rects.reduce(0, { $0 + $1.w * $1.h }) * 2 < width * height {
+
+                var d = Data(capacity: 11 + rects.reduce(0) { $0 + 16 + $1.w * $1.h * 3 / 2 })
+                d.append(1)
+                TBMonitorProtocol.appendBE32(&d, UInt32(width))
+                TBMonitorProtocol.appendBE32(&d, UInt32(height))
+                d.append(UInt8((rects.count >> 8) & 0xFF))
+                d.append(UInt8(rects.count & 0xFF))
+                let ySrc  = yBase.assumingMemoryBound(to: UInt8.self)
+                let uvSrc = uvBase.assumingMemoryBound(to: UInt8.self)
+                for r in rects {
+                    TBMonitorProtocol.appendBE32(&d, UInt32(r.x))
+                    TBMonitorProtocol.appendBE32(&d, UInt32(r.y))
+                    TBMonitorProtocol.appendBE32(&d, UInt32(r.w))
+                    TBMonitorProtocol.appendBE32(&d, UInt32(r.h))
+                    for row in 0..<r.h {
+                        d.append(UnsafeBufferPointer(start: ySrc + (r.y + row) * yStride + r.x,
+                                                     count: r.w))
+                    }
+                    // One UV row per two luma rows; r.w bytes covers r.w/2
+                    // chroma pairs, so the byte offset is r.x either way.
+                    for row in 0..<(r.h / 2) {
+                        d.append(UnsafeBufferPointer(start: uvSrc + (r.y / 2 + row) * uvStride + r.x,
+                                                     count: r.w))
+                    }
+                }
+                carriedDirty.removeAll(keepingCapacity: true)
+                framesSinceKeyframe += 1
+                let dmg = TBMonitorProtocol.makePacket(type: .rawDamage, payload: d)
+                if useSecondary { pendingVideoPacketsSecondary += 1 } else { pendingVideoPackets += 1 }
+                targetConnection.send(content: dmg, completion: .contentProcessed({ [weak self] _ in
+                    guard let self else { return }
+                    self.queue.async {
+                        if useSecondary {
+                            self.pendingVideoPacketsSecondary = max(0, self.pendingVideoPacketsSecondary - 1)
+                        } else {
+                            self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+                        }
+                    }
+                }))
+                lock.lock()
+                _sentFrames += 1
+                _rawFormatIsBGRA = false
+                _rawFormatIsTenBit = false
+                if useSecondary { _sentFramesSecondary += 1 }
+                lock.unlock()
+                return
+            }
+
+            lastDamageFormat = 1
+            lastDamageW = width
+            lastDamageH = height
+            framesSinceKeyframe = 0
+            needsKeyframe = false
+            carriedDirty.removeAll(keepingCapacity: true)
+
             var p = Data(capacity: 17 + ySize + uvSize)
             p.append(1) // format: NV12 4:2:0
             TBMonitorProtocol.appendBE32(&p, UInt32(width))
@@ -750,14 +870,89 @@ private final class TBVideoPipeline: @unchecked Sendable {
             p.append(UnsafeBufferPointer(start: uvBase.assumingMemoryBound(to: UInt8.self), count: uvSize))
             payload = p
         } else {
-            // BGRA (4:4:4, 8-bit) — one packed plane. format byte = 2.
+            // Packed 4:4:4, one plane: BGRA8888 (format 2) or 2-10-10-10
+            // (format 3). Both are 4 bytes/pixel, so the layout is identical
+            // apart from the format byte the receiver keys its texture off.
             guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+            let isTenBit = CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_ARGB2101010LEPacked
             let width = CVPixelBufferGetWidth(pixelBuffer)
             let height = CVPixelBufferGetHeight(pixelBuffer)
             let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
             let size = stride * height
+            if isTenBit { probeTenBitDepth(base, width: width, height: height, stride: stride) }
+            let fmt: UInt8 = isTenBit ? 3 : 2
+
+            // Damage path: resend only what the WindowServer says changed.
+            // A full frame is still required on the first frame, on any format
+            // or size change, periodically as a resync, and when the damaged
+            // area is big enough that per-rect overhead outweighs the saving.
+            if damageEnabled,
+               !needsKeyframe,
+               // Damage is incremental, so it must arrive in order. Dual-cable
+               // interleaves whole frames across two links with no sequencing,
+               // which would apply updates out of order. (Dual-cable also
+               // measured slower than a single link, so this costs nothing.)
+               secondaryConnection == nil,
+               fmt == lastDamageFormat, width == lastDamageW, height == lastDamageH,
+               // ~1s resync. A 59 MB full frame takes longer than a frame
+               // period to transmit, so sending them too often is itself a
+               // source of backpressure — 0.5s measurably hurt.
+               framesSinceKeyframe < 60,
+               let fresh = Self.dirtyRects(from: sampleBuffer, width: width, height: height),
+               case let rects = (carriedDirty + fresh),
+               !rects.isEmpty, rects.count <= 64,
+               rects.reduce(0, { $0 + $1.w * $1.h }) * 2 < width * height {
+
+                var d = Data(capacity: 11 + rects.reduce(0) { $0 + 16 + $1.w * $1.h * 4 })
+                d.append(fmt)
+                TBMonitorProtocol.appendBE32(&d, UInt32(width))
+                TBMonitorProtocol.appendBE32(&d, UInt32(height))
+                d.append(UInt8((rects.count >> 8) & 0xFF))
+                d.append(UInt8(rects.count & 0xFF))
+                let src = base.assumingMemoryBound(to: UInt8.self)
+                for r in rects {
+                    TBMonitorProtocol.appendBE32(&d, UInt32(r.x))
+                    TBMonitorProtocol.appendBE32(&d, UInt32(r.y))
+                    TBMonitorProtocol.appendBE32(&d, UInt32(r.w))
+                    TBMonitorProtocol.appendBE32(&d, UInt32(r.h))
+                    // Rows packed tight — the source stride's padding is not sent.
+                    for row in 0..<r.h {
+                        d.append(UnsafeBufferPointer(start: src + (r.y + row) * stride + r.x * 4,
+                                                     count: r.w * 4))
+                    }
+                }
+                carriedDirty.removeAll(keepingCapacity: true)
+                framesSinceKeyframe += 1
+                let dmg = TBMonitorProtocol.makePacket(type: .rawDamage, payload: d)
+                if useSecondary { pendingVideoPacketsSecondary += 1 } else { pendingVideoPackets += 1 }
+                targetConnection.send(content: dmg, completion: .contentProcessed({ [weak self] _ in
+                    guard let self else { return }
+                    self.queue.async {
+                        if useSecondary {
+                            self.pendingVideoPacketsSecondary = max(0, self.pendingVideoPacketsSecondary - 1)
+                        } else {
+                            self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+                        }
+                    }
+                }))
+                lock.lock()
+                _sentFrames += 1
+                _rawFormatIsBGRA = true
+                _rawFormatIsTenBit = isTenBit
+                if useSecondary { _sentFramesSecondary += 1 }
+                lock.unlock()
+                return
+            }
+
+            lastDamageFormat = fmt
+            lastDamageW = width
+            lastDamageH = height
+            framesSinceKeyframe = 0
+            needsKeyframe = false
+            carriedDirty.removeAll(keepingCapacity: true)
+
             var p = Data(capacity: 13 + size)
-            p.append(2) // format: BGRA8888 4:4:4
+            p.append(fmt) // format: ARGB2101010 / BGRA8888, both 4:4:4
             TBMonitorProtocol.appendBE32(&p, UInt32(width))
             TBMonitorProtocol.appendBE32(&p, UInt32(height))
             TBMonitorProtocol.appendBE32(&p, UInt32(stride))
@@ -777,7 +972,78 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 }
             }
         }))
-        lock.lock(); _sentFrames += 1; lock.unlock()
+        lock.lock()
+        _sentFrames += 1
+        _rawFormatIsBGRA = !planar
+        _rawFormatIsTenBit = CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_ARGB2101010LEPacked
+        if useSecondary { _sentFramesSecondary += 1 }
+        lock.unlock()
+    }
+
+
+    /// Is the captured 10-bit frame *actually* carrying 10 bits?
+    ///
+    /// `CGVirtualDisplay` exposes no way to request a 10-bit framebuffer (the
+    /// private API has no depth property at all), so the desktop may well be
+    /// composited at 8-bit and merely widened into 'l10r' on capture. In that
+    /// case every channel is a multiple of 4 and the low 2 bits are always
+    /// zero — which is directly measurable. Sampled on a prime stride so we
+    /// cover the frame without walking all 14.7M pixels.
+    private var tenBitProbeCountdown = 0
+    private func probeTenBitDepth(_ base: UnsafeMutableRawPointer, width: Int, height: Int, stride: Int) {
+        if tenBitProbeCountdown > 0 { tenBitProbeCountdown -= 1; return }
+        tenBitProbeCountdown = 180   // roughly every 3s at 60fps
+
+        var sampled = 0
+        var deep = 0
+        let rowWords = stride / 4
+        var index = 0
+        let total = rowWords * height
+        while index < total && sampled < 20_000 {
+            let word = base.load(fromByteOffset: index * 4, as: UInt32.self)
+            let r = (word >> 20) & 0x3FF
+            let g = (word >> 10) & 0x3FF
+            let b = word & 0x3FF
+            if ((r | g | b) & 3) != 0 { deep += 1 }
+            sampled += 1
+            index += 997      // prime: spreads samples across rows and columns
+        }
+        guard sampled > 0 else { return }
+        let pct = Double(deep) * 100.0 / Double(sampled)
+        TBLog.connection.info(
+            "10-bit probe: \(deep, privacy: .public)/\(sampled, privacy: .public) samples carry sub-8-bit detail (\(String(format: "%.2f", pct), privacy: .public)%) — 0% means the source is 8-bit padded into l10r"
+        )
+    }
+
+
+    struct TBDirtyRect { let x: Int; let y: Int; let w: Int; let h: Int }
+
+    /// Pull the WindowServer's dirty rectangles off the sample buffer. This is
+    /// why damage detection costs nothing: the compositor already computed the
+    /// changed regions to draw the frame, and ScreenCaptureKit attaches them.
+    /// Returns nil when unavailable, which forces a full frame.
+    private static func dirtyRects(from sb: CMSampleBuffer, width: Int, height: Int) -> [TBDirtyRect]? {
+        guard let arr = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false)
+                as? [[SCStreamFrameInfo: Any]],
+              let info = arr.first,
+              let raw = info[.dirtyRects] as? [[String: Any]]
+        else { return nil }
+
+        var out: [TBDirtyRect] = []
+        out.reserveCapacity(raw.count)
+        for entry in raw {
+            guard let r = CGRect(dictionaryRepresentation: entry as CFDictionary) else { return nil }
+            // Clamp into the frame and round outward, so a fractional rect can
+            // never leave a stale sliver behind.
+            let x0 = max(0, Int(r.minX.rounded(.down)))
+            let y0 = max(0, Int(r.minY.rounded(.down)))
+            let x1 = min(width,  Int(r.maxX.rounded(.up)))
+            let y1 = min(height, Int(r.maxY.rounded(.up)))
+            if x1 <= x0 || y1 <= y0 { continue }
+            out.append(TBDirtyRect(x: x0, y: y0, w: x1 - x0, h: y1 - y0))
+        }
+        // A great many small rects costs more in overhead than it saves.
+        return out.count <= 64 ? out : nil
     }
 
     private func buildParamSetsPacket(from format: CMVideoFormatDescription, codecType: CMVideoCodecType) -> Data? {
@@ -872,9 +1138,29 @@ final class TBSessionLiveMetrics: ObservableObject {
     @Published var senderFPS = 0
 }
 
+/// Thread-safe one-shot latch. `NWConnection` state handlers run on an
+/// arbitrary queue and can fire more than once; a continuation must be resumed
+/// exactly once.
+private final class TBOnceFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var used = false
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if used { return false }
+        used = true
+        return true
+    }
+}
+
 @MainActor
 final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @unchecked Sendable {
     private static let receiverIPDefaultsKey = "fd.tbdisplaysender.receiverIP"
+    private static let dualCableEnabledDefaultsKey = "fd.tbdisplaysender.dualCableEnabled"
+    private static let secondaryLocalIPDefaultsKey = "fd.tbdisplaysender.secondaryLocalIP"
+    private static let secondaryReceiverIPDefaultsKey = "fd.tbdisplaysender.secondaryReceiverIP"
+    private static let fullColor444DefaultsKey = "fd.tbdisplaysender.fullColor444"
+    private static let tenBitDefaultsKey = "fd.tbdisplaysender.tenBit"
+    private static let damageRectsDefaultsKey = "fd.tbdisplaysender.damageRects"
     private struct SavedExtendedDisplayArrangement {
         let x: Int32
         let y: Int32
@@ -1014,13 +1300,34 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     // are set, a second connection carries half the frames (interleaved) to
     // roughly double throughput. Locked while streaming, like the other stream
     // settings.
-    @Published var dualCableEnabled = false
-    @Published var secondaryLocalInterfaceIP = ""
-    @Published var secondaryReceiverIP = ""
+    // Persisted like receiverIP: a relaunch that silently dropped back to a
+    // single cable looks identical to a bandwidth problem, so these survive.
+    @Published var dualCableEnabled = UserDefaults.standard.bool(forKey: dualCableEnabledDefaultsKey) {
+        didSet { UserDefaults.standard.set(dualCableEnabled, forKey: Self.dualCableEnabledDefaultsKey) }
+    }
+    @Published var secondaryLocalInterfaceIP = UserDefaults.standard.string(forKey: secondaryLocalIPDefaultsKey) ?? "" {
+        didSet { UserDefaults.standard.set(secondaryLocalInterfaceIP, forKey: Self.secondaryLocalIPDefaultsKey) }
+    }
+    @Published var secondaryReceiverIP = UserDefaults.standard.string(forKey: secondaryReceiverIPDefaultsKey) ?? "" {
+        didSet { UserDefaults.standard.set(secondaryReceiverIP, forKey: Self.secondaryReceiverIPDefaultsKey) }
+    }
     // Full-color 4:4:4: capture 8-bit BGRA instead of 4:2:0 NV12 — no chroma
     // subsampling, so colored edges/text are crisp. ~28 Gb/s at 5K@60, so it
     // realistically needs dual-cable. Raw presets only.
-    @Published var fullColor444 = false
+    @Published var fullColor444 = UserDefaults.standard.bool(forKey: fullColor444DefaultsKey) {
+        didSet { UserDefaults.standard.set(fullColor444, forKey: Self.fullColor444DefaultsKey) }
+    }
+    /// 10-bit packed 2-10-10-10. Same 4 bytes/pixel as 8-bit BGRA, so it costs
+    /// no extra bandwidth — it only removes gradient banding. Needs `fullColor444`.
+    @Published var tenBit = UserDefaults.standard.bool(forKey: tenBitDefaultsKey) {
+        didSet { UserDefaults.standard.set(tenBit, forKey: Self.tenBitDefaultsKey) }
+    }
+    /// Send only the rectangles that changed. Big win for static/desktop work;
+    /// no help when the whole screen changes every frame (video, scrolling),
+    /// where it adds per-rect overhead on top of a full frame. Default on.
+    @Published var damageRects: Bool = UserDefaults.standard.object(forKey: damageRectsDefaultsKey) as? Bool ?? true {
+        didSet { UserDefaults.standard.set(damageRects, forKey: Self.damageRectsDefaultsKey) }
+    }
     @Published var selectedReceiverID = "" {
         didSet {
             if selectedReceiverID.isEmpty {
@@ -1032,6 +1339,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
     @Published var isCableTesting = false
     @Published var cableTestResult: Double? = nil
+    /// Per-cable breakdown for a dual-cable run; nil for a single-cable test.
+    @Published var cableTestDetail: String? = nil
     private var isCableTestConnection = false
     @Published var receiverIP: String = UserDefaults.standard.string(forKey: receiverIPDefaultsKey) ?? "" {
         didSet {
@@ -1094,6 +1403,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// frame. `true` = raw NV12 passthrough (`RAW=1`), `false` = HEVC. Drives the
     /// "Video path" row in the session card.
     @Published var videoPathIsRaw = false
+    /// Both observed from the pipeline, not from config — see `rawFormatIsBGRA`.
+    @Published var videoPathIsBGRA = false
+    @Published var videoPathIsTenBit = false
+    @Published var videoPathDualCable = false
     // Live FPS readout. Kept on a dedicated observable so its once-per-second
     // update only re-renders the small FPS subview — not the whole session card
     // or (via the manager's objectWillChange bubble-up) the entire window.
@@ -1396,8 +1709,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// hand it to the running pipeline. Bound to `secondaryLocalInterfaceIP`,
     /// dials `secondaryReceiverIP`. If it never comes up, the pipeline just keeps
     /// all frames on the primary (graceful single-cable fallback).
-    private func openSecondaryConnection(for pipeline: TBVideoPipeline) {
-        guard secondaryConnection == nil else { return }
+    /// Builds (but does not start) a connection bound to the second cable's
+    /// local interface. Shared by the streaming path and the cable test so both
+    /// dial cable 2 identically.
+    private func makeSecondaryConnection() -> NWConnection {
         let tcpOptions = NWProtocolTCP.Options()
         tcpOptions.noDelay = true
         let params = NWParameters(tls: nil, tcp: tcpOptions)
@@ -1418,9 +1733,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         } else {
             dialHost = NWEndpoint.Host(secondaryReceiverIP)
         }
-        let conn = NWConnection(host: dialHost, port: NWEndpoint.Port(integerLiteral: TBMonitorProtocol.port), using: params)
-        secondaryConnection = conn
         TBLog.connection.info("connect(secondary): dialing \(scopedHost, privacy: .public) from \(self.secondaryLocalInterfaceIP, privacy: .public)")
+        return NWConnection(host: dialHost, port: NWEndpoint.Port(integerLiteral: TBMonitorProtocol.port), using: params)
+    }
+
+    private func openSecondaryConnection(for pipeline: TBVideoPipeline) {
+        guard secondaryConnection == nil else { return }
+        let conn = makeSecondaryConnection()
+        secondaryConnection = conn
         conn.stateUpdateHandler = { [weak self, weak conn, weak pipeline] state in
             Task { @MainActor [weak self, weak conn, weak pipeline] in
                 guard let self, let conn, self.secondaryConnection === conn else { return }
@@ -1536,16 +1856,81 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         guard !isCableTesting, !isConnected, !receiverIP.isEmpty else { return }
         isCableTesting = true
         cableTestResult = nil
+        cableTestDetail = nil
         isCableTestConnection = true
         connect()
     }
 
+    /// Runs the throughput test. With dual cable configured, both links are
+    /// driven **concurrently** so the result reflects what the pair can carry
+    /// together — a sequential test would just measure each cable twice and
+    /// miss any shared ceiling (driver locks, host bus) that only appears
+    /// under simultaneous load.
     private func performCableTest() async throws -> Double {
-        guard let conn = connection else {
-            throw NSError(domain: "TBDisplaySenderService", code: -1, userInfo: [NSLocalizedDescriptionKey: "No connection"])
+        guard let primary = connection else {
+            throw NSError(domain: "TBDisplaySenderService", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "No connection"])
         }
 
-        let totalBytes: Int64 = 20 * 1000 * 1000 * 1000
+        let wantsDual = dualCableEnabled
+            && !secondaryLocalInterfaceIP.isEmpty
+            && !secondaryReceiverIP.isEmpty
+
+        guard wantsDual else {
+            let rate = try await pushCableTestBytes(on: primary, totalBytes: 20 * 1000 * 1000 * 1000)
+            cableTestDetail = nil
+            return rate
+        }
+
+        // Half the payload per link, so a dual run takes the same wall-clock
+        // time as a single one.
+        let perLink: Int64 = 10 * 1000 * 1000 * 1000
+
+        let secondary = makeSecondaryConnection()
+        defer {
+            secondary.stateUpdateHandler = nil
+            secondary.cancel()
+        }
+        do {
+            let once = TBOnceFlag()
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                secondary.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready:
+                        if once.claim() { c.resume() }
+                    case .failed(let e), .waiting(let e):
+                        if once.claim() { c.resume(throwing: e) }
+                    default: break
+                    }
+                }
+                secondary.start(queue: DispatchQueue.global(qos: .userInitiated))
+            }
+        } catch {
+            // Cable 2 unreachable — report cable 1 alone rather than failing.
+            TBLog.connection.warning("cable test: cable 2 unavailable (\(error.localizedDescription, privacy: .public)); testing cable 1 only")
+            let rate = try await pushCableTestBytes(on: primary, totalBytes: 20 * 1000 * 1000 * 1000)
+            cableTestDetail = "cable 2 unavailable"
+            return rate
+        }
+
+        let started = DispatchTime.now()
+        async let a = pushCableTestBytes(on: primary, totalBytes: perLink)
+        async let b = pushCableTestBytes(on: secondary, totalBytes: perLink)
+        let (rateA, rateB) = try await (a, b)
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1e9
+
+        // Aggregate over wall-clock: the links overlap, so summing their
+        // individual rates would overstate what the pair actually sustained.
+        let aggregate = Double(perLink * 2) * 8.0 / 1e9 / elapsed
+        cableTestDetail = String(format: "cable 1: %.1f · cable 2: %.1f Gb/s", rateA, rateB)
+        TBLog.connection.info("cable test: cable1=\(rateA, privacy: .public) cable2=\(rateB, privacy: .public) aggregate=\(aggregate, privacy: .public) Gb/s")
+        return aggregate
+    }
+
+    /// Push `totalBytes` down one link as fast as it will accept them and
+    /// return the achieved rate in Gb/s. Used once per cable so a dual-cable
+    /// run measures each link and their aggregate.
+    private func pushCableTestBytes(on conn: NWConnection, totalBytes: Int64) async throws -> Double {
         let chunkSize = 4 * 1000 * 1000
         let totalChunks = Int(totalBytes / Int64(chunkSize))
 
@@ -2415,6 +2800,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     Task { @MainActor in self?.handleFirstEncodedFrame() }
                 }
             )
+            pipeline.damageEnabled = damageRects
             guard pipeline.start() else { return false }
             self.pipeline = pipeline
             TBLog.connection.info("capture: pipeline started preset=\(preset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) codec=\(codecName, privacy: .public)")
@@ -2448,7 +2834,20 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             configuration.minimumFrameInterval = CMTime(value: 1, timescale: Int32(preset.expectedFrameRate))
             configuration.queueDepth = preset.queueDepth
             // Full-color 4:4:4 raw = capture packed BGRA; otherwise 4:2:0 NV12.
-            if fullColor444 && preset.isRawPassthrough {
+            // 10-bit uses packed 2-10-10-10, which is also 4 bytes/pixel — same
+            // bandwidth and same per-frame cost as 8-bit BGRA, just finer
+            // gradients. Requires 4:4:4 (there is no subsampled 10-bit here).
+            if fullColor444 && tenBit && preset.isRawPassthrough {
+                configuration.pixelFormat = kCVPixelFormatType_ARGB2101010LEPacked
+                // Requesting a colour space makes SCK convert, and a conversion
+                // computed at 10-bit precision fabricates low-order bits out of
+                // 8-bit input — which makes the "is this really 10-bit?" probe
+                // below meaningless. TB_RAW_NO_COLORSPACE=1 skips it so the
+                // captured values are whatever the framebuffer actually holds.
+                if ProcessInfo.processInfo.environment["TB_RAW_NO_COLORSPACE"] != "1" {
+                    configuration.colorSpaceName = CGColorSpace.displayP3
+                }
+            } else if fullColor444 && preset.isRawPassthrough {
                 configuration.pixelFormat = kCVPixelFormatType_32BGRA
             } else {
                 configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
@@ -3141,6 +3540,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         liveMetrics.senderFPS = 0
         senderFPS = 0
         videoPathIsRaw = false
+        videoPathIsBGRA = false
+        videoPathIsTenBit = false
+        videoPathDualCable = false
         sentSnapshot = 0
         cursorDisplayID = kCGNullDirectDisplay
         lastCursorPacket = nil
@@ -3174,6 +3576,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 liveMetrics.senderFPS = fps
                 senderFPS = fps
                 sentSnapshot = total
+                // Refresh the observed path each tick: the second link can only
+                // be seen once an odd frame has actually gone out.
+                videoPathIsBGRA = pipeline?.rawFormatIsBGRA ?? false
+                videoPathIsTenBit = pipeline?.rawFormatIsTenBit ?? false
+                videoPathDualCable = pipeline?.secondaryLinkCarriedFrames ?? false
             }
         }
     }

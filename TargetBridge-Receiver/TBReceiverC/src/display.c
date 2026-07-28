@@ -9,6 +9,7 @@
 #include "display.h"
 #include "tb_i18n.h"
 #include "tb_gesture_bridge.h"
+#include "tb_metal_plane.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
@@ -17,6 +18,7 @@
 #include <dlfcn.h>
 
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -589,10 +591,17 @@ struct tb_display *tb_disp_create(int fullscreen) {
     SDL_SetYUVConversionMode(SDL_YUV_CONVERSION_BT709);
     SDL_RenderSetLogicalSize(d->ren, 0, 0);
 
-    /* report which backend SDL picked */
+    /* report which backend SDL picked, and which texture formats it can take
+     * natively — a format missing from this list is converted per frame on the
+     * CPU, which at 5K costs far more than the upload itself. */
     SDL_RendererInfo info;
     if (SDL_GetRendererInfo(d->ren, &info) == 0) {
         fprintf(stderr, "[disp] renderer = %s\n", info.name);
+        fprintf(stderr, "[disp] native texture formats:");
+        for (Uint32 i = 0; i < info.num_texture_formats; ++i) {
+            fprintf(stderr, " %s", SDL_GetPixelFormatName(info.texture_formats[i]));
+        }
+        fprintf(stderr, "\n");
     }
 
     int win_w = 0, win_h = 0, out_w = 0, out_h = 0;
@@ -641,13 +650,65 @@ void tb_disp_destroy(struct tb_display *d) {
     free(d);
 }
 
+/* ---- per-frame stage timing -------------------------------------------
+ * Splits a frame into upload (SDL_UpdateTexture) vs present (draw + swap) so
+ * a slow path can be attributed instead of guessed at. Printed once a second.
+ */
+static double tb_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static struct {
+    double upload_ms;
+    double present_ms;
+    int    frames;
+    double last_report_ms;
+} tb_frame_stats;
+
+static void tb_frame_stats_add(const char *tag, double upload_ms, double present_ms) {
+    tb_frame_stats.upload_ms  += upload_ms;
+    tb_frame_stats.present_ms += present_ms;
+    tb_frame_stats.frames++;
+
+    double now = tb_now_ms();
+    if (tb_frame_stats.last_report_ms == 0.0) tb_frame_stats.last_report_ms = now;
+    double span = now - tb_frame_stats.last_report_ms;
+    if (span < 1000.0) return;
+
+    int n = tb_frame_stats.frames;
+    fprintf(stderr,
+            "[perf] %s %.1f fps | upload %.1f ms | present %.1f ms | total %.1f ms/frame\n",
+            tag, n * 1000.0 / span,
+            tb_frame_stats.upload_ms / n,
+            tb_frame_stats.present_ms / n,
+            (tb_frame_stats.upload_ms + tb_frame_stats.present_ms) / n);
+
+    tb_frame_stats.upload_ms = tb_frame_stats.present_ms = 0.0;
+    tb_frame_stats.frames = 0;
+    tb_frame_stats.last_report_ms = now;
+}
+
 static int tb_disp_ensure_texture_fmt(struct tb_display *d, int w, int h, Uint32 fmt) {
     if (d->tex && d->tex_w == w && d->tex_h == h && d->tex_format == fmt) return 0;
     if (d->tex) { SDL_DestroyTexture(d->tex); d->tex = NULL; }
 
     d->tex = SDL_CreateTexture(d->ren, fmt, SDL_TEXTUREACCESS_STREAMING, w, h);
     if (!d->tex) {
-        fprintf(stderr, "[disp] CreateTexture(%u): %s\n", (unsigned)fmt, SDL_GetError());
+        fprintf(stderr, "[disp] CreateTexture(%s): %s\n",
+                SDL_GetPixelFormatName(fmt), SDL_GetError());
+        /* Most likely an unsupported format (e.g. 10-bit on a backend that
+         * only advertises 8-bit). Name what the renderer does support so the
+         * failure is actionable rather than a frozen frame. */
+        SDL_RendererInfo info;
+        if (SDL_GetRendererInfo(d->ren, &info) == 0) {
+            fprintf(stderr, "[disp] renderer '%s' texture formats:", info.name);
+            for (Uint32 i = 0; i < info.num_texture_formats; ++i) {
+                fprintf(stderr, " %s", SDL_GetPixelFormatName(info.texture_formats[i]));
+            }
+            fprintf(stderr, "\n[disp] for 10-bit try: TB_RECEIVER_RENDER_DRIVER=opengl\n");
+        }
         return -1;
     }
     d->tex_w = w;
@@ -1131,33 +1192,67 @@ void tb_disp_render_nv12(struct tb_display *d,
                          const uint8_t *y, int y_stride,
                          const uint8_t *uv, int uv_stride,
                          int w, int h) {
+    tb_metal_plane_set_hidden(1);   /* SDL renders this format */
     if (tb_disp_ensure_texture(d, w, h) < 0) return;
     tb_disp_set_connection_state(d, 1);
 
+    double t0 = tb_now_ms();
     if (SDL_UpdateNVTexture(d->tex, NULL,
                             y,  y_stride,
                             uv, uv_stride) < 0) {
         fprintf(stderr, "[disp] UpdateNVTexture: %s\n", SDL_GetError());
         return;
     }
+    double t1 = tb_now_ms();
     d->last_video_frame_time = SDL_GetTicks();
     tb_disp_render_current(d);
+    tb_frame_stats_add("nv12", t1 - t0, tb_now_ms() - t1);
 }
 
-void tb_disp_render_rgba(struct tb_display *d,
-                         const uint8_t *rgba, int stride,
-                         int w, int h) {
-    /* macOS 32BGRA == SDL_PIXELFORMAT_ARGB8888 on little-endian (bytes B,G,R,A).
-     * Full 4:4:4, no chroma reconstruction — a plain packed-RGB blit. */
-    if (tb_disp_ensure_texture_fmt(d, w, h, SDL_PIXELFORMAT_ARGB8888) < 0) return;
-    tb_disp_set_connection_state(d, 1);
-
-    if (SDL_UpdateTexture(d->tex, NULL, rgba, stride) < 0) {
-        fprintf(stderr, "[disp] UpdateTexture(RGBA): %s\n", SDL_GetError());
+void tb_disp_render_packed32(struct tb_display *d,
+                             const uint8_t *rgba, int stride,
+                             int w, int h, int ten_bit) {
+    /* Both paths are packed 4:4:4 at 4 bytes/pixel, so they differ only in the
+     * texture format:
+     *   8-bit : macOS 32BGRA          == SDL_PIXELFORMAT_ARGB8888  (B,G,R,A LE)
+     *   10-bit: macOS ARGB2101010 LE  == SDL_PIXELFORMAT_ARGB2101010
+     * No chroma reconstruction either way — a plain packed-RGB blit. */
+    if (ten_bit) {
+        /* SDL cannot carry 10-bit: it would silently convert on the CPU and
+         * truncate to 8 bits. Hand these frames to the Metal plane instead. */
+        if (!tb_metal_plane_available()) tb_metal_plane_init(d->win);
+        if (tb_metal_plane_available()) {
+            double m0 = tb_now_ms();
+            if (tb_metal_plane_render_l10r(rgba, stride, w, h) == 0) {
+                tb_disp_set_connection_state(d, 1);
+                d->last_video_frame_time = SDL_GetTicks();
+                tb_frame_stats_add("10bit-metal", tb_now_ms() - m0, 0.0);
+                return;
+            }
+        }
+        /* No Metal plane: drop the frame rather than burn ~100 ms/frame on a
+         * conversion whose output is 8-bit anyway. */
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[disp] 10-bit frame but no Metal plane; dropping\n");
+        }
         return;
     }
+    tb_metal_plane_set_hidden(1);   /* SDL renders this format */
+    const Uint32 fmt = SDL_PIXELFORMAT_ARGB8888;
+    if (tb_disp_ensure_texture_fmt(d, w, h, fmt) < 0) return;
+    tb_disp_set_connection_state(d, 1);
+
+    double t0 = tb_now_ms();
+    if (SDL_UpdateTexture(d->tex, NULL, rgba, stride) < 0) {
+        fprintf(stderr, "[disp] UpdateTexture(packed32): %s\n", SDL_GetError());
+        return;
+    }
+    double t1 = tb_now_ms();
     d->last_video_frame_time = SDL_GetTicks();
     tb_disp_render_current(d);
+    tb_frame_stats_add(ten_bit ? "10bit" : "8bit", t1 - t0, tb_now_ms() - t1);
 }
 
 void tb_disp_set_cursor(struct tb_display *d,
@@ -1172,6 +1267,8 @@ void tb_disp_set_cursor(struct tb_display *d,
     d->cursor_source_h = source_h > 0 ? source_h : 1;
     d->cursor_visible = visible;
     d->cursor_type = type;
+    /* The Metal path has no SDL draw pass, so it composites the cursor itself. */
+    tb_metal_plane_set_cursor(x, y, source_w, source_h, visible, type);
 
     uint32_t now = SDL_GetTicks();
     if (now - d->last_video_frame_time > 40) {
@@ -1424,6 +1521,7 @@ void tb_disp_render_status(struct tb_display *d,
                            const char *mode,
                            const char *language,
                            const char *permissions) {
+    tb_metal_plane_set_hidden(1);   /* SDL owns the window here */
     if (!d || !d->ren || !d->win) return;
 
     tb_disp_set_connection_state(d, 0);
@@ -1478,6 +1576,7 @@ void tb_disp_render_status(struct tb_display *d,
 }
 
 void tb_disp_render_connecting(struct tb_display *d) {
+    tb_metal_plane_set_hidden(1);   /* SDL owns the window here */
     if (!d || !d->ren || !d->win) return;
 
     tb_disp_set_connecting_state(d, 1);

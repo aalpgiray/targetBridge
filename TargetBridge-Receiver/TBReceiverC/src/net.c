@@ -24,12 +24,36 @@ void tb_parser_init(struct tb_parser *p, tb_pkt_cb cb, void *ud) {
     p->cap = 0;
     p->cb  = cb;
     p->ud  = ud;
+    p->hold = 0;
+    p->spare = NULL;
+    p->spare_cap = 0;
+    p->held = NULL;
+    p->held_cap = 0;
+}
+
+void tb_parser_hold_current(struct tb_parser *p) { p->hold = 1; }
+
+void tb_parser_set_spare(struct tb_parser *p, uint8_t *buf, size_t cap) {
+    if (!buf) return;
+    if (p->spare) { free(p->spare); }
+    p->spare = buf;
+    p->spare_cap = cap;
+}
+
+uint8_t *tb_parser_take_held(struct tb_parser *p, size_t *cap_out) {
+    uint8_t *b = p->held;
+    if (cap_out) *cap_out = p->held_cap;
+    p->held = NULL;
+    p->held_cap = 0;
+    return b;
 }
 
 void tb_parser_free(struct tb_parser *p) {
     free(p->buf);
-    p->buf = NULL;
-    p->len = p->cap = 0;
+    free(p->spare);
+    free(p->held);
+    p->buf = p->spare = p->held = NULL;
+    p->len = p->cap = p->spare_cap = p->held_cap = 0;
 }
 
 static int parser_reserve(struct tb_parser *p, size_t need) {
@@ -48,11 +72,9 @@ static uint32_t read_be32(const uint8_t *p) {
            ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
 }
 
-int tb_parser_feed(struct tb_parser *p, const uint8_t *data, size_t n) {
-    if (parser_reserve(p, p->len + n + 1) < 0) return -1;  /* +1 for NUL sentinel */
-    memcpy(p->buf + p->len, data, n);
-    p->len += n;
-
+/* Dispatch every complete packet currently buffered, then compact. Shared by
+ * the copying (feed) and zero-copy (reserve/commit) ingest paths. */
+static int parser_dispatch(struct tb_parser *p) {
     size_t off = 0;
     while (p->len - off >= TB_HDR_BYTES) {
         uint32_t pkt_len = read_be32(p->buf + off);
@@ -77,6 +99,35 @@ int tb_parser_feed(struct tb_parser *p, const uint8_t *data, size_t n) {
         p->cb(type, payload, plen, p->ud);
         *sentinel = saved;
         off += 4 + pkt_len;
+
+        if (p->hold) {
+            /* The callback kept this packet. Compacting would memmove the next
+             * packet's bytes over the front of it, so instead move the (small)
+             * remainder into a fresh buffer and yield this one whole. */
+            p->hold = 0;
+            size_t rem = p->len - off;
+            uint8_t *nb = p->spare;
+            size_t   nc = p->spare_cap;
+            p->spare = NULL;
+            p->spare_cap = 0;
+            if (nc < rem + 1) {
+                size_t want = rem + 65536;
+                uint8_t *grown = (uint8_t *)realloc(nb, want);
+                if (!grown) { free(nb); return -1; }
+                nb = grown;
+                nc = want;
+            }
+            if (rem > 0) memcpy(nb, p->buf + off, rem);
+            /* Ownership moves to the caller; the payload pointer handed to the
+             * callback stays valid because this buffer is not freed. */
+            free(p->held);
+            p->held     = p->buf;
+            p->held_cap = p->cap;
+            p->buf = nb;
+            p->cap = nc;
+            p->len = rem;
+            return 0;
+        }
     }
 
     /* shift remainder to front */
@@ -86,6 +137,26 @@ int tb_parser_feed(struct tb_parser *p, const uint8_t *data, size_t n) {
         p->len = rem;
     }
     return 0;
+}
+
+int tb_parser_feed(struct tb_parser *p, const uint8_t *data, size_t n) {
+    if (parser_reserve(p, p->len + n + 1) < 0) return -1;  /* +1 for NUL sentinel */
+    memcpy(p->buf + p->len, data, n);
+    p->len += n;
+    return parser_dispatch(p);
+}
+
+int tb_parser_reserve_space(struct tb_parser *p, size_t want, uint8_t **out, size_t *avail) {
+    if (parser_reserve(p, p->len + want + 1) < 0) return -1;  /* +1 for NUL sentinel */
+    *out   = p->buf + p->len;
+    /* Withhold the sentinel byte so parser_dispatch can always write it. */
+    *avail = p->cap - p->len - 1;
+    return 0;
+}
+
+int tb_parser_commit(struct tb_parser *p, size_t n) {
+    p->len += n;
+    return parser_dispatch(p);
 }
 
 /* ---- Server ----------------------------------------------------------- */

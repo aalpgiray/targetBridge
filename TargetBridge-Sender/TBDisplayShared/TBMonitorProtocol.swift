@@ -9,6 +9,10 @@ enum TBMonitorPacketType: UInt8 {
     case frame = 0x21
     case rawFrame = 0x22   // Uncompressed NV12 planes (raw passthrough mode)
     case audioFrame = 0x23
+    /// Only the rectangles that changed since the previous frame. Detection is
+    /// free — ScreenCaptureKit attaches the WindowServer's own dirty rects —
+    /// and a typical desktop changes a few percent of its pixels per frame.
+    case rawDamage = 0x24
     case heartbeat = 0x30
     case teardown = 0x31
     case cursor = 0x32
