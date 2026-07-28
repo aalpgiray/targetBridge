@@ -627,6 +627,19 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                             .disabled(session.isConnected || session.isStreaming)
                     }
 
+                    settingRow(audioDeviceTitle, details: audioDeviceDetails) {
+                        Picker("", selection: $session.audioDeviceUID) {
+                            Text(audioDeviceSystemLabel).tag("")
+                            ForEach(TBAudioDeviceCapture.availableDevices(), id: \.uid) { dev in
+                                Text(dev.name).tag(dev.uid)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(maxWidth: 240)
+                        .disabled(session.isConnected || session.isStreaming)
+                    }
+
                     settingRow(damageRectsTitle, details: damageRectsDetails) {
                         Toggle("", isOn: $session.damageRects)
                             .labelsHidden()
@@ -1102,6 +1115,31 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .english: return "Send uncompressed 8-bit RGB (no chroma subsampling) for crisp colored edges/text. ~28 Gb/s at 5K@60 — pair with Dual cable. Raw presets only."
         case .french: return "Envoie du RVB 8 bits non compressé (sans sous-échantillonnage de chrominance). ~28 Gb/s en 5K@60. Presets raw uniquement."
         default: return "Invia RGB 8-bit non compresso (nessun sottocampionamento croma). ~28 Gb/s a 5K@60 — usare con Doppio cavo. Solo preset raw."
+        }
+    }
+    private var audioDeviceTitle: String {
+        switch service.language {
+        case .italian: return "Sorgente audio"
+        case .english: return "Audio source"
+        case .german: return "Audioquelle"
+        case .chinese: return "音频来源"
+        case .french: return "Source audio"
+        }
+    }
+    private var audioDeviceSystemLabel: String {
+        switch service.language {
+        case .italian: return "Audio di sistema"
+        case .english: return "System audio (all)"
+        case .german: return "Systemaudio"
+        case .chinese: return "系统音频"
+        case .french: return "Audio système"
+        }
+    }
+    private var audioDeviceDetails: String {
+        switch service.language {
+        case .english: return "Capture one input device instead of all system audio. Set the Mac's output to a loopback device (e.g. BlackHole) and pick it here — routing then happens in macOS's Sound settings, per app."
+        case .french: return "Capture un périphérique d'entrée au lieu de tout l'audio système. Réglez la sortie du Mac sur un périphérique de bouclage et sélectionnez-le ici."
+        default: return "Cattura un singolo dispositivo di ingresso invece di tutto l'audio di sistema. Imposta l'uscita del Mac su un dispositivo di loopback e selezionalo qui."
         }
     }
     private var damageRectsTitle: String {

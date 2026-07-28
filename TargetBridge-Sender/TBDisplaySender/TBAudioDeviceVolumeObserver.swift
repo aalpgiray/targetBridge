@@ -1,0 +1,140 @@
+import CoreAudio
+import Foundation
+
+/// Watches a CoreAudio device's volume and mute, and reports changes.
+///
+/// Point the Mac's output at the loopback device we capture, and this makes the
+/// system's own volume control — the Sound slider, and the F11/F12 keys, which
+/// always act on the *default output device* — drive the receiver's hardware
+/// volume. That is a better answer than the loopback device's own gain, which
+/// only attenuates the samples digitally before we ever see them: it throws away
+/// dynamic range and leaves the iMac's amplifier at whatever it was.
+final class TBAudioDeviceVolumeObserver {
+
+    private var deviceID: AudioDeviceID = kAudioObjectUnknown
+    private var listener: AudioObjectPropertyListenerBlock?
+    private let onChange: @Sendable (Double) -> Void
+
+    init(onChange: @escaping @Sendable (Double) -> Void) {
+        self.onChange = onChange
+    }
+
+    /// Resolve a device UID to its CoreAudio ID. Returns nil when the device has
+    /// gone away (unplugged, driver uninstalled).
+    static func deviceID(forUID uid: String) -> AudioDeviceID? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject),
+                                            &addr, 0, nil, &size) == noErr else { return nil }
+        let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+        var ids = [AudioDeviceID](repeating: 0, count: count)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                         &addr, 0, nil, &size, &ids) == noErr else { return nil }
+
+        for id in ids {
+            var uidAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyDeviceUID,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain)
+            var cf: CFString? = nil
+            var sz = UInt32(MemoryLayout<CFString?>.size)
+            guard AudioObjectGetPropertyData(id, &uidAddr, 0, nil, &sz, &cf) == noErr,
+                  let got = cf as String? else { continue }
+            if got == uid { return id }
+        }
+        return nil
+    }
+
+    /// Current output volume 0...1, or nil if the device exposes no volume control.
+    static func volume(of device: AudioDeviceID) -> Double? {
+        // Try the main element first, then channels 1/2 — virtual devices often
+        // implement per-channel volume only.
+        for element in [kAudioObjectPropertyElementMain, 1, 2] as [AudioObjectPropertyElement] {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioDevicePropertyScopeOutput,
+                mElement: element)
+            guard AudioObjectHasProperty(device, &addr) else { continue }
+            var value: Float32 = 0
+            var sz = UInt32(MemoryLayout<Float32>.size)
+            if AudioObjectGetPropertyData(device, &addr, 0, nil, &sz, &value) == noErr {
+                return Double(value)
+            }
+        }
+        return nil
+    }
+
+    private static func muted(_ device: AudioDeviceID) -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectHasProperty(device, &addr) else { return false }
+        var value: UInt32 = 0
+        var sz = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(device, &addr, 0, nil, &sz, &value) == noErr else { return false }
+        return value != 0
+    }
+
+    func start(deviceUID: String) -> Bool {
+        guard let id = Self.deviceID(forUID: deviceUID) else { return false }
+        deviceID = id
+
+        let cb = onChange
+        let block: AudioObjectPropertyListenerBlock = { _, _ in
+            let level = Self.muted(id) ? 0 : (Self.volume(of: id) ?? 1)
+            DispatchQueue.main.async { cb(level) }
+        }
+        listener = block
+
+        var ok = false
+        for element in [kAudioObjectPropertyElementMain, 1, 2] as [AudioObjectPropertyElement] {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioDevicePropertyScopeOutput,
+                mElement: element)
+            if AudioObjectHasProperty(id, &addr),
+               AudioObjectAddPropertyListenerBlock(id, &addr, nil, block) == noErr {
+                ok = true
+            }
+        }
+        var muteAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        if AudioObjectHasProperty(id, &muteAddr) {
+            _ = AudioObjectAddPropertyListenerBlock(id, &muteAddr, nil, block)
+        }
+
+        if ok {
+            // Adopt the device's current level immediately, so the receiver is not
+            // left at a stale value until the user first touches the slider.
+            let level = Self.muted(id) ? 0 : (Self.volume(of: id) ?? 1)
+            DispatchQueue.main.async { cb(level) }
+        } else {
+            TBLog.connection.info("audio volume: \(deviceUID, privacy: .public) exposes no volume control")
+        }
+        return ok
+    }
+
+    func stop() {
+        guard deviceID != kAudioObjectUnknown, let block = listener else { return }
+        for element in [kAudioObjectPropertyElementMain, 1, 2] as [AudioObjectPropertyElement] {
+            var addr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyVolumeScalar,
+                mScope: kAudioDevicePropertyScopeOutput,
+                mElement: element)
+            _ = AudioObjectRemovePropertyListenerBlock(deviceID, &addr, nil, block)
+        }
+        var muteAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyMute,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain)
+        _ = AudioObjectRemovePropertyListenerBlock(deviceID, &muteAddr, nil, block)
+        listener = nil
+        deviceID = kAudioObjectUnknown
+    }
+}

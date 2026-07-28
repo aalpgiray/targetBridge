@@ -1175,6 +1175,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private static let fullColor444DefaultsKey = "fd.tbdisplaysender.fullColor444"
     private static let tenBitDefaultsKey = "fd.tbdisplaysender.tenBit"
     private static let damageRectsDefaultsKey = "fd.tbdisplaysender.damageRects"
+    private static let audioDeviceUIDDefaultsKey = "fd.tbdisplaysender.audioDeviceUID"
     private struct SavedExtendedDisplayArrangement {
         let x: Int32
         let y: Int32
@@ -1397,6 +1398,15 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         return parts.joined(separator: "\n")
     }
 
+    /// Capture this input device instead of whole-system audio. Empty = system
+    /// audio via ScreenCaptureKit (the previous behaviour). Pointing macOS's
+    /// output at a loopback device and selecting it here moves routing into the
+    /// system's own Sound UI, so it can be chosen per app.
+    @Published var audioDeviceUID: String = UserDefaults.standard.string(forKey: audioDeviceUIDDefaultsKey) ?? "" {
+        didSet { UserDefaults.standard.set(audioDeviceUID, forKey: Self.audioDeviceUIDDefaultsKey) }
+    }
+    private var audioDeviceCapture: TBAudioDeviceCapture?
+    private var audioVolumeObserver: TBAudioDeviceVolumeObserver?
     @Published var audioEnabled: Bool
     @Published var brightness: Double = 1.0 {
         didSet {
@@ -2092,6 +2102,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             ProcessInfo.processInfo.endActivity(activity)
             streamingActivity = nil
         }
+        stopAudioDeviceCapture()
         pipeline?.stop()
         pipeline = nil
         releaseInjectedModifiersIfNeeded()
@@ -2821,6 +2832,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             )
             pipeline.damageEnabled = damageRects
             guard pipeline.start() else { return false }
+            startAudioDeviceCaptureIfNeeded()
             self.pipeline = pipeline
             TBLog.connection.info("capture: pipeline started preset=\(preset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) codec=\(codecName, privacy: .public) rawNV12=\(usesRawNV12, privacy: .public)")
 
@@ -2874,7 +2886,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             configuration.showsCursor = !largeCursor
             configuration.scalesToFit = true
             configuration.captureResolution = preset.captureResolution
-            configuration.capturesAudio = true
+            // A selected input device supersedes system capture; capturing both
+            // would send two copies of the same sound.
+            configuration.capturesAudio = audioDeviceUID.isEmpty
             configuration.excludesCurrentProcessAudio = true
             configuration.sampleRate = 48000
             configuration.channelCount = 2
@@ -3576,6 +3590,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             ProcessInfo.processInfo.endActivity(activity)
             streamingActivity = nil
         }
+        stopAudioDeviceCapture()
         pipeline?.stop()
         pipeline = nil
         isStreaming = false
@@ -3694,6 +3709,52 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         
         connectTimeoutWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: workItem)
+    }
+
+
+    // MARK: - Routed audio device
+
+    /// When a device is selected, capture it and feed the same `processAudio`
+    /// path ScreenCaptureKit's audio used, so conversion, packetisation and the
+    /// receiver are unchanged.
+    private func startAudioDeviceCaptureIfNeeded() {
+        guard audioEnabled, !audioDeviceUID.isEmpty else { return }
+        let uid = audioDeviceUID
+        Task { @MainActor in
+            guard await TBAudioDeviceCapture.requestAccess() else {
+                TBLog.connection.error("audio device: microphone access denied; falling back to no audio")
+                return
+            }
+            let capture = TBAudioDeviceCapture { [weak self] sb in
+                guard let self else { return }
+                Task { @MainActor in self.processAudio(sb) }
+            }
+            if capture.start(deviceUID: uid) {
+                self.audioDeviceCapture = capture
+
+                // Mirror the OS volume for that device onto the receiver, so the
+                // Sound slider and the F11/F12 keys (which act on the default
+                // output device) control the iMac's actual output.
+                let observer = TBAudioDeviceVolumeObserver { level in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        // Guard against feedback: our own send would otherwise
+                        // bounce back through the observer.
+                        if abs(self.volume - level) > 0.005 { self.volume = level }
+                    }
+                }
+                if observer.start(deviceUID: uid) {
+                    self.audioVolumeObserver = observer
+                }
+            }
+        }
+    }
+
+    private func stopAudioDeviceCapture() {
+        audioVolumeObserver?.stop()
+        audioVolumeObserver = nil
+        audioDeviceCapture?.stop()
+        audioDeviceCapture = nil
     }
 
     private func processAudio(_ sampleBuffer: CMSampleBuffer) {
