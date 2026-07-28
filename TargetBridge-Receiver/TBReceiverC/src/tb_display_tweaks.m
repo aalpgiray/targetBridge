@@ -110,6 +110,21 @@ int tb_true_tone_enabled(void) {
 int tb_true_tone_set(int enabled) {
     id c = tb_true_tone_client();
     if (!c) return -1;
+
+    /* setEnabled: is the real switch. activate/deactivate look like the obvious
+     * pair and are not: measured on macOS 15, deactivate leaves `enabled`
+     * reporting 1 and the panel unchanged — they activate the *client session*,
+     * not the feature. Keep them only as a fallback for an OS that lacks the
+     * setter, so a missing selector degrades instead of failing outright. */
+    SEL set = @selector(setEnabled:);
+    if ([c respondsToSelector:set]) {
+        IMP imp = [c methodForSelector:set];
+        if (imp) {
+            BOOL (*fn)(id, SEL, BOOL) = (BOOL (*)(id, SEL, BOOL))imp;
+            return fn(c, set, enabled ? YES : NO) ? 0 : -1;
+        }
+    }
+
     SEL sel = enabled ? @selector(activate) : @selector(deactivate);
     if (![c respondsToSelector:sel]) return -1;
     IMP imp = [c methodForSelector:sel];
