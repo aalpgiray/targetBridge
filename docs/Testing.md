@@ -95,3 +95,26 @@ log stream --predicate 'subsystem == "com.targetbridge.sender"'
 
 The receiver logs to stderr; under the LaunchAgent that lands in
 `~/Library/Logs/TargetBridgeReceiver.launchd.err.log`.
+
+## Experimental 5K at 60 FPS
+
+`native5k60Experimental` is an opt-in HEVC profile for testing recent Apple
+Silicon encoders at 5120 x 2880 and 60 FPS. It does not alter the stable 5K
+profile, which remains at 48 FPS and is the recommended choice for daily work.
+
+Real-world M4 testing has reached 56-57 FPS but also showed temporary drops
+under mixed workloads and added heat when Input Dockstation is active. Treat
+this profile as a benchmark and feedback tool, not a guaranteed 60 FPS mode.
+
+Use it only for a test session, either from the Sender's stream-profile picker
+or with the automation alias:
+
+```bash
+targetbridge connect --receiver <receiver-ip> --mode extended --preset 5k60
+```
+
+After at least one minute of normal desktop use, note the Sender FPS shown in
+the session card, whether input remains responsive, and any capture or decoder
+errors. For a two-receiver experiment, start one session per receiver and
+record the FPS for each session separately. Include the sender model, macOS
+version, receiver model, cable type, and selected transport with the report.

@@ -67,6 +67,10 @@ struct app {
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
     int      close_requested;
     int      have_video_frame;
+    /* A real streaming session has begun (the sender sent a session packet, not
+     * just a transient probe like a UI-language push). Gates the fullscreen
+     * "connecting" splash so a bare/short-lived connection doesn't flash it. */
+    int      session_active;
 
     char     ip_text[64];
     char     tb_ip_text[64];
@@ -590,6 +594,7 @@ static void bonjour_update(struct app *a, uint16_t port) {
     TXTRecordSetValue(&txt, "panel", (uint8_t)strlen(a->panel_text), a->panel_text);
     TXTRecordSetValue(&txt, "version", (uint8_t)strlen(TB_RECEIVER_VERSION), TB_RECEIVER_VERSION);
     TXTRecordSetValue(&txt, "supportsHEVCDecode", 1, tb_dec_supports_hevc_hwdecode() ? "1" : "0");
+    TXTRecordSetValue(&txt, "supportsRawNV12", 1, "1");
 
     struct tb_display_info info;
     if (tb_disp_get_info(a->disp, &info) == 0) {
@@ -889,6 +894,46 @@ static void on_frame(const uint8_t *y, int y_stride,
     a->frames++;
 }
 
+/* Raw passthrough: render received NV12 planes directly, bypassing the decoder.
+ * Payload: [1: format=1(NV12)][BE32 w][BE32 h][BE32 yStride][BE32 uvStride]
+ *          [Y plane: yStride*h][CbCr plane: uvStride*(h/2)] */
+static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
+    if (len < 17) return;
+    if (p[0] != 1) return; /* only NV12 is supported */
+    uint32_t w  = ((uint32_t)p[1]  << 24) | ((uint32_t)p[2]  << 16) | ((uint32_t)p[3]  << 8) | (uint32_t)p[4];
+    uint32_t h  = ((uint32_t)p[5]  << 24) | ((uint32_t)p[6]  << 16) | ((uint32_t)p[7]  << 8) | (uint32_t)p[8];
+    uint32_t ys = ((uint32_t)p[9]  << 24) | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 8) | (uint32_t)p[12];
+    uint32_t us = ((uint32_t)p[13] << 24) | ((uint32_t)p[14] << 16) | ((uint32_t)p[15] << 8) | (uint32_t)p[16];
+    /* Keep malformed peer data from turning into oversized stride arithmetic or
+     * an out-of-bounds render. TargetBridge RAW is intentionally limited to
+     * practical 4:2:0 display sizes and the protocol packet cap. */
+    if (w == 0 || h == 0 || (w & 1) || (h & 1) ||
+        w > 8192 || h > 8192 || ys < w || us < w ||
+        ys > 16384 || us > 16384) return;
+    size_t y_size  = (size_t)ys * h;
+    size_t uv_size = (size_t)us * (h / 2);
+    size_t payload_size = len - 17;
+    if (y_size > payload_size || uv_size > payload_size - y_size) return;
+    const uint8_t *y  = p + 17;
+    const uint8_t *uv = y + y_size;
+
+    a->have_video_frame = 1;
+    tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
+    {
+        char width_text[16];
+        char height_text[16];
+        struct tb_i18n_pair pairs[] = {
+            { "width", width_text },
+            { "height", height_text }
+        };
+        snprintf(width_text, sizeof(width_text), "%u", w);
+        snprintf(height_text, sizeof(height_text), "%u", h);
+        tb_format_i18n(a->mode_text, sizeof(a->mode_text), "receiver.mode.receiving", pairs, 2);
+    }
+    tb_disp_render_nv12(a->disp, y, (int)ys, uv, (int)us, (int)w, (int)h);
+    a->frames++;
+}
+
 static void ring_read(struct app *a, Uint8 *dst, int len) {
     int first = AUDIO_BUF_CAP - a->audio_buf_tail;
     if (first >= len) {
@@ -1013,20 +1058,28 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
 
             tb_set_receiver_mode_requested(a->mode_text, sizeof(a->mode_text), capture_w, capture_h, source, preset, codec);
         }
+        a->session_active = 1;
         fprintf(stderr, "[main] hello from sender\n");
         tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.sender_connected_profile_sent");
         break;
     case TB_PKT_CREATE_SESSION_ACK:
+        a->session_active = 1;
         fprintf(stderr, "[main] sender session ack: %.*s\n", (int)len, (const char *)payload);
         tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.session_accepted_waiting_frames");
         break;
     case TB_PKT_PARAM_SETS:
+        a->session_active = 1;
         /* tb_dec_set_param_sets is now a no-op if the sets are unchanged,
          * so we don't spam a log line per keyframe. */
         tb_dec_set_param_sets(a->dec, payload, len);
         break;
     case TB_PKT_FRAME:
+        a->session_active = 1;
         tb_dec_feed_frame(a->dec, payload, len);
+        break;
+    case TB_PKT_RAW_FRAME:
+        a->session_active = 1;
+        handle_raw_frame(a, payload, len);
         break;
     case TB_PKT_CURSOR:
         {
@@ -1598,7 +1651,7 @@ static void send_receiver_info(struct app *a) {
         "{\"receiverName\":\"%s\",\"panelWidth\":%u,\"panelHeight\":%u,"
         "\"modeWidth\":%u,\"modeHeight\":%u,\"refreshRate\":60,"
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
-        "\"supportsHEVCDecode\":%s,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s}",
+        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s}",
         escaped_name,
         panel_w,
         panel_h,
@@ -1631,6 +1684,7 @@ static void send_receiver_info(struct app *a) {
 static void close_client(struct app *a) {
     if (a->client_fd >= 0) close(a->client_fd);
     a->client_fd = -1;
+    a->session_active = 0;
     a->close_requested = 0;
     a->have_video_frame = 0;
     snprintf(a->input_control_mode, sizeof(a->input_control_mode), "off");
@@ -1823,6 +1877,7 @@ int main(int argc, char **argv) {
             if (c >= 0) {
                 a.client_fd = c;
                 a.have_video_frame = 0;
+                a.session_active = 0;
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] client connected\n");
@@ -1859,7 +1914,10 @@ int main(int argc, char **argv) {
             tb_receiver_poll_permissions(&a);
         }
 
-        if (a.client_fd < 0) {
+        if (a.client_fd < 0 || !a.session_active) {
+            /* No client, or a connection that hasn't started a real streaming
+             * session (e.g. a transient UI-language push during discovery):
+             * stay on the windowed waiting screen, don't flash fullscreen. */
             tb_disp_render_status(a.disp, a.display_host, a.status_text, a.sender_text, a.panel_text, a.mode_text, a.language_text, a.permissions_text);
         } else if (!a.have_video_frame) {
             tb_disp_render_connecting(a.disp);
