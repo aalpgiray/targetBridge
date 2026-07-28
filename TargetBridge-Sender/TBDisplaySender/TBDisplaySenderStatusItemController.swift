@@ -10,6 +10,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
     // Retains the target objects for the current menu's sliders (NSSlider holds
     // its target weakly). Cleared and rebuilt each time the menu opens.
     private var sliderTargets: [TBMenuSliderTarget] = []
+    private var toggleRows: [TBMenuToggleRowView] = []
 
     init(service: TBDisplaySenderService) {
         self.service = service
@@ -98,6 +99,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
     private func rebuildMenuItems(in menu: NSMenu) {
         menu.removeAllItems()
         sliderTargets.removeAll()
+        toggleRows.removeAll()
 
         let titleItem = NSMenuItem(title: "TargetBridge", action: nil, keyEquivalent: "")
         titleItem.isEnabled = false
@@ -122,10 +124,37 @@ final class TBDisplaySenderStatusItemController: NSObject {
                 menu.addItem(makeSliderItem(symbol: "sun.max", label: brightnessMenuLabel(), value: session.brightness) { [weak session] value in
                     session?.brightness = value
                 })
-                if session.audioEnabled {
-                    menu.addItem(makeSliderItem(symbol: "speaker.wave.2.fill", label: volumeMenuLabel(), value: session.volume) { [weak session] value in
-                        session?.volume = value
-                    })
+                // No volume slider: with the TargetBridge audio device selected,
+                // macOS's own Sound slider and the F11/F12 keys already drive the
+                // receiver's hardware volume, so a second control here would just
+                // be a duplicate that can disagree with the system one.
+                var toggles: [TBMenuToggleSpec] = []
+                if session.receiverSupportsNightShift {
+                    toggles.append(TBMenuToggleSpec(
+                        symbol: "moon.fill",
+                        title: nightShiftMenuLabel(),
+                        stateText: session.nightShiftEnabled ? onWord() : offWord(),
+                        isOn: session.nightShiftEnabled) { [weak session] on in
+                            session?.nightShiftEnabled = on
+                        })
+                }
+                if session.receiverSupportsTrueTone {
+                    toggles.append(TBMenuToggleSpec(
+                        symbol: "sun.max",
+                        title: trueToneMenuLabel(),
+                        stateText: session.trueToneEnabled ? onWord() : offWord(),
+                        isOn: session.trueToneEnabled) { [weak session] on in
+                            session?.trueToneEnabled = on
+                        })
+                }
+                if !toggles.isEmpty {
+                    let row = TBMenuToggleRowView(specs: toggles, width: 240, leadingInset: 14)
+                    row.onWord = onWord()
+                    row.offWord = offWord()
+                    let item = NSMenuItem()
+                    item.view = row
+                    menu.addItem(item)
+                    toggleRows.append(row)
                 }
             }
         }
@@ -230,6 +259,46 @@ final class TBDisplaySenderStatusItemController: NSObject {
         case .english: return "Brightness"
         case .german: return "Helligkeit"
         case .chinese: return "亮度"
+        }
+    }
+
+    private func onWord() -> String {
+        switch service.language {
+        case .italian: return "Attivo"
+        case .english: return "On"
+        case .german: return "Ein"
+        case .chinese: return "开"
+        case .french: return "Activé"
+        }
+    }
+
+    private func offWord() -> String {
+        switch service.language {
+        case .italian: return "Non attivo"
+        case .english: return "Off"
+        case .german: return "Aus"
+        case .chinese: return "关"
+        case .french: return "Désactivé"
+        }
+    }
+
+    private func nightShiftMenuLabel() -> String {
+        switch service.language {
+        case .italian: return "Night Shift"
+        case .english: return "Night Shift"
+        case .german: return "Night Shift"
+        case .chinese: return "夜览"
+        case .french: return "Night Shift"
+        }
+    }
+
+    private func trueToneMenuLabel() -> String {
+        switch service.language {
+        case .italian: return "True Tone"
+        case .english: return "True Tone"
+        case .german: return "True Tone"
+        case .chinese: return "原彩显示"
+        case .french: return "True Tone"
         }
     }
 
