@@ -45,6 +45,7 @@ struct TBMonitorDisplayProfile: Codable {
     var captureWidth: Int
     var captureHeight: Int
     var supportsHEVCDecode: Bool?
+    var supportsRawNV12: Bool?
     var inputMonitoringTrusted: Bool?
     var accessibilityTrusted: Bool?
 }

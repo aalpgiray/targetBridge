@@ -226,6 +226,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
     private func brightnessMenuLabel() -> String {
         switch service.language {
         case .italian: return "Luminosità"
+        case .french: return "Luminosité"
         case .english: return "Brightness"
         case .german: return "Helligkeit"
         case .chinese: return "亮度"
@@ -235,6 +236,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
     private func volumeMenuLabel() -> String {
         switch service.language {
         case .italian: return "Volume"
+        case .french: return "Volume"
         case .english: return "Volume"
         case .german: return "Lautstärke"
         case .chinese: return "音量"
@@ -244,6 +246,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
     private func connectionInfoMenuLabel() -> String {
         switch service.language {
         case .italian: return "Info connessione"
+        case .french: return "Infos de connexion"
         case .english: return "Connection info"
         case .german: return "Verbindungsinfo"
         case .chinese: return "连接信息"
