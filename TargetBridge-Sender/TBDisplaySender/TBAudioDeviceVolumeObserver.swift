@@ -11,8 +11,11 @@ import Foundation
 /// dynamic range and leaves the iMac's amplifier at whatever it was.
 final class TBAudioDeviceVolumeObserver {
 
+    private let lock = NSLock()
     private var deviceID: AudioDeviceID = kAudioObjectUnknown
     private var listener: AudioObjectPropertyListenerBlock?
+    private var wantedUID: String?
+    private var watchingDeviceList = false
     private let onChange: @Sendable (Double) -> Void
 
     init(onChange: @escaping @Sendable (Double) -> Void) {
@@ -79,9 +82,67 @@ final class TBAudioDeviceVolumeObserver {
         return value != 0
     }
 
+    /// Begin mirroring `deviceUID`'s volume, now or as soon as it appears.
+    ///
+    /// The device may legitimately not exist yet: our own driver withdraws it
+    /// whenever the sender is not carrying audio, and republishes it about a
+    /// second after we open the socket — which is *after* this is called. It
+    /// also gets a fresh CoreAudio ID each time it is republished, so an ID
+    /// resolved once is not good for the life of the app. Hence: watch the
+    /// device list and (re)attach whenever the UID shows up.
+    @discardableResult
     func start(deviceUID: String) -> Bool {
-        guard let id = Self.deviceID(forUID: deviceUID) else { return false }
+        lock.lock()
+        wantedUID = deviceUID
+        lock.unlock()
+        watchDeviceList()
+        return attach()
+    }
+
+    /// Re-run attachment whenever devices come or go.
+    private func watchDeviceList() {
+        lock.lock()
+        let already = watchingDeviceList
+        watchingDeviceList = true
+        lock.unlock()
+        guard !already else { return }
+
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.attachIfNeeded()
+        }
+        _ = AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject),
+                                                &addr, nil, block)
+    }
+
+    private func attachIfNeeded() {
+        lock.lock()
+        let uid = wantedUID
+        let current = deviceID
+        lock.unlock()
+        guard let uid else { return }
+
+        let resolved = Self.deviceID(forUID: uid)
+        if resolved == current { return }   // nothing changed
+
+        // Either it went away, or it came back under a new ID. Drop the old
+        // registration before taking a new one so listeners cannot accumulate.
+        detach()
+        if resolved != nil { _ = attach() }
+    }
+
+    private func attach() -> Bool {
+        lock.lock()
+        let uid = wantedUID
+        lock.unlock()
+        guard let deviceUID = uid, let id = Self.deviceID(forUID: deviceUID) else { return false }
+
+        lock.lock()
         deviceID = id
+        lock.unlock()
 
         let cb = onChange
         let block: AudioObjectPropertyListenerBlock = { _, _ in
@@ -90,7 +151,9 @@ final class TBAudioDeviceVolumeObserver {
             let level = Self.muted(id) ? 0 : (Self.volume(of: id) ?? 1)
             DispatchQueue.main.async { cb(level) }
         }
+        lock.lock()
         listener = block
+        lock.unlock()
 
         var ok = false
         for element in [kAudioObjectPropertyElementMain, 1, 2] as [AudioObjectPropertyElement] {
@@ -111,7 +174,7 @@ final class TBAudioDeviceVolumeObserver {
             _ = AudioObjectAddPropertyListenerBlock(id, &muteAddr, nil, block)
         }
 
-        TBLog.connection.info("audio volume: observer start uid=\(deviceUID, privacy: .public) id=\(id, privacy: .public) registered=\(ok, privacy: .public)")
+        TBLog.connection.notice("audio volume: observer start uid=\(deviceUID, privacy: .public) id=\(id, privacy: .public) registered=\(ok, privacy: .public)")
         if ok {
             // Adopt the device's current level immediately, so the receiver is not
             // left at a stale value until the user first touches the slider.
@@ -124,7 +187,18 @@ final class TBAudioDeviceVolumeObserver {
     }
 
     func stop() {
-        guard deviceID != kAudioObjectUnknown, let block = listener else { return }
+        lock.lock()
+        wantedUID = nil
+        lock.unlock()
+        detach()
+    }
+
+    private func detach() {
+        lock.lock()
+        let deviceID = self.deviceID
+        let held = listener
+        lock.unlock()
+        guard deviceID != kAudioObjectUnknown, let block = held else { return }
         for element in [kAudioObjectPropertyElementMain, 1, 2] as [AudioObjectPropertyElement] {
             var addr = AudioObjectPropertyAddress(
                 mSelector: kAudioDevicePropertyVolumeScalar,
@@ -137,7 +211,10 @@ final class TBAudioDeviceVolumeObserver {
             mScope: kAudioDevicePropertyScopeOutput,
             mElement: kAudioObjectPropertyElementMain)
         _ = AudioObjectRemovePropertyListenerBlock(deviceID, &muteAddr, nil, block)
+
+        lock.lock()
         listener = nil
-        deviceID = kAudioObjectUnknown
+        self.deviceID = kAudioObjectUnknown
+        lock.unlock()
     }
 }

@@ -3781,7 +3781,6 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             if rx.start() {
                 audioDriverReceiver = rx
                 startAudioVolumeMirror(uid: uid)
-                // Keeps the driver's device alive only while a real path exists.
             }
             return
         }
@@ -3816,9 +3815,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 if abs(self.volume - level) > 0.005 { self.volume = level }
             }
         }
-        if observer.start(deviceUID: uid) {
-            audioVolumeObserver = observer
-        }
+        // Keep it whatever start() reports: our own driver publishes its device
+        // about a second after we open the socket, so the usual outcome here is
+        // "not yet" and the observer attaches itself when the device appears.
+        observer.start(deviceUID: uid)
+        audioVolumeObserver = observer
     }
 
     private func stopAudioDeviceCapture() {
