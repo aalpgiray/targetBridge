@@ -207,6 +207,40 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual(TBMonitorProtocol.decodeJSON(TBMonitorHeartbeat.self, from: payload)?.sequence, 42)
     }
 
+    func testInputButtonEventRoundTripPreservesClickCount() throws {
+        let buttonEvent = TBMonitorInputButtonEvent(kind: "leftDown", clickCount: 2)
+        guard var buffer = TBMonitorProtocol.makeJSONPacket(type: .inputEvent, value: buttonEvent),
+              let (type, payload) = try TBMonitorProtocol.drainPacket(from: &buffer)
+        else {
+            XCTFail("button event did not encode and drain")
+            return
+        }
+
+        XCTAssertEqual(type, .inputEvent)
+        XCTAssertEqual(TBMonitorProtocol.decodeJSON(TBMonitorInputButtonEvent.self, from: payload)?.kind, "leftDown")
+        XCTAssertEqual(TBMonitorProtocol.decodeJSON(TBMonitorInputButtonEvent.self, from: payload)?.clickCount, 2)
+    }
+
+    func testInputButtonEventWithoutClickCountRemainsCompatible() {
+        let payload = Data(#"{"kind":"leftDown"}"#.utf8)
+
+        let buttonEvent = TBMonitorProtocol.decodeJSON(TBMonitorInputButtonEvent.self, from: payload)
+        XCTAssertEqual(buttonEvent?.kind, "leftDown")
+        XCTAssertNil(buttonEvent?.clickCount)
+    }
+
+    func testGenericInputEventIgnoresButtonOnlyMetadata() {
+        let payload = Data(#"{"kind":"leftDown","clickCount":2}"#.utf8)
+
+        let genericEvent = TBMonitorProtocol.decodeJSON(TBMonitorInputEvent.self, from: payload)
+        XCTAssertEqual(genericEvent?.kind, "leftDown")
+        XCTAssertNil(genericEvent?.dx)
+        XCTAssertNil(genericEvent?.dy)
+        XCTAssertNil(genericEvent?.scrollX)
+        XCTAssertNil(genericEvent?.scrollY)
+        XCTAssertNil(genericEvent?.keyCode)
+    }
+
     // MARK: - Hand-rolled input-event encoder parity
     //
     // `makeInputEventPacket` documents this invariant: "emits the same JSON shape
