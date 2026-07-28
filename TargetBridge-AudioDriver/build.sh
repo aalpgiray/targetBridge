@@ -11,6 +11,12 @@ LIB=vendor/libASPL
 rm -rf build
 mkdir -p "$BUNDLE/Contents/MacOS"
 
+# Stamp the bundle with a hash of what it was built from, so the app can tell an
+# installed driver apart from the one it ships and offer to update it. A running
+# driver whose code no longer matches the app is invisible otherwise — it looks
+# exactly like a change that did nothing, which cost us a day of debugging once.
+BUILD_ID=$(cat Driver.cpp build.sh | shasum -a 256 | cut -c1-12)
+
 CXXFLAGS=(-std=c++17 -O2 -fPIC -arch arm64 -arch x86_64
           -mmacosx-version-min=11.0
           -I"$LIB/include" -I"$LIB/src" -Wno-unused-parameter -Wno-reorder-init-list)
@@ -32,7 +38,7 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
     <key>CFBundleName</key><string>$NAME</string>
     <key>CFBundlePackageType</key><string>BNDL</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleVersion</key><string>$BUILD_ID</string>
     <key>CFPlugInFactories</key>
     <dict>
         <!-- Any fresh UUID; coreaudiod maps it to our factory symbol. -->
