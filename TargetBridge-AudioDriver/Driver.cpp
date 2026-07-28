@@ -149,12 +149,39 @@ std::shared_ptr<aspl::Driver> CreateTargetBridgeDriver()
     // Output only — no input stream, so no microphone permission. See (2) above.
     // AddStreamAsync (rather than AddStreamWithControlsAsync) so no default
     // volume control is created; we attach our own reporting-only one instead.
-    auto stream = device->AddStreamAsync(aspl::Direction::Output);
+    //
+    // Pin the stream format explicitly. libASPL defaults to 44100 Hz Int16, and
+    // OnWriteMixedOutput hands over the *stream's native format* — so leaving
+    // the default while treating the bytes as 48 kHz Float32 produced noise.
+    // Matching the receiver's wire format here means no conversion at all.
+    aspl::StreamParameters streamParams;
+    streamParams.Direction = aspl::Direction::Output;
+    streamParams.Format.mSampleRate = kSampleRate;
+    streamParams.Format.mFormatID = kAudioFormatLinearPCM;
+    streamParams.Format.mFormatFlags = kAudioFormatFlagIsSignedInteger
+                                     | kAudioFormatFlagsNativeEndian
+                                     | kAudioFormatFlagIsPacked;
+    streamParams.Format.mBitsPerChannel = 16;
+    streamParams.Format.mChannelsPerFrame = kChannelCount;
+    streamParams.Format.mBytesPerFrame = kChannelCount * 2;
+    streamParams.Format.mFramesPerPacket = 1;
+    streamParams.Format.mBytesPerPacket = kChannelCount * 2;
+    auto stream = device->AddStreamAsync(streamParams);
 
     aspl::VolumeControlParameters volumeParams;
     volumeParams.Scope = kAudioObjectPropertyScopeOutput;
     auto volume = std::make_shared<ReportingOnlyVolumeControl>(context, volumeParams);
+    // Both calls are required and do different things: AddVolumeControlAsync
+    // *publishes* the control as an audio object, which is what makes macOS
+    // draw a volume slider for the device; AttachVolumeControl wires it into
+    // the stream so ApplyProcessing runs (ours deliberately does nothing).
+    // Attaching without publishing leaves the slider greyed out.
+    device->AddVolumeControlAsync(volume);
     stream->AttachVolumeControl(volume);
+
+    // Publish a mute control too, so the mute key and the muted state work.
+    auto mute = device->AddMuteControlAsync(kAudioObjectPropertyScopeOutput);
+    stream->AttachMuteControl(mute);
 
     auto handler = std::make_shared<TargetBridgeHandler>();
     device->SetControlHandler(handler);

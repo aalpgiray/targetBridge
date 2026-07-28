@@ -630,6 +630,9 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                     settingRow(audioDeviceTitle, details: audioDeviceDetails) {
                         Picker("", selection: $session.audioDeviceUID) {
                             Text(audioDeviceSystemLabel).tag("")
+                            // Our own driver is output-only, so it never appears
+                            // in the input-device list — offer it explicitly.
+                            Text("TargetBridge (driver)").tag(TBAudioDriverReceiver.deviceUID)
                             ForEach(TBAudioDeviceCapture.availableDevices(), id: \.uid) { dev in
                                 Text(dev.name).tag(dev.uid)
                             }

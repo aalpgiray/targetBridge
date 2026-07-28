@@ -85,6 +85,8 @@ final class TBAudioDeviceVolumeObserver {
 
         let cb = onChange
         let block: AudioObjectPropertyListenerBlock = { _, _ in
+            // Mute reports as level 0 so the receiver actually goes silent,
+            // rather than staying at its last level with muted audio arriving.
             let level = Self.muted(id) ? 0 : (Self.volume(of: id) ?? 1)
             DispatchQueue.main.async { cb(level) }
         }
@@ -109,6 +111,7 @@ final class TBAudioDeviceVolumeObserver {
             _ = AudioObjectAddPropertyListenerBlock(id, &muteAddr, nil, block)
         }
 
+        TBLog.connection.info("audio volume: observer start uid=\(deviceUID, privacy: .public) id=\(id, privacy: .public) registered=\(ok, privacy: .public)")
         if ok {
             // Adopt the device's current level immediately, so the receiver is not
             // left at a stale value until the user first touches the slider.

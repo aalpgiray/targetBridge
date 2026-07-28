@@ -1406,6 +1406,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         didSet { UserDefaults.standard.set(audioDeviceUID, forKey: Self.audioDeviceUIDDefaultsKey) }
     }
     private var audioDeviceCapture: TBAudioDeviceCapture?
+    private var audioDriverReceiver: TBAudioDriverReceiver?
     private var audioVolumeObserver: TBAudioDeviceVolumeObserver?
     @Published var audioEnabled: Bool
     @Published var brightness: Double = 1.0 {
@@ -3720,6 +3721,23 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private func startAudioDeviceCaptureIfNeeded() {
         guard audioEnabled, !audioDeviceUID.isEmpty else { return }
         let uid = audioDeviceUID
+
+        // Our own virtual device pushes PCM to us over loopback UDP: no capture
+        // session, no microphone permission, and it is already the exact wire
+        // format, so it bypasses the converter entirely.
+        if uid == TBAudioDriverReceiver.deviceUID {
+            let rx = TBAudioDriverReceiver { [weak self] pcm in
+                Task { @MainActor [weak self] in
+                    guard let self, self.audioEnabled else { return }
+                    self.send(TBMonitorProtocol.makePacket(type: .audioFrame, payload: pcm))
+                }
+            }
+            if rx.start() {
+                audioDriverReceiver = rx
+                startAudioVolumeMirror(uid: uid)
+            }
+            return
+        }
         Task { @MainActor in
             guard await TBAudioDeviceCapture.requestAccess() else {
                 TBLog.connection.error("audio device: microphone access denied; falling back to no audio")
@@ -3732,25 +3750,33 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             if capture.start(deviceUID: uid) {
                 self.audioDeviceCapture = capture
 
-                // Mirror the OS volume for that device onto the receiver, so the
-                // Sound slider and the F11/F12 keys (which act on the default
-                // output device) control the iMac's actual output.
-                let observer = TBAudioDeviceVolumeObserver { level in
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        // Guard against feedback: our own send would otherwise
-                        // bounce back through the observer.
-                        if abs(self.volume - level) > 0.005 { self.volume = level }
-                    }
-                }
-                if observer.start(deviceUID: uid) {
-                    self.audioVolumeObserver = observer
-                }
+                self.startAudioVolumeMirror(uid: uid)
             }
         }
     }
 
+    /// Mirror a device's OS volume onto the receiver's hardware volume, so the
+    /// Sound slider and the F11/F12 keys (which act on the default output
+    /// device) control the iMac. With our own driver this is the *only* thing
+    /// its volume control does — it reports the level without touching samples,
+    /// which is what stops the level being applied twice.
+    private func startAudioVolumeMirror(uid: String) {
+        let observer = TBAudioDeviceVolumeObserver { level in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                // Guard against feedback: our own send would otherwise bounce
+                // back through the observer.
+                if abs(self.volume - level) > 0.005 { self.volume = level }
+            }
+        }
+        if observer.start(deviceUID: uid) {
+            audioVolumeObserver = observer
+        }
+    }
+
     private func stopAudioDeviceCapture() {
+        audioDriverReceiver?.stop()
+        audioDriverReceiver = nil
         audioVolumeObserver?.stop()
         audioVolumeObserver = nil
         audioDeviceCapture?.stop()
