@@ -39,6 +39,26 @@ final class TBMonitorProtocolTests: XCTestCase {
         XCTAssertEqual([UInt8](packet), [0x00, 0x00, 0x00, 0x04, 0x30, 0xAA, 0xBB, 0xCC])
     }
 
+    func testRawNV12PacketTypeAndOlderDisplayProfilesRemainCompatible() throws {
+        XCTAssertEqual(TBMonitorPacketType.rawFrame.rawValue, 0x22)
+
+        let olderProfile = Data("""
+        {
+          "receiverName": "Older Receiver",
+          "panelWidth": 5120,
+          "panelHeight": 2880,
+          "modeWidth": 2560,
+          "modeHeight": 1440,
+          "refreshRate": 60,
+          "hiDPI": true,
+          "captureWidth": 5120,
+          "captureHeight": 2880
+        }
+        """.utf8)
+        let profile = try JSONDecoder().decode(TBMonitorDisplayProfile.self, from: olderProfile)
+        XCTAssertNil(profile.supportsRawNV12)
+    }
+
     func testDrainPacketRoundTrip() throws {
         let payload = Data("hello receiver".utf8)
         var buffer = TBMonitorProtocol.makePacket(type: .helloReceiver, payload: payload)

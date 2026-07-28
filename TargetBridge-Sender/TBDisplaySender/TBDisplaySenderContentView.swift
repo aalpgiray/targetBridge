@@ -165,6 +165,7 @@ struct TBDisplaySenderContentView: View {
         case .italian: return "Impostazioni"
         case .english: return "Settings"
         case .german: return "Einstellungen"
+        case .french: return "Réglages"
         case .chinese: return "设置"
         }
     }
@@ -174,6 +175,7 @@ struct TBDisplaySenderContentView: View {
         case .italian: return "About"
         case .english: return "About"
         case .german: return "Info"
+        case .french: return "À propos"
         case .chinese: return "关于"
         }
     }
@@ -410,6 +412,7 @@ private struct TBDisplaySenderSessionCard: View {
         case .italian: return "Trasporto"
         case .english: return "Transport"
         case .german: return "Transport"
+        case .french: return "Transport"
         case .chinese: return "传输"
         }
     }
@@ -419,6 +422,7 @@ private struct TBDisplaySenderSessionCard: View {
         case .italian: return "Receiver"
         case .english: return "Receiver"
         case .german: return "Empfänger"
+        case .french: return "Receiver"
         case .chinese: return "接收端"
         }
     }
@@ -428,6 +432,7 @@ private struct TBDisplaySenderSessionCard: View {
         case .italian: return "Modalità"
         case .english: return "Mode"
         case .german: return "Modus"
+        case .french: return "Mode"
         case .chinese: return "模式"
         }
     }
@@ -437,6 +442,7 @@ private struct TBDisplaySenderSessionCard: View {
         case .italian: return "Telemetria"
         case .english: return "Telemetry"
         case .german: return "Telemetrie"
+        case .french: return "Télémétrie"
         case .chinese: return "遥测"
         }
     }
@@ -446,6 +452,7 @@ private struct TBDisplaySenderSessionCard: View {
         case .italian: return "Luminosità"
         case .english: return "Brightness"
         case .german: return "Helligkeit"
+        case .french: return "Luminosité"
         case .chinese: return "亮度"
         }
     }
@@ -455,6 +462,7 @@ private struct TBDisplaySenderSessionCard: View {
         case .italian: return "Volume"
         case .english: return "Volume"
         case .german: return "Lautstärke"
+        case .french: return "Volume"
         case .chinese: return "音量"
         }
     }
@@ -464,6 +472,7 @@ private struct TBDisplaySenderSessionCard: View {
         case .italian: return "Frame in invio"
         case .english: return "Frames currently sending"
         case .german: return "Frames werden gesendet"
+        case .french: return "Images en cours d’envoi"
         case .chinese: return "正在发送画面帧"
         }
     }
@@ -473,6 +482,7 @@ private struct TBDisplaySenderSessionCard: View {
         case .italian: return "Nessuno stream attivo"
         case .english: return "No active stream"
         case .german: return "Kein aktiver Stream"
+        case .french: return "Aucun flux actif"
         case .chinese: return "当前没有活动流"
         }
     }
@@ -482,6 +492,7 @@ private struct TBDisplaySenderSessionCard: View {
         case .italian: return "Sessione monitor"
         case .english: return "Monitor Session"
         case .german: return "Monitor-Sitzung"
+        case .french: return "Moniteur de session"
         case .chinese: return "显示会话"
         }
     }
@@ -516,6 +527,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
     @ObservedObject var service: TBDisplaySenderService
     @ObservedObject var session: TBDisplaySenderSession
     @Environment(\.dismiss) private var dismiss
+    @State private var configurationChecks: [TBConfigurationCheck] = []
 
     var body: some View {
         ScrollView {
@@ -571,6 +583,18 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                 }
 
                 settingsSection(title: outputSettingsTitle) {
+                    settingRow(TBDisplaySenderL10n.displayProfiles(service.language), details: TBDisplaySenderL10n.displayProfilesHint(service.language)) {
+                        HStack(spacing: 8) {
+                            ForEach(TBDisplayProfile.allCases) { profile in
+                                Button(TBDisplaySenderL10n.displayProfileTitle(profile, language: service.language)) {
+                                    service.applyDisplayProfile(profile, to: session)
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(session.isConnected || session.isStreaming)
+                            }
+                        }
+                    }
+
                     settingRow(TBDisplaySenderL10n.captureSource(service.language), details: captureModeDetails) {
                         Picker(TBDisplaySenderL10n.captureSource(service.language), selection: $session.captureSource) {
                             ForEach(TBDisplayCaptureSource.allCases) { source in
@@ -711,6 +735,33 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                 settingsSection(title: diagnosticsTitle) {
                     SurfaceSubcard {
                         VStack(alignment: .leading, spacing: 12) {
+                            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(TBDisplaySenderL10n.text("sender.diagnostics.guided_title", service.language))
+                                        .font(.subheadline.weight(.semibold))
+                                    Text(TBDisplaySenderL10n.text("sender.diagnostics.guided_hint", service.language))
+                                        .font(.footnote)
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                Spacer()
+                                Button(TBDisplaySenderL10n.text("sender.diagnostics.check_configuration", service.language)) {
+                                    configurationChecks = service.configurationChecks(for: session)
+                                }
+                                .buttonStyle(.borderedProminent)
+                            }
+
+                            if !configurationChecks.isEmpty {
+                                Divider().overlay(Color.white.opacity(0.08))
+                                VStack(alignment: .leading, spacing: 10) {
+                                    ForEach(configurationChecks) { check in
+                                        configurationCheckRow(check)
+                                    }
+                                }
+                            }
+
+                            Divider().overlay(Color.white.opacity(0.08))
+
                             HStack(spacing: 12) {
                                 Button(action: {
                                     session.startCableTest()
@@ -886,6 +937,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Configura trasporto, output e diagnostica senza sporcare la dashboard principale."
         case .english: return "Configure transport, output, and diagnostics without cluttering the main dashboard."
         case .german: return "Transport, Ausgabe und Diagnose konfigurieren, ohne das Haupt-Dashboard zu überladen."
+        case .french: return "Configurez le transport, la sortie et le diagnostic sans encombrer le tableau de bord principal."
         case .chinese: return "在不干扰主控制面板的情况下配置传输、输出和诊断。"
         }
     }
@@ -895,6 +947,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Connessione"
         case .english: return "Connection"
         case .german: return "Verbindung"
+        case .french: return "Connexion"
         case .chinese: return "连接"
         }
     }
@@ -904,6 +957,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Uscita"
         case .english: return "Output"
         case .german: return "Ausgabe"
+        case .french: return "Sortie"
         case .chinese: return "输出"
         }
     }
@@ -913,6 +967,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Diagnostica"
         case .english: return "Diagnostics"
         case .german: return "Diagnose"
+        case .french: return "Diagnostic"
         case .chinese: return "诊断"
         }
     }
@@ -922,6 +977,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Scegli il percorso di rete per questa sessione. Thunderbolt Bridge resta il profilo raccomandato; Network Link e sperimentale."
         case .english: return "Choose the network path for this session. Thunderbolt Bridge remains the recommended profile; Network Link is experimental."
         case .german: return "Wähle den Netzwerkpfad für diese Sitzung. Thunderbolt Bridge bleibt die empfohlene Option; Network Link ist experimentell."
+        case .french: return "Choisissez le chemin réseau de cette session. Thunderbolt Bridge reste le profil recommandé ; Network Link est expérimental."
         case .chinese: return "为该会话选择网络路径。Thunderbolt Bridge 仍然是推荐模式；Network Link 为实验性功能。"
         }
     }
@@ -931,6 +987,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "L'interfaccia locale determina da quale indirizzo il sender apre la connessione."
         case .english: return "The local interface controls which source address the sender binds before opening the connection."
         case .german: return "Die lokale Schnittstelle bestimmt, an welche Quelladresse der Sender beim Verbindungsaufbau bindet."
+        case .french: return "L’interface locale détermine l’adresse source à laquelle le sender se lie avant d’ouvrir la connexion."
         case .chinese: return "本地接口决定 sender 在建立连接前绑定的源地址。"
         }
     }
@@ -940,6 +997,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Seleziona un receiver rilevato automaticamente oppure lascia inserimento manuale."
         case .english: return "Select an automatically discovered receiver or keep manual entry."
         case .german: return "Wähle einen automatisch gefundenen Empfänger oder bleibe bei der manuellen Eingabe."
+        case .french: return "Sélectionnez un receiver détecté automatiquement ou conservez la saisie manuelle."
         case .chinese: return "选择自动发现的 receiver，或者保持手动输入。"
         }
     }
@@ -949,6 +1007,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Indirizzo diretto del receiver. Puoi usare IP Thunderbolt o LAN a seconda del trasporto."
         case .english: return "Direct receiver address. You can use a Thunderbolt or LAN IP depending on the selected transport."
         case .german: return "Direkte Empfängeradresse. Je nach gewähltem Transport kann eine Thunderbolt- oder LAN-IP verwendet werden."
+        case .french: return "Adresse directe du receiver. Vous pouvez utiliser une IP Thunderbolt ou LAN selon le transport sélectionné."
         case .chinese: return "receiver 的直连地址。可以根据所选传输使用 Thunderbolt 或局域网 IP。"
         }
     }
@@ -958,6 +1017,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Mirror per duplicare il desktop, Extended per creare un display indipendente."
         case .english: return "Mirror duplicates the desktop, Extended creates a separate display."
         case .german: return "Mirror dupliziert den Desktop, Extended erstellt ein separates Display."
+        case .french: return "Dupliquer recopie le bureau, Étendu crée un écran distinct."
         case .chinese: return "Mirror 复制桌面，Extended 创建独立显示器。"
         }
     }
@@ -967,6 +1027,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Parti da preset conservativi su Wi-Fi o reti lente, poi sali se la stabilita rimane buona."
         case .english: return "Start with conservative presets on Wi-Fi or slower links, then move up if stability stays good."
         case .german: return "Beginne bei WLAN oder langsameren Verbindungen mit konservativen Profilen und wähle höhere Einstellungen, wenn die Verbindung stabil bleibt."
+        case .french: return "Commencez avec des préréglages prudents sur Wi-Fi ou les liaisons lentes, puis augmentez-les si la stabilité reste bonne."
         case .chinese: return "在 Wi‑Fi 或较慢链路上先使用保守预设，稳定后再逐步提高。"
         }
     }
@@ -976,6 +1037,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Invia anche l'audio di sistema del sender al receiver per questa sessione."
         case .english: return "Also send the sender’s system audio to the receiver for this session."
         case .german: return "Überträgt für diese Sitzung auch den Systemton des Senders an den Empfänger."
+        case .french: return "Envoie aussi l’audio système du sender au receiver pour cette session."
         case .chinese: return "同时将 sender 的系统音频传到此会话的 receiver。"
         }
     }
@@ -985,6 +1047,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Rendering alla risoluzione dello stream"
         case .english: return "Match render to stream"
         case .german: return "Rendern in Stream-Auflösung"
+        case .french: return "Adapter le rendu au flux"
         case .chinese: return "渲染匹配串流分辨率"
         }
     }
@@ -995,6 +1058,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Dimensiona il display virtuale sul profilo dello stream: nessun ridimensionamento in cattura. Il desktop appare come \(desktop) HiDPI."
         case .english: return "Sizes the virtual display to the stream profile so capture is 1:1 — no rescale before encoding. Desktop looks like \(desktop) HiDPI."
         case .german: return "Passt das virtuelle Display an das Stream-Profil an, sodass die Aufnahme 1:1 erfolgt. Der Desktop erscheint als \(desktop) HiDPI."
+        case .french: return "Dimensionne l’écran virtuel selon le profil de flux pour une capture 1:1, sans redimensionnement avant l’encodage. Le bureau apparaît en \(desktop) HiDPI."
         case .chinese: return "使虚拟显示器匹配串流分辨率，捕获无需缩放。桌面显示为 \(desktop) HiDPI。"
         }
     }
@@ -1004,6 +1068,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Input Dockstation"
         case .english: return "Input Dockstation"
         case .german: return "Input Dockstation"
+        case .french: return "Station d’accueil des entrées"
         case .chinese: return "输入扩展坞"
         }
     }
@@ -1013,6 +1078,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Definisce il ruolo input di questa sessione. Una sola sessione puo avere un master attivo alla volta: questo Mac puo controllare il receiver, oppure il receiver puo controllare questo Mac. Per uscire rapidamente dal controllo usa Ctrl+Option+Command+K."
         case .english: return "Defines the input role for this session. Only one session can have an active master at a time: this Mac can control the receiver, or the receiver can control this Mac. Use Control+Option+Command+K to exit control quickly."
         case .german: return "Legt die Eingaberolle für diese Sitzung fest. Nur eine Sitzung kann gleichzeitig einen aktiven Master haben: Dieser Mac kann den Empfänger steuern oder der Empfänger kann diesen Mac steuern. Mit Ctrl+Option+Command+K beendest du die Steuerung schnell."
+        case .french: return "Définit le rôle d’entrée de cette session. Une seule session peut avoir un master actif à la fois : ce Mac peut contrôler le receiver, ou le receiver peut contrôler ce Mac. Utilisez Contrôle+Option+Commande+K pour quitter rapidement le contrôle."
         case .chinese: return "定义此会话的输入角色。同一时间只能有一个活动 master：这台 Mac 可以控制 receiver，或者 receiver 可以控制这台 Mac。按下 Control+Option+Command+K 可以快速退出控制。"
         }
     }
@@ -1022,6 +1088,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Cambio slave"
         case .english: return "Slave switching"
         case .german: return "Slave-Wechsel"
+        case .french: return "Changement de slave"
         case .chinese: return "Slave 切换"
         }
     }
@@ -1034,6 +1101,8 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
             return "Chooses how to move control from one slave to another when 'This Mac is Master' is active. In native mode, macOS keeps handling the master's desktop normally. In relay mode, TargetBridge uses the left/right screen edge and the Ctrl+Option+Left/Right hotkeys to move control to the previous or next slave."
         case .german:
             return "Legt fest, wie die Steuerung von einem Slave zum anderen wechselt, wenn 'Dieser Mac ist Master' aktiv ist. Im nativen Modus verwaltet macOS den Desktop des Masters normal weiter. Im Relay-Modus nutzt TargetBridge den linken/rechten Bildschirmrand und die Hotkeys Ctrl+Option+Links/Rechts, um zum vorherigen oder nächsten Slave zu wechseln."
+        case .french:
+            return "Définit comment déplacer le contrôle d’un slave à l’autre lorsque « Ce Mac est Master » est actif. En mode natif, macOS continue de gérer normalement le bureau du master. En mode relais, TargetBridge utilise les bords gauche et droit de l’écran ainsi que les raccourcis Ctrl+Option+Gauche/Droite pour déplacer le contrôle vers le slave précédent ou suivant."
         case .chinese:
             return "决定在“这台 Mac 是 Master”启用时如何在不同 slave 之间切换控制。原生模式下，macOS 继续正常处理 master 的桌面；relay 模式下，TargetBridge 会使用屏幕左右边缘以及 Ctrl+Option+Left/Right 热键，把控制切换到上一个或下一个 slave。"
         }
@@ -1044,10 +1113,12 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case (.native, .italian): return "Lascia il desktop nativo del master"
         case (.native, .english): return "Keep master's desktop native"
         case (.native, .german): return "Desktop des Masters nativ lassen"
+        case (.native, .french): return "Conserver le bureau natif du master"
         case (.native, .chinese): return "保留 master 的原生桌面行为"
         case (.relayToSlave, .italian): return "Usa bordi schermo e hotkey per cambiare slave"
         case (.relayToSlave, .english): return "Use screen edges and hotkeys to switch slave"
         case (.relayToSlave, .german): return "Bildschirmränder und Hotkeys für Slave-Wechsel nutzen"
+        case (.relayToSlave, .french): return "Utiliser les bords de l’écran et les raccourcis pour changer de slave"
         case (.relayToSlave, .chinese): return "使用屏幕边缘和热键切换 slave"
         }
     }
@@ -1057,14 +1128,17 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case (.off, .italian): return "Off"
         case (.off, .english): return "Off"
         case (.off, .german): return "Aus"
+        case (.off, .french): return "Désactivé"
         case (.off, .chinese): return "关闭"
         case (.senderMaster, .italian): return "Questo Mac e Master"
         case (.senderMaster, .english): return "This Mac is Master"
         case (.senderMaster, .german): return "Dieser Mac ist Master"
+        case (.senderMaster, .french): return "Ce Mac est Master"
         case (.senderMaster, .chinese): return "这台 Mac 是 Master"
         case (.receiverMaster, .italian): return "Receiver e Master"
         case (.receiverMaster, .english): return "Receiver is Master"
         case (.receiverMaster, .german): return "Empfänger ist Master"
+        case (.receiverMaster, .french): return "Le receiver est Master"
         case (.receiverMaster, .chinese): return "Receiver 是 Master"
         }
     }
@@ -1074,6 +1148,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Il sender non puo ancora iniettare input"
         case .english: return "The sender cannot inject input yet"
         case .german: return "Der Sender kann noch keine Eingaben injizieren"
+        case .french: return "Le sender ne peut pas encore injecter d’entrées"
         case .chinese: return "Sender 目前还不能注入输入"
         }
     }
@@ -1086,6 +1161,8 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
             return "To use 'Receiver is Master', this TargetBridge app on the sender must be allowed under Privacy & Security > Accessibility. Open the settings, enable the app you are actually running, then reopen the session. Configured shortcuts also require a one-time macOS permission to control System Events."
         case .german:
             return "Um 'Empfänger ist Master' zu verwenden, muss diese TargetBridge-App auf dem Sender unter Datenschutz & Sicherheit > Bedienungshilfen erlaubt sein. Öffne die Einstellungen, aktiviere die wirklich verwendete App und öffne dann die Sitzung erneut. Konfigurierte Kurzbefehle benötigen außerdem einmalig die macOS-Erlaubnis, System Events zu steuern."
+        case .french:
+            return "Pour utiliser « Le receiver est Master », cette app TargetBridge sur le sender doit être autorisée dans Confidentialité et sécurité > Accessibilité. Ouvrez les réglages, activez l’app que vous utilisez réellement, puis rouvrez la session. Les raccourcis configurés exigent aussi une autorisation macOS unique pour contrôler System Events."
         case .chinese:
             return "要使用“Receiver 是 Master”，sender 上这份 TargetBridge 必须在“隐私与安全性 > 辅助功能”中被允许。打开设置，启用你当前运行的这份应用，然后重新打开会话。已配置的快捷键还需要一次性授权 TargetBridge 控制 System Events。"
         }
@@ -1096,6 +1173,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Apri Accessibilita"
         case .english: return "Open Accessibility"
         case .german: return "Bedienungshilfen öffnen"
+        case .french: return "Ouvrir Accessibilité"
         case .chinese: return "打开辅助功能"
         }
     }
@@ -1109,6 +1187,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Manca il monitoraggio input sul sender"
         case .english: return "Input Monitoring is missing on the sender"
         case .german: return "Eingabeüberwachung fehlt auf dem Sender"
+        case .french: return "La surveillance des entrées manque sur le sender"
         case .chinese: return "sender 缺少输入监控权限"
         }
     }
@@ -1121,6 +1200,8 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
             return "To use 'This Mac is Master' reliably outside the active app window, the sender needs Input Monitoring permission. Without it, some keys or global pointer events may not be captured."
         case .german:
             return "Damit 'Dieser Mac ist Master' auch außerhalb des aktiven Fensters zuverlässig funktioniert, braucht der Sender die Berechtigung für Eingabeüberwachung. Ohne diese können einige Tasten oder globale Zeigerereignisse fehlen."
+        case .french:
+            return "Pour utiliser « Ce Mac est Master » de façon fiable en dehors de la fenêtre active, le sender a besoin de l’autorisation Surveillance des entrées. Sans elle, certaines touches ou certains événements globaux du pointeur peuvent ne pas être capturés."
         case .chinese:
             return "要让“这台 Mac 是 Master”在活动窗口之外也可靠工作，sender 需要“输入监控”权限。没有它，一些按键或全局指针事件可能无法被捕获。"
         }
@@ -1131,6 +1212,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Manca Accessibilita sul receiver"
         case .english: return "Accessibility is missing on the receiver"
         case .german: return "Bedienungshilfen fehlen auf dem Empfänger"
+        case .french: return "L’accessibilité manque sur le receiver"
         case .chinese: return "receiver 缺少辅助功能权限"
         }
     }
@@ -1143,6 +1225,8 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
             return "With 'This Mac is Master', the receiver must be allowed to inject clicks and keyboard events. On the receiver Mac, enable TargetBridge Receiver under Privacy & Security > Accessibility."
         case .german:
             return "Bei 'Dieser Mac ist Master' muss der Empfänger Klicks und Tastatureingaben injizieren dürfen. Aktiviere auf dem Empfänger-Mac TargetBridge-Receiver unter Datenschutz & Sicherheit > Bedienungshilfen."
+        case .french:
+            return "Avec « Ce Mac est Master », le receiver doit pouvoir injecter les clics et les événements clavier. Sur le Mac receiver, activez TargetBridge Receiver dans Confidentialité et sécurité > Accessibilité."
         case .chinese:
             return "在“这台 Mac 是 Master”模式下，receiver 必须被允许注入点击和键盘事件。请在 receiver Mac 的“隐私与安全性 > 辅助功能”中启用 TargetBridge Receiver。"
         }
@@ -1153,6 +1237,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Manca Monitoraggio input sul receiver"
         case .english: return "Input Monitoring is missing on the receiver"
         case .german: return "Eingabeüberwachung fehlt auf dem Empfänger"
+        case .french: return "La surveillance des entrées manque sur le receiver"
         case .chinese: return "receiver 缺少输入监控权限"
         }
     }
@@ -1165,6 +1250,8 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
             return "With 'Receiver is Master', the receiver Mac must be allowed to read local keyboard and mouse input. On the receiver, enable TargetBridge Receiver under Privacy & Security > Input Monitoring."
         case .german:
             return "Bei 'Empfänger ist Master' muss der Empfänger-Mac lokale Tastatur- und Mauseingaben lesen dürfen. Aktiviere dort TargetBridge-Receiver unter Datenschutz & Sicherheit > Eingabeüberwachung."
+        case .french:
+            return "Avec « Le receiver est Master », le Mac receiver doit pouvoir lire les entrées clavier et souris locales. Sur le receiver, activez TargetBridge Receiver dans Confidentialité et sécurité > Surveillance des entrées."
         case .chinese:
             return "在“Receiver 是 Master”模式下，receiver Mac 必须被允许读取本地键盘和鼠标输入。请在 receiver 上的“隐私与安全性 > 输入监控”中启用 TargetBridge Receiver。"
         }
@@ -1175,6 +1262,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .italian: return "Apri Monitoraggio input"
         case .english: return "Open Settings"
         case .german: return "Einstellungen öffnen"
+        case .french: return "Ouvrir les réglages"
         case .chinese: return "打开设置"
         }
     }
@@ -1204,6 +1292,38 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func configurationCheckRow(_ check: TBConfigurationCheck) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: configurationCheckIcon(for: check.state))
+                .foregroundStyle(configurationCheckColor(for: check.state))
+                .frame(width: 16)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(TBDisplaySenderL10n.text(check.titleKey, service.language))
+                    .font(.footnote.weight(.semibold))
+                Text(TBDisplaySenderL10n.text(check.detailKey, service.language, check.values))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func configurationCheckIcon(for state: TBConfigurationCheckState) -> String {
+        switch state {
+        case .passed: return "checkmark.circle.fill"
+        case .attention: return "exclamationmark.triangle.fill"
+        case .pending: return "clock.fill"
+        }
+    }
+
+    private func configurationCheckColor(for state: TBConfigurationCheckState) -> Color {
+        switch state {
+        case .passed: return .green
+        case .attention: return .yellow
+        case .pending: return .secondary
         }
     }
 }

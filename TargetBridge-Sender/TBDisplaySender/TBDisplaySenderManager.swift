@@ -15,10 +15,12 @@ enum TBTransportKind: String, CaseIterable, Identifiable {
         case (.thunderboltBridge, .italian): return "Thunderbolt Bridge"
         case (.thunderboltBridge, .english): return "Thunderbolt Bridge"
         case (.thunderboltBridge, .german): return "Thunderbolt Bridge"
+        case (.thunderboltBridge, .french): return "Thunderbolt Bridge"
         case (.thunderboltBridge, .chinese): return "Thunderbolt Bridge"
         case (.networkLink, .italian): return "Network Link (sperimentale)"
         case (.networkLink, .english): return "Network Link (experimental)"
         case (.networkLink, .german): return "Network Link (experimentell)"
+        case (.networkLink, .french): return "Network Link (expérimental)"
         case (.networkLink, .chinese): return "Network Link（实验性）"
         }
     }
@@ -44,6 +46,9 @@ final class TBDisplaySenderService: ObservableObject {
     @Published private(set) var localInterfaces: [TBLocalLinkInterface] = []
     @Published private(set) var discoveredReceivers: [TBDiscoveredReceiver] = []
     @Published private(set) var addons: [TBAddonRecord] = []
+    /// Changes whenever the app returns from System Settings so permission cards
+    /// re-evaluate their live TCC state instead of showing a stale warning.
+    @Published private(set) var privacyPermissionsRevision = 0
     @Published var language: TBDisplaySenderLanguage = .load() {
         didSet {
             language.persist()
@@ -103,6 +108,7 @@ final class TBDisplaySenderService: ObservableObject {
     private let inputRelayController = TBInputRelayController()
     private var discoveryCancellable: AnyCancellable?
     private var addonCancellable: AnyCancellable?
+    private var activationObserver: NSObjectProtocol?
     private var clipboardTimer: Timer?
     private var lastClipboardChangeCount: Int = NSPasteboard.general.changeCount
 
@@ -123,6 +129,19 @@ final class TBDisplaySenderService: ObservableObject {
         addonStore.refresh()
         restorePersistedSessions()
         startClipboardMonitoring()
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshPrivacyPermissions()
+            }
+        }
+    }
+
+    func refreshPrivacyPermissions() {
+        privacyPermissionsRevision &+= 1
     }
 
     var anyConnected: Bool {
@@ -191,6 +210,30 @@ final class TBDisplaySenderService: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    func configurationChecks(for session: TBDisplaySenderSession) -> [TBConfigurationCheck] {
+        let interfaces = TBConnectionDiagnostics.currentIPv4Interfaces()
+        let role = session.inputControlRole
+        let snapshot = TBConfigurationDiagnosticSnapshot(
+            hasScreenRecording: CGPreflightScreenCaptureAccess(),
+            transportIsThunderbolt: session.transportKind == .thunderboltBridge,
+            localInterfaceName: TBConnectionDiagnostics.interfaceName(forLocalIP: session.localInterfaceIP, in: interfaces),
+            receiverAddress: session.receiverIP.trimmingCharacters(in: .whitespacesAndNewlines),
+            receiverProfileAvailable: session.receiverSupportsHEVCDecodeHint != nil,
+            receiverSupportsHEVC: session.receiverSupportsHEVCDecodeHint,
+            requiresHEVC: session.capturePreset.codecName == "HEVC",
+            cableRate: session.cableTestResult,
+            requiresSenderInputMonitoring: role == .senderMaster,
+            senderInputMonitoringGranted: localInputMonitoringTrusted,
+            requiresSenderAccessibility: role == .receiverMaster,
+            senderAccessibilityGranted: localInputInjectionTrusted,
+            requiresReceiverInputMonitoring: role == .receiverMaster,
+            receiverInputMonitoringGranted: session.receiverInputMonitoringTrustedHint,
+            requiresReceiverAccessibility: role == .senderMaster,
+            receiverAccessibilityGranted: session.receiverAccessibilityTrustedHint
+        )
+        return TBConfigurationDiagnostics.checks(for: snapshot)
+    }
+
     func addSession() {
         let session = TBDisplaySenderSession(
             language: language,
@@ -236,6 +279,7 @@ final class TBDisplaySenderService: ObservableObject {
     // MARK: - Session persistence
 
     private static let persistedSessionsKey = "fd.tbdisplaysender.sessions.v1"
+    private static let receiverDisplayProfilesKey = "fd.tbdisplaysender.receiverDisplayProfiles.v1"
 
     /// Snapshot of the user-configurable settings for a single session. Transient
     /// runtime state (connection, FPS, …) is intentionally excluded — only the
@@ -256,6 +300,7 @@ final class TBDisplaySenderService: ObservableObject {
         var volume: Double?
         var inputControlRole: String?
         var inputBindings: [TBInputBinding]?
+        var matchRenderToStream: Bool?
     }
 
     private var lastPersistedData: Data?
@@ -289,7 +334,8 @@ final class TBDisplaySenderService: ObservableObject {
                 inputGestureMode: session.inputGestureMode.rawValue,
                 volume: session.volume,
                 inputControlRole: session.inputControlRole.rawValue,
-                inputBindings: session.inputBindings
+                inputBindings: session.inputBindings,
+                matchRenderToStream: session.matchRenderToStream
             )
         }
         guard let data = try? JSONEncoder().encode(configs) else { return }
@@ -364,6 +410,7 @@ final class TBDisplaySenderService: ObservableObject {
         session.audioEnabled = config.audioEnabled && audioRelayAvailable
         session.brightness = config.brightness
         session.volume = config.volume ?? 0.5
+        session.matchRenderToStream = config.matchRenderToStream ?? false
     }
 
     func refreshLocalInterfaces() {
@@ -381,7 +428,47 @@ final class TBDisplaySenderService: ObservableObject {
                 ?? availableInterfaces(for: session.transportKind).first?.ip
                 ?? ""
         }
+        restoreDisplayProfile(for: session)
         objectWillChange.send()
+    }
+
+    func applyDisplayProfile(_ profile: TBDisplayProfile, to session: TBDisplaySenderSession) {
+        guard !session.isConnected, !session.isStreaming else { return }
+
+        let settings = profile.settings
+        session.captureSource = settings.captureSource
+        session.capturePreset = settings.capturePreset
+        session.matchRenderToStream = settings.matchRenderToStream
+        session.audioEnabled = settings.audioEnabled && audioRelayAvailable
+
+        guard let receiverKey = receiverProfileKey(for: session) else { return }
+        var profiles = persistedDisplayProfiles
+        profiles[receiverKey] = profile.rawValue
+        UserDefaults.standard.set(profiles, forKey: Self.receiverDisplayProfilesKey)
+    }
+
+    private var persistedDisplayProfiles: [String: String] {
+        UserDefaults.standard.dictionary(forKey: Self.receiverDisplayProfilesKey) as? [String: String] ?? [:]
+    }
+
+    private func receiverProfileKey(for session: TBDisplaySenderSession) -> String? {
+        if !session.selectedReceiverID.isEmpty {
+            return "id:\(session.selectedReceiverID)"
+        }
+
+        let receiverIP = session.receiverIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        return receiverIP.isEmpty ? nil : "ip:\(receiverIP)"
+    }
+
+    private func restoreDisplayProfile(for session: TBDisplaySenderSession) {
+        guard let receiverKey = receiverProfileKey(for: session),
+              let rawValue = persistedDisplayProfiles[receiverKey],
+              let profile = TBDisplayProfile(rawValue: rawValue)
+        else {
+            return
+        }
+
+        applyDisplayProfile(profile, to: session)
     }
 
     func sessionTitle(for session: TBDisplaySenderSession) -> String {

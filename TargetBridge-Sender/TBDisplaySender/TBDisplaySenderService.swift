@@ -16,6 +16,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     case smooth1800p60
     case crisp2160p60
     case native5k
+    case native5k60Experimental
 
     var id: String { rawValue }
 
@@ -31,6 +32,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "Crisp"
         case .native5k:
             return "5K"
+        case .native5k60Experimental:
+            return "5K 60 Experimental"
         }
     }
 
@@ -46,6 +49,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "3840 × 2160 @ 60"
         case .native5k:
             return "5120 × 2880 @ 48"
+        case .native5k60Experimental:
+            return "5120 × 2880 @ 60"
         }
     }
 
@@ -57,7 +62,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 3200
         case .crisp2160p60:
             return 3840
-        case .native5k:
+        case .native5k, .native5k60Experimental:
             return 5120
         }
     }
@@ -70,7 +75,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 1800
         case .crisp2160p60:
             return 2160
-        case .native5k:
+        case .native5k, .native5k60Experimental:
             return 2880
         }
     }
@@ -87,6 +92,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 105_000_000
         case .native5k:
             return 120_000_000
+        case .native5k60Experimental:
+            return 150_000_000
         }
     }
 
@@ -94,7 +101,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
             return "H.264"
-        case .crisp2160p60, .native5k:
+        case .crisp2160p60, .native5k, .native5k60Experimental:
             return "HEVC"
         }
     }
@@ -103,7 +110,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
             return kCMVideoCodecType_H264
-        case .crisp2160p60, .native5k:
+        case .crisp2160p60, .native5k, .native5k60Experimental:
             return kCMVideoCodecType_HEVC
         }
     }
@@ -127,6 +134,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .native5k:
             return 48
+        case .native5k60Experimental:
+            return 60
         }
     }
 
@@ -142,6 +151,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .native5k:
             return 48
+        case .native5k60Experimental:
+            return 60
         }
     }
 
@@ -153,7 +164,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 1
         case .smooth1800p60, .crisp2160p60:
             return 1
-        case .native5k:
+        case .native5k, .native5k60Experimental:
             return 1
         }
     }
@@ -162,7 +173,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return false
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5k60Experimental:
             return true
         }
     }
@@ -178,7 +189,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return 1
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5k60Experimental:
             return 0
         }
     }
@@ -187,7 +198,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return false
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5k60Experimental:
             return true
         }
     }
@@ -203,7 +214,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
             return .nominal
-        case .crisp2160p60, .native5k:
+        case .crisp2160p60, .native5k, .native5k60Experimental:
             return .best
         }
     }
@@ -218,6 +229,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .native5k:
             return 48
+        case .native5k60Experimental:
+            return 60
         }
     }
 
@@ -362,6 +375,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private let connection: NWConnection
     private let displayName: String
     private let displayID: CGDirectDisplayID
+    private let usesRawNV12: Bool
     private let onFirstFrame: @Sendable () -> Void
 
     // Confined to `queue`.
@@ -384,6 +398,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
          connection: NWConnection,
          displayName: String,
          displayID: CGDirectDisplayID,
+         usesRawNV12: Bool,
          ackAlreadySent: Bool,
          onFirstFrame: @escaping @Sendable () -> Void) {
         self.preset = preset
@@ -391,6 +406,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         self.connection = connection
         self.displayName = displayName
         self.displayID = displayID
+        self.usesRawNV12 = usesRawNV12
         self.ackSent = ackAlreadySent
         self.onFirstFrame = onFirstFrame
     }
@@ -401,6 +417,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// could not be created.
     func start() -> Bool {
         queue.sync {
+            if usesRawNV12 {
+                running = true
+                return true
+            }
             setupEncoder()
             running = vtEncoder != nil
             return running
@@ -504,9 +524,19 @@ private final class TBVideoPipeline: @unchecked Sendable {
 
     // MARK: - Encode paths (on `queue`)
 
+    /// Opt-in raw passthrough: ScreenCaptureKit already captures NV12,
+    /// so we can forward the planes uncompressed and skip the encoder entirely.
+    /// This removes all decode cost on the receiver — useful when the receiver is
+    /// an older Intel Mac whose HEVC decoder struggles at high resolutions — at
+    /// the price of much higher bandwidth (~10.6 Gb/s for 5K@60 4:2:0), which a
+    /// direct Thunderbolt Bridge link comfortably sustains.
     /// SCStream capture path. Must be dispatched onto `queue` by the caller.
     func encode(_ sampleBuffer: CMSampleBuffer) {
         markCaptureFrame()
+        if usesRawNV12 {
+            sendRawFrame(sampleBuffer)
+            return
+        }
         guard running, let encoder = vtEncoder,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
@@ -620,6 +650,66 @@ private final class TBVideoPipeline: @unchecked Sendable {
             }))
             lock.lock(); _sentFrames += 1; lock.unlock()
         }
+    }
+
+    /// Raw passthrough: package the two NV12 planes of the captured pixel buffer
+    /// and send them uncompressed. The receiver blits them directly (no decode).
+    /// Payload: [1: format=1(NV12)][BE32 w][BE32 h][BE32 yStride][BE32 uvStride]
+    ///          [Y plane: yStride*h][CbCr plane: uvStride*(h/2)]
+    private func sendRawFrame(_ sampleBuffer: CMSampleBuffer) {
+        guard running,
+              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
+        else { return }
+        // Backpressure: never pile frames on top of a network that can't keep up.
+        if pendingVideoPackets >= preset.maxPendingVideoPackets { return }
+        guard CVPixelBufferGetPlaneCount(pixelBuffer) >= 2 else { return }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
+              let uvBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1)
+        else { return }
+        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        let uvStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
+        let uvHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)
+        let ySize = yStride * height
+        let uvSize = uvStride * uvHeight
+
+        // Send the session ack on the first frame, mirroring the encoded path.
+        if !ackSent {
+            ackSent = true
+            let ack = TBMonitorCreateSessionAck(
+                accepted: true,
+                displayName: displayName,
+                displayID: displayID
+            )
+            if let packet = TBMonitorProtocol.makeJSONPacket(type: .createSessionAck, value: ack) {
+                connection.send(content: packet, completion: .contentProcessed({ _ in }))
+            }
+            onFirstFrame()
+        }
+
+        var payload = Data(capacity: 17 + ySize + uvSize)
+        payload.append(1) // format: NV12
+        TBMonitorProtocol.appendBE32(&payload, UInt32(width))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(height))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(yStride))
+        TBMonitorProtocol.appendBE32(&payload, UInt32(uvStride))
+        payload.append(UnsafeBufferPointer(start: yBase.assumingMemoryBound(to: UInt8.self), count: ySize))
+        payload.append(UnsafeBufferPointer(start: uvBase.assumingMemoryBound(to: UInt8.self), count: uvSize))
+
+        let packet = TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
+        pendingVideoPackets += 1
+        connection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
+            guard let self else { return }
+            self.queue.async {
+                self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+            }
+        }))
+        lock.lock(); _sentFrames += 1; lock.unlock()
     }
 
     private func buildParamSetsPacket(from format: CMVideoFormatDescription, codecType: CMVideoCodecType) -> Data? {
@@ -1145,7 +1235,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return kCMVideoCodecType_HEVC
             }
             return kCMVideoCodecType_H264
-        case .crisp2160p60, .native5k:
+        case .crisp2160p60, .native5k, .native5k60Experimental:
             return preset.codecType
         }
     }
@@ -1183,6 +1273,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             || captureDisplayText == TBDisplaySenderL10n.captureDisplayNotAvailable(.italian)
             || captureDisplayText == TBDisplaySenderL10n.captureDisplayNotAvailable(.english)
             || captureDisplayText == TBDisplaySenderL10n.captureDisplayNotAvailable(.german)
+            || captureDisplayText == TBDisplaySenderL10n.captureDisplayNotAvailable(.french)
             || captureDisplayText == TBDisplaySenderL10n.captureDisplayNotAvailable(.chinese) {
             captureDisplayText = TBDisplaySenderL10n.captureDisplayNotAvailable(language)
         }
@@ -1191,6 +1282,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             || displayStateText == TBDisplaySenderL10n.displayStateNotAvailable(.italian)
             || displayStateText == TBDisplaySenderL10n.displayStateNotAvailable(.english)
             || displayStateText == TBDisplaySenderL10n.displayStateNotAvailable(.german)
+            || displayStateText == TBDisplaySenderL10n.displayStateNotAvailable(.french)
             || displayStateText == TBDisplaySenderL10n.displayStateNotAvailable(.chinese) {
             displayStateText = TBDisplaySenderL10n.displayStateNotAvailable(language)
         }
@@ -2126,7 +2218,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return
             }
             if self.captureSource == .desktopMirror {
-                let mirrorConfigured = self.configureDesktopMirror(for: self.session.displayID)
+                let displayReady = await self.waitForOnlineDisplay(self.session.displayID)
+                let mirrorConfigured = displayReady && self.configureDesktopMirror(for: self.session.displayID)
                 if !mirrorConfigured {
                     NSLog(
                         "TargetBridge: unable to enable mirror mode for virtual display %u on first attempt; scheduling retry",
@@ -2169,9 +2262,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private func startCapture(for profile: TBMonitorDisplayProfile) async -> Bool {
         do {
             let preset = capturePreset
+            let usesRawNV12 = rawNV12Enabled(for: profile)
             let codecType = resolvedCodecType(for: preset, profile: profile)
-            let codecName = codecName(for: codecType)
-            activeCodecType = codecType
+            let codecName = usesRawNV12 ? "NV12 RAW" : codecName(for: codecType)
+            activeCodecType = usesRawNV12 ? nil : codecType
             activeCodecName = codecName
             guard let connection else { return false }
 
@@ -2185,6 +2279,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 connection: connection,
                 displayName: session.displayName,
                 displayID: session.displayID,
+                usesRawNV12: usesRawNV12,
                 ackAlreadySent: sessionAckSent,
                 onFirstFrame: { [weak self] in
                     Task { @MainActor in self?.handleFirstEncodedFrame() }
@@ -2192,7 +2287,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             )
             guard pipeline.start() else { return false }
             self.pipeline = pipeline
-            TBLog.connection.info("capture: pipeline started preset=\(preset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) codec=\(codecName, privacy: .public)")
+            TBLog.connection.info("capture: pipeline started preset=\(preset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) codec=\(codecName, privacy: .public) rawNV12=\(usesRawNV12, privacy: .public)")
 
             let display: SCDisplay
             if captureSource == .desktopMirror {
@@ -2377,6 +2472,29 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         } catch {
             return []
         }
+    }
+
+    /// A freshly created virtual display can be reported by CoreGraphics before
+    /// it is usable in a display configuration. Waiting briefly avoids racing
+    /// `CGConfigureDisplayMirrorOfDisplay` on first connect.
+    private func waitForOnlineDisplay(_ displayID: CGDirectDisplayID) async -> Bool {
+        for _ in 0..<20 {
+            if onlineDisplayIDs().contains(displayID) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return onlineDisplayIDs().contains(displayID)
+    }
+
+    /// RAW remains an explicit diagnostic-only transport until a selectable
+    /// profile and sustained hardware tests prove it safe for normal sessions.
+    /// A Receiver must explicitly advertise support before the environment
+    /// override can enable it, so older builds never receive unknown frames.
+    private func rawNV12Enabled(for profile: TBMonitorDisplayProfile) -> Bool {
+        guard profile.supportsRawNV12 == true else { return false }
+        guard let value = ProcessInfo.processInfo.environment["RAW"]?.lowercased() else { return false }
+        return value == "1" || value == "true"
     }
 
     private func configureDesktopMirror(for virtualDisplayID: CGDirectDisplayID) -> Bool {
@@ -2960,7 +3078,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 guard isStreaming, !sessionAckSent else { return }
                 let sentFrames = self.pipeline?.sentFramesSnapshot ?? 0
                 TBLog.connection.error("capture: first-frame timeout preset=\(self.capturePreset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) connected=\(self.isConnected, privacy: .public) sentFrames=\(sentFrames, privacy: .public)")
-                if self.capturePreset == .native5k {
+                if self.capturePreset == .native5k || self.capturePreset == .native5k60Experimental {
                     setStatus(.hevcNoFrames)
                 } else {
                     setStatus(.noFirstFrame)
@@ -2983,6 +3101,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 case .italian: timeoutMessage = "Connessione scaduta"
                 case .english: timeoutMessage = "Connection timed out"
                 case .german: timeoutMessage = "Verbindungs-Zeitüberschreitung"
+                case .french: timeoutMessage = "Délai de connexion dépassé"
                 case .chinese: timeoutMessage = "连接超时"
                 }
 
