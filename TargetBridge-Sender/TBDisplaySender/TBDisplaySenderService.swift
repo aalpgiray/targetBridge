@@ -1006,6 +1006,20 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             sendVolumeUpdate()
         }
     }
+    /// Night Shift / True Tone on the receiver's own panel. Only offered when
+    /// the receiver reports it can honour them (both are private CoreBrightness
+    /// features, and True Tone needs supporting hardware).
+    @Published var nightShiftEnabled = false {
+        didSet { if !adoptingReportedTweaks { sendDisplayTweaks() } }
+    }
+    @Published var trueToneEnabled = false {
+        didSet { if !adoptingReportedTweaks { sendDisplayTweaks() } }
+    }
+    /// Set while adopting state the receiver reported, so the didSet observers
+    /// above don't echo it back and start a loop.
+    private var adoptingReportedTweaks = false
+    @Published var receiverSupportsNightShift = false
+    @Published var receiverSupportsTrueTone = false
     var audioAddonAvailable = true
     var receiverSupportsHEVCDecodeHint: Bool?
     var receiverInputMonitoringTrustedHint: Bool?
@@ -1701,6 +1715,22 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         send(packet)
     }
 
+    private func applyReportedDisplayTweaks(_ tweaks: TBMonitorDisplayTweaks) {
+        guard nightShiftEnabled != tweaks.nightShift || trueToneEnabled != tweaks.trueTone else { return }
+        adoptingReportedTweaks = true
+        nightShiftEnabled = tweaks.nightShift
+        trueToneEnabled = tweaks.trueTone
+        adoptingReportedTweaks = false
+    }
+
+    private func sendDisplayTweaks() {
+        guard let packet = TBMonitorProtocol.makeJSONPacket(
+            type: .displayTweaks,
+            value: TBMonitorDisplayTweaks(nightShift: nightShiftEnabled, trueTone: trueToneEnabled)
+        ) else { return }
+        send(packet)
+    }
+
     private func sendVolumeUpdate() {
         guard let packet = TBMonitorProtocol.makeJSONPacket(
             type: .volume,
@@ -1808,6 +1838,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 setStatus(.receiverTerminatedSession)
                 stop(resetStatusTo: nil)
                 return
+            case .displayTweaks:
+                // Receiver reporting its real state (it may have been changed on
+                // that Mac directly). Adopt it without sending anything back —
+                // the didSet observers would otherwise bounce it straight to the
+                // receiver and the two could ping-pong.
+                if let tweaks = TBMonitorProtocol.decodeJSON(TBMonitorDisplayTweaks.self, from: payload) {
+                    applyReportedDisplayTweaks(tweaks)
+                }
             case .clipboard:
                 if let clipboard = TBMonitorProtocol.decodeJSON(TBMonitorClipboard.self, from: payload) {
                     let pasteboard = NSPasteboard.general
@@ -2169,6 +2207,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         if let accessibilityTrusted = profile.accessibilityTrusted {
             receiverAccessibilityTrustedHint = accessibilityTrusted
         }
+        receiverSupportsNightShift = profile.supportsNightShift ?? false
+        receiverSupportsTrueTone = profile.supportsTrueTone ?? false
         receiverPanelText = TBDisplaySenderL10n.receiverSummary(profile, language: language)
         sendHello()
         sendInputControlModeUpdate()

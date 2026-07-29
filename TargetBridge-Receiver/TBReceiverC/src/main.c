@@ -18,6 +18,7 @@
 #include "display.h"
 #include "proto.h"
 #include "tb_gesture_bridge.h"
+#include "tb_display_tweaks.h"
 #include "tb_i18n.h"
 
 #include <SDL.h>
@@ -64,6 +65,13 @@ struct app {
     uint64_t last_fps_tick_ms;
     uint64_t last_fps_count;
     uint64_t last_ip_check_ms;
+    /* Last display-tweak state reported to the sender, so changes made on this
+     * Mac (Control Center, System Settings) propagate back and the sender's
+     * toggles stay truthful. -1 = nothing sent yet. */
+    int      reported_night_shift;
+    int      reported_true_tone;
+    uint64_t last_tweak_poll_ms;
+
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
     int      close_requested;
     int      have_video_frame;
@@ -191,6 +199,7 @@ static void tb_receiver_set_clipboard_text(const char *text);
 static int tb_receiver_get_clipboard_text(char *dest, size_t size);
 static void tb_receiver_send_clipboard_if_changed(struct app *a);
 static void write_be32(uint8_t *dst, uint32_t value);
+static void tb_receiver_send_display_tweaks_if_changed(struct app *a);
 
 static int tb_receiver_is_valid_language_pref(const char *language_pref) {
     return language_pref &&
@@ -1105,6 +1114,19 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
             tb_disp_set_brightness(a->disp, level);
         }
         break;
+    case TB_PKT_DISPLAY_TWEAKS:
+        {
+            /* Absent fields are left alone rather than defaulted, so the sender
+             * can change one without disturbing the other. */
+            int night = 0, tone = 0;
+            if (extract_json_bool_field(payload, len, "\"nightShift\"", &night)) {
+                tb_night_shift_set(night);
+            }
+            if (extract_json_bool_field(payload, len, "\"trueTone\"", &tone)) {
+                tb_true_tone_set(tone);
+            }
+        }
+        break;
     case TB_PKT_CLIPBOARD:
         {
             char text[4096];
@@ -1615,6 +1637,33 @@ static void tb_receiver_refresh_input_capture(struct app *a) {
     }
 }
 
+
+/* Report Night Shift / True Tone back to the sender when they change, so its
+ * menu reflects the panel's real state rather than only what it last asked for. */
+static void tb_receiver_send_display_tweaks_if_changed(struct app *a) {
+    if (a->client_fd < 0) return;
+
+    const int night = tb_night_shift_supported() ? tb_night_shift_enabled() : 0;
+    const int tone  = tb_true_tone_supported() ? tb_true_tone_enabled() : 0;
+    if (night == a->reported_night_shift && tone == a->reported_true_tone) return;
+
+    a->reported_night_shift = night;
+    a->reported_true_tone = tone;
+
+    char json[192];
+    int len = snprintf(json, sizeof(json),
+                       "{\"nightShift\":%s,\"trueTone\":%s}",
+                       night ? "true" : "false",
+                       tone ? "true" : "false");
+    if (len <= 0 || (size_t)len >= sizeof(json)) return;
+
+    uint8_t pkt[4 + 1 + sizeof(json)];
+    write_be32(pkt, (uint32_t)(1 + len));
+    pkt[4] = TB_PKT_DISPLAY_TWEAKS;
+    memcpy(pkt + 5, json, (size_t)len);
+    (void)send_all(a->client_fd, pkt, 5 + (size_t)len);
+}
+
 static void send_receiver_info(struct app *a) {
     struct tb_display_info info;
     if (tb_disp_get_info(a->disp, &info) < 0) return;
@@ -1644,14 +1693,15 @@ static void send_receiver_info(struct app *a) {
     }
     escaped_name[out] = '\0';
 
-    char json[768];
+    char json[1024];
     int json_len = snprintf(
         json,
         sizeof(json),
         "{\"receiverName\":\"%s\",\"panelWidth\":%u,\"panelHeight\":%u,"
         "\"modeWidth\":%u,\"modeHeight\":%u,\"refreshRate\":60,"
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
-        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s}",
+        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s,"
+        "\"supportsNightShift\":%s,\"supportsTrueTone\":%s}",
         escaped_name,
         panel_w,
         panel_h,
@@ -1661,8 +1711,9 @@ static void send_receiver_info(struct app *a) {
         capture_h,
         tb_dec_supports_hevc_hwdecode() ? "true" : "false",
         tb_receiver_input_monitoring_trusted() ? "true" : "false",
-        tb_receiver_accessibility_trusted() ? "true" : "false"
-    );
+        tb_receiver_accessibility_trusted() ? "true" : "false",
+        tb_night_shift_supported() ? "true" : "false",
+        tb_true_tone_supported() ? "true" : "false");
     if (json_len <= 0 || (size_t)json_len >= sizeof(json)) return;
 
     const size_t packet_len = 4 + 1 + (size_t)json_len;
@@ -1878,6 +1929,8 @@ int main(int argc, char **argv) {
                 a.client_fd = c;
                 a.have_video_frame = 0;
                 a.session_active = 0;
+                a.reported_night_shift = -1;   /* force one report per session */
+                a.reported_true_tone = -1;
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] client connected\n");
@@ -1912,6 +1965,12 @@ int main(int argc, char **argv) {
         if (t - a.last_permissions_poll_ms >= 250) {
             a.last_permissions_poll_ms = t;
             tb_receiver_poll_permissions(&a);
+        }
+
+        /* Cheap enough to poll: two private-framework getters, twice a second. */
+        if (t - a.last_tweak_poll_ms >= 500) {
+            a.last_tweak_poll_ms = t;
+            tb_receiver_send_display_tweaks_if_changed(&a);
         }
 
         if (a.client_fd < 0 || !a.session_active) {
