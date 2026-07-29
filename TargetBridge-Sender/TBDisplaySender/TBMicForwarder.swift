@@ -9,7 +9,7 @@ import Foundation
 final class TBMicForwarder {
 
     /// Must match `kMicPort` in TargetBridge-AudioDriver/Driver.cpp.
-    private static let port: UInt16 = 51711
+    private static let port = TBAudioWireFormat.Port.microphone
 
     private var fd: Int32 = -1
 
@@ -19,7 +19,7 @@ final class TBMicForwarder {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = Self.port.bigEndian
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        addr.sin_addr.s_addr = inet_addr(TBAudioWireFormat.loopbackAddress)
         let ok = withUnsafePointer(to: &addr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 connect(s, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
@@ -43,7 +43,11 @@ final class TBMicForwarder {
         pcm.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             var offset = 0
-            let chunk = 1024
+            // Whole frames per datagram: the driver discards a trailing
+            // partial frame, so a chunk that split one would desynchronise the
+            // channels for the rest of the stream.
+            let chunk = TBAudioWireFormat.maxDatagram
+                      - (TBAudioWireFormat.maxDatagram % TBAudioWireFormat.bytesPerFrame)
             while offset < raw.count {
                 let n = min(chunk, raw.count - offset)
                 _ = send(fd, base.advanced(by: offset), n, MSG_DONTWAIT)

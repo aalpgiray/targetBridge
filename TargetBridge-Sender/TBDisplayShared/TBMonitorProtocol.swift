@@ -36,6 +36,9 @@ struct TBMonitorHelloReceiver: Codable {
     var captureWidth: Int?
     var captureHeight: Int?
     var codec: String?
+    /// "f32" or "s16". Lets a newer receiver tell what an older sender is
+    /// sending: absent means Int16, which is what senders sent before this.
+    var audioFormat: String?
 }
 
 struct TBMonitorDisplayProfile: Codable {
@@ -50,6 +53,9 @@ struct TBMonitorDisplayProfile: Codable {
     var captureHeight: Int
     var supportsHEVCDecode: Bool?
     var supportsRawNV12: Bool?
+    /// Absent on receivers older than the Float32 audio change, which is the
+    /// point: audio stays Int16 for them rather than arriving as noise.
+    var supportsFloat32Audio: Bool?
     var inputMonitoringTrusted: Bool?
     var accessibilityTrusted: Bool?
     /// Optional so older receivers still decode; absent means "cannot".

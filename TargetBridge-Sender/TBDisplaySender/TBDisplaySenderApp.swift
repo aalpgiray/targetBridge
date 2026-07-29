@@ -13,7 +13,10 @@ struct TBDisplaySenderApp: App {
                     statusItemController.activate()
                     // Track which output the user was on before selecting ours,
                     // so we can hand it back rather than leaving them silent.
-                    TBDefaultOutputGuard.shared.begin()
+                    // Only meaningful when our device exists to be selected.
+                    if service.audioDriverAvailable {
+                        TBDefaultOutputGuard.shared.begin()
+                    }
                     TBSenderAutomation.handleLaunchArguments(CommandLine.arguments)
                 }
                 .onOpenURL { url in

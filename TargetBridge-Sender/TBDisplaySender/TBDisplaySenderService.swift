@@ -1175,7 +1175,6 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private static let fullColor444DefaultsKey = "fd.tbdisplaysender.fullColor444"
     private static let tenBitDefaultsKey = "fd.tbdisplaysender.tenBit"
     private static let damageRectsDefaultsKey = "fd.tbdisplaysender.damageRects"
-    private static let audioDeviceUIDDefaultsKey = "fd.tbdisplaysender.audioDeviceUID"
     private struct SavedExtendedDisplayArrangement {
         let x: Int32
         let y: Int32
@@ -1398,14 +1397,6 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         return parts.joined(separator: "\n")
     }
 
-    /// Capture this input device instead of whole-system audio. Empty = system
-    /// audio via ScreenCaptureKit (the previous behaviour). Pointing macOS's
-    /// output at a loopback device and selecting it here moves routing into the
-    /// system's own Sound UI, so it can be chosen per app.
-    @Published var audioDeviceUID: String = UserDefaults.standard.string(forKey: audioDeviceUIDDefaultsKey) ?? "" {
-        didSet { UserDefaults.standard.set(audioDeviceUID, forKey: Self.audioDeviceUIDDefaultsKey) }
-    }
-    private var audioDeviceCapture: TBAudioDeviceCapture?
     private var audioDriverReceiver: TBAudioDriverReceiver?
     private var micForwarder: TBMicForwarder?
     private var audioVolumeObserver: TBAudioDeviceVolumeObserver?
@@ -1435,6 +1426,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     @Published var receiverSupportsNightShift = false
     @Published var receiverSupportsTrueTone = false
     var audioAddonAvailable = true
+    /// Mirrors the service's Audio Driver addon state. Stored rather than read
+    /// through, because the session is a separate object from the service.
+    var audioDriverAvailable = false
     var receiverSupportsHEVCDecodeHint: Bool?
     var receiverInputMonitoringTrustedHint: Bool?
     var receiverAccessibilityTrustedHint: Bool?
@@ -1524,6 +1518,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
     private var session = ReceiverBackedVirtualDisplaySession()
     private let audioConverter = SBAudioConverter()
+    /// False until the receiver says otherwise, so an unknown receiver gets the
+    /// older format instead of noise.
+    private var receiverSupportsFloat32Audio = false
     private var activeProfile: TBMonitorDisplayProfile?
     private var activeCodecType: CMVideoCodecType?
     private var activeCodecName: String?
@@ -2239,7 +2236,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 captureSource: captureSource.title(language),
                 captureWidth: preset.width,
                 captureHeight: preset.height,
-                codec: codecName(for: helloCodecType)
+                codec: codecName(for: helloCodecType),
+                audioFormat: receiverSupportsFloat32Audio ? "f32" : "s16"
             )
         ) else { return }
         send(packet)
@@ -2759,6 +2757,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         if let accessibilityTrusted = profile.accessibilityTrusted {
             receiverAccessibilityTrustedHint = accessibilityTrusted
         }
+        // Receivers predating the Float32 audio change do not advertise it, and
+        // would play float samples as noise. Fall back to Int16 for them rather
+        // than requiring both ends to be updated together.
+        receiverSupportsFloat32Audio = profile.supportsFloat32Audio ?? false
+        audioConverter.setFloatOutput(receiverSupportsFloat32Audio)
         receiverSupportsNightShift = profile.supportsNightShift ?? false
         receiverSupportsTrueTone = profile.supportsTrueTone ?? false
         receiverPanelText = TBDisplaySenderL10n.receiverSummary(profile, language: language)
@@ -2935,7 +2938,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             configuration.captureResolution = preset.captureResolution
             // A selected input device supersedes system capture; capturing both
             // would send two copies of the same sound.
-            configuration.capturesAudio = audioDeviceUID.isEmpty
+            configuration.capturesAudio = !audioDriverAvailable
             configuration.excludesCurrentProcessAudio = true
             configuration.sampleRate = 48000
             configuration.channelCount = 2
@@ -3761,43 +3764,23 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
     // MARK: - Routed audio device
 
-    /// When a device is selected, capture it and feed the same `processAudio`
-    /// path ScreenCaptureKit's audio used, so conversion, packetisation and the
-    /// receiver are unchanged.
+    /// With the Audio Driver addon on, our virtual device *is* the audio path —
+    /// there is nothing to choose. It pushes PCM to us over loopback UDP: no
+    /// capture session, no microphone permission, and already the exact wire
+    /// format, so it bypasses the converter entirely.
     private func startAudioDeviceCaptureIfNeeded() {
-        guard audioEnabled, !audioDeviceUID.isEmpty else { return }
-        let uid = audioDeviceUID
+        guard audioEnabled, audioDriverAvailable else { return }
 
-        // Our own virtual device pushes PCM to us over loopback UDP: no capture
-        // session, no microphone permission, and it is already the exact wire
-        // format, so it bypasses the converter entirely.
-        if uid == TBAudioDriverReceiver.deviceUID {
-            let rx = TBAudioDriverReceiver { [weak self] pcm in
-                Task { @MainActor [weak self] in
-                    guard let self, self.audioEnabled else { return }
-                    self.send(TBMonitorProtocol.makePacket(type: .audioFrame, payload: pcm))
-                }
+        let rx = TBAudioDriverReceiver { [weak self] pcm in
+            Task { @MainActor [weak self] in
+                guard let self, self.audioEnabled else { return }
+                let payload = self.receiverSupportsFloat32Audio ? pcm : Self.int16(fromFloat32: pcm)
+                self.send(TBMonitorProtocol.makePacket(type: .audioFrame, payload: payload))
             }
-            if rx.start() {
-                audioDriverReceiver = rx
-                startAudioVolumeMirror(uid: uid)
-            }
-            return
         }
-        Task { @MainActor in
-            guard await TBAudioDeviceCapture.requestAccess() else {
-                TBLog.connection.error("audio device: microphone access denied; falling back to no audio")
-                return
-            }
-            let capture = TBAudioDeviceCapture { [weak self] sb in
-                guard let self else { return }
-                Task { @MainActor in self.processAudio(sb) }
-            }
-            if capture.start(deviceUID: uid) {
-                self.audioDeviceCapture = capture
-
-                self.startAudioVolumeMirror(uid: uid)
-            }
+        if rx.start() {
+            audioDriverReceiver = rx
+            startAudioVolumeMirror(uid: TBAudioDriverReceiver.deviceUID)
         }
     }
 
@@ -3822,6 +3805,25 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         audioVolumeObserver = observer
     }
 
+    /// Float32 -> Int16 for receivers that cannot take float. Clamped, because
+    /// a mix of several apps can exceed full scale and wrapping would be far
+    /// more audible than the ceiling.
+    private static func int16(fromFloat32 data: Data) -> Data {
+        let count = data.count / MemoryLayout<Float32>.size
+        var out = Data(count: count * MemoryLayout<Int16>.size)
+        data.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
+            out.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
+                let f = src.bindMemory(to: Float32.self)
+                let i = dst.bindMemory(to: Int16.self)
+                for n in 0..<count {
+                    let v = max(-1.0, min(1.0, f[n]))
+                    i[n] = Int16(v * TBAudioWireFormat.Int16Scale.fromFloat)
+                }
+            }
+        }
+        return out
+    }
+
     private func stopAudioDeviceCapture() {
         // Stop first: the driver notices the silence and retires the device,
         // which is the backstop for the cases the restore below cannot cover
@@ -3829,7 +3831,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // If the user is listening through our virtual device, hand the system
         // back to its previous output — otherwise the device stays selected
         // with nothing behind it and sound just stops with no explanation.
-        if !audioDeviceUID.isEmpty {
+        if audioDriverAvailable {
             TBDefaultOutputGuard.shared.restoreIfSelected()
         }
         micForwarder?.stop()
@@ -3838,8 +3840,6 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         audioDriverReceiver = nil
         audioVolumeObserver?.stop()
         audioVolumeObserver = nil
-        audioDeviceCapture?.stop()
-        audioDeviceCapture = nil
     }
 
     private func processAudio(_ sampleBuffer: CMSampleBuffer) {
@@ -3872,21 +3872,37 @@ private final class SBAudioConverter: Sendable {
         private let lock = NSLock()
         var converter: AVAudioConverter?
         var inputFormat: AVAudioFormat?
-        let outputFormat: AVAudioFormat
+        var outputFormat: AVAudioFormat
 
-        init() {
+        static func format(float: Bool) -> AVAudioFormat {
             var asbd = AudioStreamBasicDescription(
-                mSampleRate: 48000.0,
+                mSampleRate: Double(TBAudioWireFormat.sampleRate),
                 mFormatID: kAudioFormatLinearPCM,
-                mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
-                mBytesPerPacket: 4,
+                mFormatFlags: (float ? kAudioFormatFlagIsFloat : kAudioFormatFlagIsSignedInteger)
+                            | kAudioFormatFlagIsPacked,
+                mBytesPerPacket: float ? 8 : 4,
                 mFramesPerPacket: 1,
-                mBytesPerFrame: 4,
+                mBytesPerFrame: float ? 8 : 4,
                 mChannelsPerFrame: 2,
-                mBitsPerChannel: 16,
+                mBitsPerChannel: float ? 32 : 16,
                 mReserved: 0
             )
-            self.outputFormat = AVAudioFormat(streamDescription: &asbd)!
+            return AVAudioFormat(streamDescription: &asbd)!
+        }
+
+        init() {
+            // Int16 until the receiver says it can take float, matching the
+            // conservative default on the driver path.
+            self.outputFormat = Self.format(float: false)
+        }
+
+        func setFloatOutput(_ float: Bool) {
+            lock.lock()
+            defer { lock.unlock() }
+            let wanted = Self.format(float: float)
+            guard !wanted.settings.isEmpty, outputFormat != wanted else { return }
+            outputFormat = wanted
+            converter = nil   // rebuilt on the next buffer with the new format
         }
 
         func convert(sampleBuffer: CMSampleBuffer) -> Data? {
@@ -3982,5 +3998,9 @@ private final class SBAudioConverter: Sendable {
 
     func convert(sampleBuffer: CMSampleBuffer) -> Data? {
         return converterState.convert(sampleBuffer: sampleBuffer)
+    }
+
+    func setFloatOutput(_ float: Bool) {
+        converterState.setFloatOutput(float)
     }
 }

@@ -48,36 +48,95 @@
 
 namespace {
 
-// Fixed loopback endpoint. The sender binds this port; if nothing is listening
-// the datagrams are simply dropped, so audio routed here while TargetBridge is
-// closed is harmless rather than an error.
-constexpr const char* kSinkAddr = "127.0.0.1";
-constexpr unsigned short kSinkPort = 51710;
-constexpr UInt32 kMaxDatagram = 1024;
+// ---- Wire format -------------------------------------------------------
+//
+// 48 kHz, stereo, 32-bit float, interleaved, native endian. This is CoreAudio's
+// canonical format (kAudioFormatFlagsNativeFloatPacked), which is why it is
+// used end to end: the audio server hands over the mix untouched, and the
+// receiver's output device is float as well, so nothing quantises anywhere.
+//
+// Every size below is derived from these three numbers. Byte counts written out
+// by hand silently change meaning when the sample size does — that is exactly
+// how a "0.5 second" buffer became a quarter of a second when this moved from
+// Int16 to Float32.
+constexpr UInt32 kSampleRate     = 48000;
+constexpr UInt32 kChannelCount   = 2;
+constexpr UInt32 kBytesPerSample = sizeof(Float32);
 
-// Microphone audio arrives from the sender on this port and is presented as
-// this device's input stream, so the receiver Mac's mic can be selected on this
-// Mac like any other input.
+constexpr size_t kBytesPerFrame  = kChannelCount * kBytesPerSample;
+constexpr size_t kBytesPerSecond = kSampleRate * kBytesPerFrame;
+constexpr size_t BytesForMs(size_t ms) { return kBytesPerSecond * ms / 1000; }
+
+// ---- Loopback endpoints ------------------------------------------------
+//
+// Both ports are in IANA's dynamic/private range (49152-65535), which is the
+// range reserved for exactly this: no registration, no collision with a
+// registered service. Traffic never leaves the loopback interface.
+constexpr const char* kSinkAddr = "127.0.0.1";
+
+// Output audio, driver -> sender. The sender binds it; if nothing is listening
+// the datagrams are dropped, so audio routed here while TargetBridge is closed
+// is harmless rather than an error.
+constexpr unsigned short kSinkPort = 51710;
+
+// Microphone audio, sender -> driver, presented as this device's input stream
+// so the receiver Mac's mic can be selected here like any local one.
 constexpr unsigned short kMicPort = 51711;
 
-// How the driver decides the sender is gone. A virtual device that is still
-// present but no longer carries audio is silently broken — sound just stops
-// with no explanation — so when the sender disappears the device must go too.
+// One datagram carries at most this much audio. Sized to stay well inside the
+// loopback MTU so the kernel never fragments a packet: fragmentation would make
+// a single lost fragment cost the whole datagram.
+constexpr UInt32 kMaxDatagram = 1024;
+
+// ---- Liveness ----------------------------------------------------------
 //
-// Detection is by probing kSinkPort, not by listening on a port of our own.
-// The plug-in is hosted in a process we do not control, and a leftover host
-// from a previous load can sit on a fixed port for minutes; bind() then fails
-// with EADDRINUSE and a listener never recovers. Sending has no such failure
-// mode, and a connected UDP socket surfaces ICMP port-unreachable as
-// ECONNREFUSED — so an unanswered probe *is* the "sender is gone" signal.
-constexpr int kProbeIntervalUs = 1000 * 1000;
+// A virtual device that is still present but no longer carries audio is
+// silently broken — sound just stops with no explanation — so when the sender
+// disappears the device must go too.
+//
+// Detection is by probing kSinkPort, not by listening on a port of our own. The
+// plug-in is hosted in a process we do not control, and a leftover host from a
+// previous load can sit on a fixed port for minutes; bind() then fails with
+// EADDRINUSE and a listener never recovers. Sending has no such failure mode,
+// and a connected UDP socket surfaces ICMP port-unreachable as ECONNREFUSED
+// (RFC 1122 s4.1.3.3) — so an unanswered probe *is* the "sender is gone" signal.
+constexpr int kProbeIntervalUs = 1000 * 1000;   // 1 s between probes
+
 // The ICMP reply is asynchronous: send() returns fine and the error is queued
 // for the next call on the socket. Pause before looking for it.
-constexpr int kProbeReplyWaitUs = 200 * 1000;
+constexpr int kProbeReplyWaitUs = 200 * 1000;   // 0.2 s
+
+// Consecutive unanswered probes before the device is withdrawn. Three, so a
+// single dropped probe cannot yank the user's output device away; at the
+// interval above that is a ~3 s worst case, which is below the point where a
+// listener starts wondering why the sound stopped.
 constexpr int kProbeStrikes = 3;
-// ~0.5s at 48 kHz stereo Int16. Large enough to ride out scheduling jitter,
-// small enough that latency stays reasonable if the producer runs ahead.
-constexpr size_t kMicRingBytes = 96000;
+
+// ---- Microphone buffering ----------------------------------------------
+//
+// The two ends run on independent 48 kHz clocks — the receiver's mic ADC and
+// this Mac's audio device — with no shared reference, so drift accumulates one
+// way forever and a ring that is merely large eventually runs full and stays
+// full.
+//
+// Every tier of standard practice above the crudest (PulseAudio and PipeWire
+// resample toward a target latency; WebRTC's NetEq tracks a target delay and
+// time-stretches with WSOLA) shares one idea: pick a target and correct toward
+// it. This does the cheap version — discard whole frames once the backlog
+// passes the ceiling — which bounds delay and self-corrects drift in both
+// directions, at the cost of one skip per drift period (minutes apart at
+// typical tens of ppm). Resampling would remove even that, and is worth adding
+// only if measurement shows the skips matter.
+//
+// 30 ms target: comfortably above the ~21 ms the receiver's own output buffer
+// needs, so normal jitter does not starve us, and low enough to stay under the
+// ~100 ms where conversational delay becomes noticeable.
+constexpr size_t kMicTargetBytes = BytesForMs(30);
+constexpr size_t kMicMaxBytes    = BytesForMs(60);   // 2x target: correct late, not constantly
+
+// Capacity, not latency — headroom for a scheduling stall. The ceiling above is
+// what actually governs delay.
+constexpr size_t kMicRingBytes = BytesForMs(500);
 
 // The plug-in is hosted by audiomxd, so stderr goes nowhere useful; os_log is
 // the only way to see what it is doing. Read with:
@@ -95,8 +154,6 @@ static double MonotonicSeconds()
     return double(ts.tv_sec) + double(ts.tv_nsec) / 1e9;
 }
 
-constexpr UInt32 kSampleRate = 48000;   // matches the wire format the receiver expects
-constexpr UInt32 kChannelCount = 2;
 
 constexpr const char* kDeviceName = "TargetBridge";
 constexpr const char* kDeviceUID = "TargetBridgeAudioDevice_UID";
@@ -126,6 +183,14 @@ public:
 
     void Write(const UInt8* data, size_t size)
     {
+        // Whole frames only. A partial frame would shift every following sample
+        // by one channel, swapping left and right for the rest of the stream —
+        // and it would never resynchronise.
+        size -= size % kBytesPerFrame;
+        if (size == 0) {
+            return;
+        }
+
         const size_t writePos = write_.load(std::memory_order_relaxed);
         const size_t readPos = read_.load(std::memory_order_acquire);
         const size_t used = writePos - readPos;
@@ -144,9 +209,25 @@ public:
     // Fills `size` bytes, padding with silence when starved. Never blocks.
     void Read(UInt8* out, size_t size)
     {
-        const size_t readPos = read_.load(std::memory_order_relaxed);
+        size_t readPos = read_.load(std::memory_order_relaxed);
         const size_t writePos = write_.load(std::memory_order_acquire);
-        const size_t available = writePos - readPos;
+        size_t available = writePos - readPos;
+
+        // Enforce the latency ceiling here, in the consumer, rather than in
+        // Write: only this thread may move read_, and reaching across from the
+        // producer would break the single-reader/single-writer contract that
+        // makes the lock-free access safe.
+        //
+        // Skipping the OLDEST audio is the whole point. Refusing the newest —
+        // the obvious-looking choice — keeps a full buffer full, so delay pins
+        // at the ring depth permanently and never recovers.
+        if (available > kMicMaxBytes) {
+            size_t drop = available - kMicTargetBytes;
+            drop -= drop % kBytesPerFrame;
+            readPos += drop;
+            available -= drop;
+        }
+
         const size_t take = std::min(size, available);
         for (size_t i = 0; i < take; ++i) {
             out[i] = buffer_[(readPos + i) % kMicRingBytes];
@@ -232,7 +313,7 @@ private:
                 refused = true;   // error queued from the previous round
             }
             Nap(kProbeReplyWaitUs);
-            UInt8 sink[64];
+            UInt8 sink[64];   // probe replies are never read for content
             if (recv(fd, sink, sizeof(sink), MSG_DONTWAIT) == -1 && errno == ECONNREFUSED) {
                 refused = true;
             }
@@ -275,7 +356,9 @@ private:
     /// Sleep in slices so Stop() is not left waiting a whole probe interval.
     void Nap(int microseconds)
     {
-        constexpr int kSlice = 100 * 1000;
+        // Sleep in slices so Stop() waits at most this long rather than a whole
+        // probe interval.
+        constexpr int kSlice = 100 * 1000;   // 0.1 s
         while (microseconds > 0 && !stop_.load()) {
             const int chunk = microseconds < kSlice ? microseconds : kSlice;
             usleep(static_cast<useconds_t>(chunk));
@@ -404,7 +487,11 @@ private:
         // minutes. Retry rather than giving up for the lifetime of the process,
         // which is how the mic silently never worked.
         bool bound = false;
-        for (int attempt = 0; attempt < 60 && !micStop_.load(); ++attempt) {
+        // One attempt per second for a minute: long enough to outlast a
+        // leftover host holding the port, short enough to give up rather than
+        // spin for the life of the process.
+        constexpr int kBindAttempts = 60;
+        for (int attempt = 0; attempt < kBindAttempts && !micStop_.load(); ++attempt) {
             if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
                 bound = true;
                 break;
@@ -423,7 +510,7 @@ private:
         micSocket_.store(fd);
         os_log_error(TBLog(), "mic: listening on %{public}u", kMicPort);
 
-        UInt8 buf[2048];
+        UInt8 buf[2 * kMaxDatagram];   // one datagram, with slack
         while (!micStop_.load()) {
             const ssize_t n = recv(fd, buf, sizeof(buf), 0);
             if (n <= 0) {
@@ -468,20 +555,21 @@ std::shared_ptr<aspl::Driver> CreateTargetBridgeDriver()
     //
     // Pin the stream format explicitly. libASPL defaults to 44100 Hz Int16, and
     // OnWriteMixedOutput hands over the *stream's native format* — so leaving
+    // OnWriteMixedOutput hands over the stream's *native* format — so leaving
     // the default while treating the bytes as 48 kHz Float32 produced noise.
     // Matching the receiver's wire format here means no conversion at all.
     aspl::StreamParameters streamParams;
     streamParams.Direction = aspl::Direction::Output;
     streamParams.Format.mSampleRate = kSampleRate;
     streamParams.Format.mFormatID = kAudioFormatLinearPCM;
-    streamParams.Format.mFormatFlags = kAudioFormatFlagIsSignedInteger
+    streamParams.Format.mFormatFlags = kAudioFormatFlagIsFloat
                                      | kAudioFormatFlagsNativeEndian
                                      | kAudioFormatFlagIsPacked;
-    streamParams.Format.mBitsPerChannel = 16;
+    streamParams.Format.mBitsPerChannel = 32;
     streamParams.Format.mChannelsPerFrame = kChannelCount;
-    streamParams.Format.mBytesPerFrame = kChannelCount * 2;
+    streamParams.Format.mBytesPerFrame = kChannelCount * kBytesPerSample;
     streamParams.Format.mFramesPerPacket = 1;
-    streamParams.Format.mBytesPerPacket = kChannelCount * 2;
+    streamParams.Format.mBytesPerPacket = kChannelCount * kBytesPerSample;
     auto stream = device->AddStreamAsync(streamParams);
 
     aspl::VolumeControlParameters volumeParams;

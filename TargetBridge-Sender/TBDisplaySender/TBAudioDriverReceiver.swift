@@ -2,15 +2,14 @@ import Foundation
 
 /// Receives audio from the TargetBridge virtual output device.
 ///
-/// The driver pushes whatever macOS routes to it as interleaved **Int16** stereo
+/// The driver pushes whatever macOS routes to it as interleaved **Float32** stereo
 /// at 48 kHz over loopback UDP — deliberately the receiver's exact wire format,
 /// so these bytes are forwarded untouched. No resampling, no sample conversion,
 /// and no capture session, which is why this path needs no microphone
 /// permission.
 final class TBAudioDriverReceiver {
 
-    /// Must match `kSinkPort` in TargetBridge-AudioDriver/Driver.cpp.
-    static let port: UInt16 = 51710
+    static let port = TBAudioWireFormat.Port.output
     /// The device UID the driver publishes; used to read its volume.
     static let deviceUID = "TargetBridgeAudioDevice_UID"
 
@@ -42,7 +41,7 @@ final class TBAudioDriverReceiver {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = Self.port.bigEndian
-        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        addr.sin_addr.s_addr = inet_addr(TBAudioWireFormat.loopbackAddress)
         let bound = withUnsafePointer(to: &addr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
@@ -75,14 +74,14 @@ final class TBAudioDriverReceiver {
     }
 
     private func drain() {
-        var buf = [UInt8](repeating: 0, count: 4096)
+        var buf = [UInt8](repeating: 0, count: TBAudioWireFormat.receiveBufferBytes)
         while true {
             let n = recv(socketFD, &buf, buf.count, 0)
             if n <= 0 { return }   // EAGAIN once the socket is empty
-            // Already 48 kHz stereo Int16 — exactly what the receiver plays, so
-            // forward verbatim. Trim any odd trailing byte so a frame boundary
-            // is never split across packets.
-            let usable = n - (n % 4)
+            // Already the wire format — forward verbatim. Trim any partial
+            // trailing frame: a split frame would swap left and right for
+            // everything after it, permanently.
+            let usable = n - (n % TBAudioWireFormat.bytesPerFrame)
             guard usable > 0 else { continue }
             onPCM(Data(buf[0..<usable]))
         }

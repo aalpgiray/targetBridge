@@ -2,7 +2,7 @@
  *
  * The sender feeds it into the TargetBridge virtual audio device's input
  * stream, so the receiver Mac's mic can be picked on the sender like a local
- * one. Output is 48 kHz stereo Int16 — the same format everything else on the
+ * one. Output is 48 kHz stereo Float32 — the same format everything else on the
  * wire uses, so no conversion happens anywhere along the path. A mono mic is
  * duplicated to both channels here rather than sending mono and widening later.
  */
@@ -11,6 +11,7 @@
 #import <Foundation/Foundation.h>
 
 #include "tb_mic_capture.h"
+#include "proto.h"   /* AUDIO_* — the wire format this must match */
 
 @interface TBMicDelegate : NSObject <AVCaptureAudioDataOutputSampleBufferDelegate>
 @property (nonatomic, assign) tb_mic_cb callback;
@@ -38,7 +39,7 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
         fmt ? CMAudioFormatDescriptionGetStreamBasicDescription(fmt) : NULL;
     if (!asbd) return;
 
-    /* The session is configured for Int16; if the channel count is 1, widen to
+    /* The session is configured for Float32; if the channel count is 1, widen to
      * stereo so the wire format is uniform. */
     if (asbd->mChannelsPerFrame == 2) {
         self.callback((const uint8_t *)data, length, self.userData);
@@ -46,15 +47,15 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
     }
     if (asbd->mChannelsPerFrame != 1) return;
 
-    const size_t frames = length / sizeof(int16_t);
-    int16_t *stereo = (int16_t *)malloc(frames * 2 * sizeof(int16_t));
+    const size_t frames = length / sizeof(float);
+    float *stereo = (float *)malloc(frames * 2 * sizeof(float));
     if (!stereo) return;
-    const int16_t *mono = (const int16_t *)data;
+    const float *mono = (const float *)data;
     for (size_t i = 0; i < frames; ++i) {
         stereo[i * 2] = mono[i];
         stereo[i * 2 + 1] = mono[i];
     }
-    self.callback((const uint8_t *)stereo, frames * 2 * sizeof(int16_t), self.userData);
+    self.callback((const uint8_t *)stereo, frames * 2 * sizeof(float), self.userData);
     free(stereo);
 }
 
@@ -89,10 +90,10 @@ int tb_mic_capture_start(tb_mic_cb cb, void *user_data) {
     AVCaptureAudioDataOutput *out = [[AVCaptureAudioDataOutput alloc] init];
     out.audioSettings = @{
         AVFormatIDKey:              @(kAudioFormatLinearPCM),
-        AVSampleRateKey:            @48000,
-        AVNumberOfChannelsKey:      @2,
-        AVLinearPCMBitDepthKey:     @16,
-        AVLinearPCMIsFloatKey:      @NO,
+        AVSampleRateKey:            @(AUDIO_SAMPLE_RATE),
+        AVNumberOfChannelsKey:      @(AUDIO_CHANNELS),
+        AVLinearPCMBitDepthKey:     @(AUDIO_BYTES_PER_SAMPLE * 8),
+        AVLinearPCMIsFloatKey:      @YES,
         AVLinearPCMIsBigEndianKey:  @NO,
         AVLinearPCMIsNonInterleaved:@NO,
     };
