@@ -252,6 +252,9 @@ final class TBDisplaySenderStatusItemController: NSObject {
         func glyph(_ name: String, size: CGFloat, x: CGFloat) -> NSImageView {
             let view = NSImageView(frame: NSRect(x: x, y: (height - size) / 2, width: size, height: size))
             view.image = NSImage(systemSymbolName: name, accessibilityDescription: label)
+            // Decorative: the slider itself carries the name, so reading these
+            // as well would announce the row three times.
+            view.setAccessibilityElement(false)
             view.contentTintColor = .secondaryLabelColor
             view.imageScaling = .scaleProportionallyUpOrDown
             return view
@@ -273,6 +276,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
         // supported way to get an accent-filled track if that changes.
         slider.trackFillColor = .controlAccentColor
         slider.controlSize = .small
+        slider.setAccessibilityLabel(label)
         let target = TBMenuSliderTarget(onChange)
         slider.target = target
         slider.action = #selector(TBMenuSliderTarget.changed(_:))

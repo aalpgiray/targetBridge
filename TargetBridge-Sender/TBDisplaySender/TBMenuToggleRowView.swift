@@ -21,6 +21,7 @@ struct TBMenuToggleSpec {
 final class TBMenuToggleRowView: NSView {
 
     private var buttons: [NSButton] = []
+    private var stateFields: [NSTextField] = []
     private var specs: [TBMenuToggleSpec] = []
 
     private enum Metrics {
@@ -75,7 +76,12 @@ final class TBMenuToggleRowView: NSView {
             button.image = NSImage(systemSymbolName: spec.symbol,
                                    accessibilityDescription: spec.title)?
                 .withSymbolConfiguration(config)
+            // A toggle, not a plain button: the checkbox role is what makes
+            // VoiceOver announce the on/off state, which is otherwise only
+            // conveyed by the caption underneath.
             button.setAccessibilityLabel(spec.title)
+            button.setAccessibilityRole(.checkBox)
+            button.setAccessibilityValue(NSNumber(value: spec.isOn))
 
             button.tag = index
             button.target = self
@@ -85,21 +91,26 @@ final class TBMenuToggleRowView: NSView {
             buttons.append(button)
 
             let titleY = circleY - Metrics.gap - Metrics.titleHeight
+            // The captions repeat what the button already announces, so keep
+            // them out of the accessibility tree rather than reading twice.
             addSubview(label(spec.title,
                              frame: NSRect(x: cellX, y: titleY, width: cellWidth, height: Metrics.titleHeight),
                              font: .systemFont(ofSize: 11, weight: .medium),
                              color: .labelColor))
 
-            addSubview(label(spec.stateText,
-                             frame: NSRect(x: cellX, y: titleY - Metrics.stateHeight,
-                                           width: cellWidth, height: Metrics.stateHeight),
-                             font: .systemFont(ofSize: 10, weight: .regular),
-                             color: .secondaryLabelColor))
+            let stateField = label(spec.stateText,
+                                   frame: NSRect(x: cellX, y: titleY - Metrics.stateHeight,
+                                                 width: cellWidth, height: Metrics.stateHeight),
+                                   font: .systemFont(ofSize: 10, weight: .regular),
+                                   color: .secondaryLabelColor)
+            addSubview(stateField)
+            stateFields.append(stateField)
         }
     }
 
     private func label(_ text: String, frame: NSRect, font: NSFont, color: NSColor) -> NSTextField {
         let field = NSTextField(labelWithString: text)
+        field.setAccessibilityElement(false)
         field.frame = frame
         field.font = font
         field.textColor = color
@@ -124,6 +135,7 @@ final class TBMenuToggleRowView: NSView {
         let newState = !isOn(index)
         states[index] = newState
         applyStyle(to: sender, isOn: newState)
+        sender.setAccessibilityValue(NSNumber(value: newState))
         // Reflect the change immediately; the menu usually closes on click, but
         // if it stays open the row should not show a stale state.
         if let field = stateField(at: index) {
@@ -150,10 +162,6 @@ final class TBMenuToggleRowView: NSView {
     var offWord = "Off"
 
     private func stateField(at index: Int) -> NSTextField? {
-        // State labels are the second text field added per cell.
-        let fields = subviews.compactMap { $0 as? NSTextField }
-        let perCell = 2
-        let position = index * perCell + 1
-        return fields.indices.contains(position) ? fields[position] : nil
+        stateFields.indices.contains(index) ? stateFields[index] : nil
     }
 }
