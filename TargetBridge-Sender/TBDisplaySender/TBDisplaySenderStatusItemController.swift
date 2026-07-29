@@ -121,8 +121,8 @@ final class TBDisplaySenderStatusItemController: NSObject {
                     header.isEnabled = false
                     menu.addItem(header)
                 }
-                menu.addItem(makeSliderItem(symbol: "sun.min",
-                                            trailingSymbol: "sun.max",
+                menu.addItem(makeSliderItem(symbol: "sun.min.fill",
+                                            trailingSymbol: "sun.max.fill",
                                             label: brightnessMenuLabel(),
                                             value: session.brightness) { [weak session] value in
                     session?.brightness = value
@@ -134,7 +134,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
                 var toggles: [TBMenuToggleSpec] = []
                 if session.receiverSupportsNightShift {
                     toggles.append(TBMenuToggleSpec(
-                        symbol: "moon.fill",
+                        symbol: "sun.lefthalf.filled",
                         title: nightShiftMenuLabel(),
                         stateText: session.nightShiftEnabled ? onWord() : offWord(),
                         isOn: session.nightShiftEnabled) { [weak session] on in
@@ -143,7 +143,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
                 }
                 if session.receiverSupportsTrueTone {
                     toggles.append(TBMenuToggleSpec(
-                        symbol: "sun.max",
+                        symbol: "sun.max.fill",
                         title: trueToneMenuLabel(),
                         stateText: session.trueToneEnabled ? onWord() : offWord(),
                         isOn: session.trueToneEnabled) { [weak session] on in
@@ -151,7 +151,9 @@ final class TBDisplaySenderStatusItemController: NSObject {
                         })
                 }
                 if !toggles.isEmpty {
-                    let row = TBMenuToggleRowView(specs: toggles, width: 240, leadingInset: 14)
+                    let row = TBMenuToggleRowView(specs: toggles,
+                                                  width: TBMenuMetrics.width,
+                                                  leadingInset: TBMenuMetrics.inset)
                     row.onWord = onWord()
                     row.offWord = offWord()
                     let item = NSMenuItem()
@@ -231,16 +233,17 @@ final class TBDisplaySenderStatusItemController: NSObject {
     /// closing the row. The trailing icon is what stops the track running to the
     /// edge of the menu.
     ///
-    /// This uses the stock NSSlider deliberately. A hand-drawn Control Center
-    /// lookalike was tried and looked worse — dated next to the real thing —
-    /// and `trackFillColor` is ignored inside a menu's vibrant context, so the
-    /// accent-filled track is not reachable from here either. The system
-    /// control at least ages with macOS.
+    /// Stock NSSlider, deliberately, after two attempts at Control Center's
+    /// accent-filled track. `trackFillColor` is set below and menus ignore it.
+    /// Overriding NSSliderCell.drawBar does produce the fill, but any drawing
+    /// override opts the cell out of AppKit's modern slider rendering and the
+    /// knob loses its pressed-state translucency — more noticeable than a grey
+    /// track, since it makes the control feel wrong rather than just look plain.
     private func makeSliderItem(symbol: String, trailingSymbol: String, label: String,
                                 value: Double, onChange: @escaping (Double) -> Void) -> NSMenuItem {
-        let width: CGFloat = 240
+        let width = TBMenuMetrics.width
         let height: CGFloat = 28
-        let inset: CGFloat = 14
+        let inset = TBMenuMetrics.inset
         let leadingIcon: CGFloat = 13
         let trailingIcon: CGFloat = 17
         let gap: CGFloat = 8
