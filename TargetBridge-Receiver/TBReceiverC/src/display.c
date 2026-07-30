@@ -1239,7 +1239,24 @@ void tb_disp_render_packed32(struct tb_display *d,
         }
         return;
     }
-    tb_metal_plane_set_hidden(1);   /* SDL renders this format */
+    /* 8-bit packed goes through the same Metal plane. Two reasons: SDL's Metal
+     * backend reallocates a full-size staging buffer every frame (59 MB at 5K)
+     * where the plane reuses a ring, and the plane's shader dithers into a
+     * 10-bit drawable, which is what keeps desktop gradients from banding —
+     * the source is 8-bit either way, so this is the only place depth can be
+     * recovered. */
+    if (!tb_metal_plane_available()) tb_metal_plane_init(d->win);
+    if (tb_metal_plane_available()) {
+        double m0 = tb_now_ms();
+        if (tb_metal_plane_render_bgra8(rgba, stride, w, h) == 0) {
+            tb_disp_set_connection_state(d, 1);
+            d->last_video_frame_time = SDL_GetTicks();
+            tb_frame_stats_add("8bit-metal", tb_now_ms() - m0, 0.0);
+            return;
+        }
+    }
+
+    tb_metal_plane_set_hidden(1);   /* fall back to SDL */
     const Uint32 fmt = SDL_PIXELFORMAT_ARGB8888;
     if (tb_disp_ensure_texture_fmt(d, w, h, fmt) < 0) return;
     tb_disp_set_connection_state(d, 1);

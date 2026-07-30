@@ -893,7 +893,11 @@ private final class TBVideoPipeline: @unchecked Sendable {
             let height = CVPixelBufferGetHeight(pixelBuffer)
             let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
             let size = stride * height
-            if isTenBit { probeTenBitDepth(base, width: width, height: height, stride: stride) }
+            if isTenBit {
+                probeTenBitDepth(base, width: width, height: height, stride: stride)
+            } else {
+                probeAlphaConstant(base, width: width, height: height, stride: stride)
+            }
             let fmt: UInt8 = isTenBit ? 3 : 2
 
             // Damage path: resend only what the WindowServer says changed.
@@ -995,6 +999,34 @@ private final class TBVideoPipeline: @unchecked Sendable {
     }
 
 
+    /// Is the alpha byte in captured BGRA actually constant?
+    ///
+    /// The desktop is opaque, so it should be 0xFF everywhere — which makes it
+    /// a quarter of the wire carrying nothing. Worth 7 Gb/s at 5K60 4:4:4. But
+    /// this is exactly the kind of assumption that turns out to be wrong on
+    /// some machine or some content, so it is measured rather than assumed, and
+    /// only reported until something depends on it.
+    private func probeAlphaConstant(_ base: UnsafeMutableRawPointer, width: Int, height: Int, stride: Int) {
+        if alphaProbeCountdown > 0 { alphaProbeCountdown -= 1; return }
+        alphaProbeCountdown = 300
+
+        var sampled = 0
+        var opaque = 0
+        let rowWords = stride / 4
+        var index = 0
+        let total = rowWords * height
+        while index < total && sampled < 20_000 {
+            let word = base.load(fromByteOffset: index * 4, as: UInt32.self)
+            if (word >> 24) == 0xFF { opaque += 1 }
+            sampled += 1
+            index += 997
+        }
+        guard sampled > 0 else { return }
+        TBLog.connection.notice(
+            "alpha probe: \(opaque, privacy: .public)/\(sampled, privacy: .public) sampled pixels are fully opaque — all of them means the alpha byte is pure padding"
+        )
+    }
+
     /// Is the captured 10-bit frame *actually* carrying 10 bits?
     ///
     /// `CGVirtualDisplay` exposes no way to request a 10-bit framebuffer (the
@@ -1004,6 +1036,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// zero — which is directly measurable. Sampled on a prime stride so we
     /// cover the frame without walking all 14.7M pixels.
     private var tenBitProbeCountdown = 0
+    private var alphaProbeCountdown = 0
     private func probeTenBitDepth(_ base: UnsafeMutableRawPointer, width: Int, height: Int, stride: Int) {
         if tenBitProbeCountdown > 0 { tenBitProbeCountdown -= 1; return }
         tenBitProbeCountdown = 180   // roughly every 3s at 60fps
@@ -1022,9 +1055,32 @@ private final class TBVideoPipeline: @unchecked Sendable {
             sampled += 1
             index += 997      // prime: spreads samples across rows and columns
         }
+        // Distinct values, taking the richest row found rather than one fixed
+        // row: whatever is being measured rarely fills the screen, and a row of
+        // flat desktop reports a handful of levels and tells us nothing. An
+        // 8-bit source cannot exceed 256 however it is converted afterwards; a
+        // 10-bit one can reach 1024. Counting non-zero low bits cannot separate
+        // real depth from bits a conversion invents.
+        var best = 0
+        var bestRow = 0
+        let rowStep = Swift.max(1, height / 48)
+        var row = 0
+        while row < height {
+            var seen = Set<UInt32>()
+            for x in 0..<Swift.min(width, 2560) {
+                let word = base.load(fromByteOffset: (row * rowWords + x) * 4, as: UInt32.self)
+                seen.insert((word >> 10) & 0x3FF)
+            }
+            if seen.count > best { best = seen.count; bestRow = row }
+            row += rowStep
+        }
+        TBLog.connection.notice(
+            "10-bit depth: richest row (y=\(bestRow, privacy: .public)) has \(best, privacy: .public) distinct green levels — >256 means the source is deeper than 8-bit"
+        )
+
         guard sampled > 0 else { return }
         let pct = Double(deep) * 100.0 / Double(sampled)
-        TBLog.connection.info(
+        TBLog.connection.notice(
             "10-bit probe: \(deep, privacy: .public)/\(sampled, privacy: .public) samples carry sub-8-bit detail (\(String(format: "%.2f", pct), privacy: .public)%) — 0% means the source is 8-bit padded into l10r"
         )
     }
@@ -2928,6 +2984,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 if ProcessInfo.processInfo.environment["TB_RAW_NO_COLORSPACE"] != "1" {
                     configuration.colorSpaceName = CGColorSpace.displayP3
                 }
+                // Not requesting EDR capture. It raised the share of pixels with
+                // non-zero low bits from ~7% to ~88%, but that is a conversion
+                // artefact, not depth: ARGB2101010 is unorm, so extended-range
+                // values have to be squeezed into 0...1, which leaves SDR
+                // content with *fewer* effective levels and clamps anything
+                // above white. Carrying EDR properly would need a float
+                // container at 8 bytes/pixel, which buys nothing while the
+                // virtual display's framebuffer is 8-bit.
             } else if fullColor444 && preset.isRawPassthrough {
                 configuration.pixelFormat = kCVPixelFormatType_32BGRA
             } else {

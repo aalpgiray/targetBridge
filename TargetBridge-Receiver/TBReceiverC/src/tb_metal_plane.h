@@ -33,4 +33,11 @@ void tb_metal_plane_set_cursor(int x, int y, int source_w, int source_h,
  * success. */
 int  tb_metal_plane_render_l10r(const uint8_t *px, int stride, int w, int h);
 
+/* Same path for packed 8-bit BGRA. The drawable stays 10-bit and the shader
+ * dithers into it, which is what macOS does with 8-bit content everywhere else
+ * — and what stops desktop gradients banding here. Also avoids SDL's Metal
+ * backend, which reallocates a full-size staging buffer every frame (59 MB at
+ * 5K). */
+int  tb_metal_plane_render_bgra8(const uint8_t *px, int stride, int w, int h);
+
 #endif

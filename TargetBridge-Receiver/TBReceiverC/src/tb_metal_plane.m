@@ -34,6 +34,9 @@ static struct {
     CAMetalLayer         *layer;
     id<MTLDevice>         dev;
     id<MTLCommandQueue>   queue;
+    id<MTLRenderPipelineState> pipe;
+    size_t                row_align;
+    float                 dither;
     id<MTLBuffer>         ring[TB_METAL_RING];
     size_t                ring_cap[TB_METAL_RING];
     int                   ring_idx;
@@ -58,7 +61,7 @@ static inline uint32_t tb_pack10(uint32_t r, uint32_t g_, uint32_t b) {
 
 /* Even-odd scanline fill; the arrow is non-convex so a simple span fill will
  * not do. Coordinates are floats in frame space. */
-static void tb_fill_poly(uint32_t *px, int w, int h,
+static void tb_fill_poly(uint32_t *px, int w, int h, int stride,
                          const float *xs, const float *ys, int n,
                          uint32_t colour) {
     float miny = ys[0], maxy = ys[0];
@@ -83,7 +86,7 @@ static void tb_fill_poly(uint32_t *px, int w, int h,
             int xa = (int)xi[s], xb = (int)xi[s + 1];
             if (xa < 0) xa = 0;
             if (xb > w) xb = w;
-            uint32_t *row = px + (size_t)y * w;
+            uint32_t *row = px + (size_t)y * stride;
             for (int x = xa; x < xb; ++x) row[x] = colour;
         }
     }
@@ -91,7 +94,7 @@ static void tb_fill_poly(uint32_t *px, int w, int h,
 
 /* Classic arrow, drawn black-offset-then-white so it stays legible on any
  * background — the same reason the SDL path outlines it. */
-static void tb_draw_cursor(uint32_t *px, int w, int h) {
+static void tb_draw_cursor_stride_fmt(uint32_t *px, int w, int h, int stride, int ten) {
     if (!g.cur_visible) return;
 
     const float ax[7] = { 0.f, 0.f,  4.5f, 7.5f, 10.5f, 7.5f, 12.f };
@@ -110,10 +113,10 @@ static void tb_draw_cursor(uint32_t *px, int w, int h) {
             bx[i] = ox + ax[i] * scale + (float)off[k][0];
             by[i] = oy + ay[i] * scale + (float)off[k][1];
         }
-        tb_fill_poly(px, w, h, bx, by, 7, tb_pack10(0, 0, 0));
+        tb_fill_poly(px, w, h, stride, bx, by, 7, ten ? tb_pack10(0, 0, 0) : 0xFF000000u);
     }
     for (int i = 0; i < 7; ++i) { bx[i] = ox + ax[i] * scale; by[i] = oy + ay[i] * scale; }
-    tb_fill_poly(px, w, h, bx, by, 7, tb_pack10(1023, 1023, 1023));
+    tb_fill_poly(px, w, h, stride, bx, by, 7, ten ? tb_pack10(1023, 1023, 1023) : 0xFFFFFFFFu);
 }
 
 /* The Metal view is a sibling layer over SDL's window, and SDL's renderer here
@@ -145,9 +148,112 @@ int tb_metal_plane_init(SDL_Window *win) {
     g.layer.opaque = YES;
     g.layer.maximumDrawableCount = TB_METAL_RING;
     g.layer.displaySyncEnabled = YES;
-    /* Match the panel so the compositor does not colour-convert per frame. */
-    CGColorSpaceRef cs = CGDisplayCopyColorSpace(CGMainDisplayID());
+    /* Tag the layer with the space the pixels are actually in, which is what
+     * the sender captures: Display P3.
+     *
+     * This used to be the *panel's* profile, chosen to avoid a per-frame
+     * conversion. That was wrong: it tells the compositor the values are
+     * already in display space, so the conversion P3 data needs is skipped.
+     * On a panel using its own calibrated profile that shows up as banding in
+     * dark gradients and a colour shift — and setting the display profile to
+     * P3 by hand "fixed" it only by making the mislabel accidentally true.
+     * Labelling correctly lets the compositor convert, in its own higher
+     * precision, on the GPU. */
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceDisplayP3);
     if (cs) { g.layer.colorspace = cs; CGColorSpaceRelease(cs); }
+
+    /* What the panel is actually capable of receiving. A 10-bit drawable still
+     * gets quantised at scanout if the display is running an 8-bit mode, and
+     * that looks exactly like a pipeline that never carried 10 bits. */
+    {
+        NSScreen *scr = [NSScreen mainScreen];
+        CGColorSpaceRef dcs = CGDisplayCopyColorSpace(CGMainDisplayID());
+        CFStringRef name = dcs ? CGColorSpaceCopyName(dcs) : NULL;
+        fprintf(stderr,
+                "[metal] drawable=BGR10A2Unorm  panel bits/sample=%ld  P3=%d  maxEDR=%.2f  colorspace=%s\n",
+                (long)NSBitsPerSampleFromDepth(scr.depth),
+                (int)[scr canRepresentDisplayGamut:NSDisplayGamutP3],
+                (double)scr.maximumExtendedDynamicRangeColorComponentValue,
+                name ? [(__bridge NSString *)name UTF8String] : "?");
+        if (name) CFRelease(name);
+        if (dcs) CGColorSpaceRelease(dcs);
+    }
+
+    /* Dither on presentation.
+     *
+     * macOS adds sub-LSB noise on the way to the panel, which is why 8-bit
+     * gradients look smooth everywhere else in the OS. A CAMetalLayer writing
+     * straight to a 10-bit drawable never picks that up, so quantisation the
+     * rest of the system hides is plainly visible in our window — measured with
+     * a synthetic ramp: an 8-bit half banded here while the same data was
+     * smooth in any ordinary window.
+     *
+     * The content arrives quantised to 256 levels even in a 10-bit container,
+     * so the noise is scaled to one 8-bit step by default.
+     *
+     * An 8x8 ordered matrix, not random noise. White noise of the same
+     * amplitude reads as canvas texture across the whole image — its energy
+     * sits at all spatial frequencies, including the low ones the eye is most
+     * sensitive to. An ordered pattern puts its energy at high frequencies
+     * where the eye does not resolve it, which is why GPUs dither this way.
+     *
+     * Amplitude is sized to the *output* quantiser, not the input step: the
+     * drawable is 10-bit, so one 8-bit step is already four output levels of
+     * noise. Half a step is enough to spread values across the levels between
+     * two 8-bit codes. TB_DITHER scales it, in units of 8-bit steps. */
+    NSString *src = @"#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "struct VOut { float4 pos [[position]]; float2 uv; };\n"
+        "vertex VOut tb_vs(uint vid [[vertex_id]]) {\n"
+        "  float2 p = float2((vid << 1) & 2, vid & 2);\n"
+        "  VOut o; o.pos = float4(p * 2.0 - 1.0, 0, 1); o.uv = float2(p.x, 1.0 - p.y);\n"
+        "  return o;\n"
+        "}\n"
+        "constant float bayer[64] = {\n"
+        "  0,32,8,40,2,34,10,42, 48,16,56,24,50,18,58,26,\n"
+        " 12,44,4,36,14,46,6,38, 60,28,52,20,62,30,54,22,\n"
+        "  3,35,11,43,1,33,9,41, 51,19,59,27,49,17,57,25,\n"
+        " 15,47,7,39,13,45,5,37, 63,31,55,23,61,29,53,21 };\n"
+        "fragment float4 tb_fs(VOut in [[stage_in]],\n"
+        "                      texture2d<float> tex [[texture(0)]],\n"
+        "                      constant float &amp [[buffer(0)]]) {\n"
+        "  constexpr sampler s(filter::nearest, address::clamp_to_edge);\n"
+        "  float4 c = tex.sample(s, in.uv);\n"
+        "  uint2 q = uint2(in.pos.xy);\n"
+        "  float t = (bayer[(q.y & 7) * 8 + (q.x & 7)] + 0.5) / 64.0 - 0.5;\n"
+        "  c.rgb += t * amp;\n"
+        "  return c;\n"
+        "}\n";
+    NSError *err = nil;
+    id<MTLLibrary> lib = [g.dev newLibraryWithSource:src options:nil error:&err];
+    if (!lib) {
+        fprintf(stderr, "[metal] shader compile failed: %s\n",
+                err.localizedDescription.UTF8String ?: "?");
+        return -1;
+    }
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction   = [lib newFunctionWithName:@"tb_vs"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"tb_fs"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGR10A2Unorm;
+    g.pipe = [g.dev newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (!g.pipe) {
+        fprintf(stderr, "[metal] pipeline failed: %s\n",
+                err.localizedDescription.UTF8String ?: "?");
+        return -1;
+    }
+    /* Buffer-backed textures need their rows aligned; the staging copy pads to
+     * this rather than to the frame width. */
+    g.dither = 0.5f / 255.0f;   /* half an 8-bit step = ~2 levels at 10-bit */
+    const char *denv = getenv("TB_DITHER");
+    if (denv) {
+        float scale = (float)atof(denv);
+        if (scale >= 0.0f && scale <= 8.0f) g.dither = scale / 255.0f;
+    }
+    fprintf(stderr, "[metal] dither %.2f of an 8-bit step (%.1f levels at 10-bit)\n",
+            g.dither * 255.0f, g.dither * 1023.0f);
+
+    g.row_align = [g.dev minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGR10A2Unorm];
+    if (g.row_align == 0) g.row_align = 256;
 
     g.queue = [g.dev newCommandQueue];
     g.inflight = dispatch_semaphore_create(TB_METAL_RING);
@@ -202,7 +308,8 @@ void tb_metal_plane_set_hidden(int hidden) {
     }
 }
 
-int tb_metal_plane_render_l10r(const uint8_t *px, int stride, int w, int h) {
+static int tb_metal_render(const uint8_t *px, int stride, int w, int h,
+                           MTLPixelFormat srcFmt) {
     if (!g.ready || !px || w <= 0 || h <= 0) return -1;
 
     @autoreleasepool {
@@ -216,7 +323,9 @@ int tb_metal_plane_render_l10r(const uint8_t *px, int stride, int w, int h) {
             fprintf(stderr, "[metal] drawable %dx%d\n", w, h);
         }
 
-        const size_t bpr   = (size_t)w * 4;
+        const size_t tight = (size_t)w * 4;
+        const size_t bpr   = ((tight + g.row_align - 1) / g.row_align) * g.row_align;
+        const int    ten   = (srcFmt == MTLPixelFormatBGR10A2Unorm);
         const size_t bytes = bpr * (size_t)h;
 
         /* Block only if all ring slots are still in GPU use. */
@@ -234,30 +343,40 @@ int tb_metal_plane_render_l10r(const uint8_t *px, int stride, int w, int h) {
         if (!buf) { dispatch_semaphore_signal(g.inflight); return -1; }
 
         uint8_t *dst = (uint8_t *)[buf contents];
+
         if ((size_t)stride == bpr) {
             memcpy(dst, px, bytes);
         } else {
             for (int y = 0; y < h; ++y) memcpy(dst + (size_t)y * bpr,
-                                               px + (size_t)y * stride, bpr);
+                                               px + (size_t)y * stride, tight);
         }
 
-        tb_draw_cursor((uint32_t *)dst, w, h);
+        tb_draw_cursor_stride_fmt((uint32_t *)dst, w, h, (int)(bpr / 4), ten);
 
         id<CAMetalDrawable> drawable = [g.layer nextDrawable];
         if (!drawable) { dispatch_semaphore_signal(g.inflight); return -1; }
 
+        /* A texture view over the staging buffer — no copy, the shader samples
+         * the bytes we just wrote. */
+        MTLTextureDescriptor *td =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:srcFmt
+                                                               width:w height:h mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        td.storageMode = MTLStorageModeShared;
+        id<MTLTexture> srcTex = [buf newTextureWithDescriptor:td offset:0 bytesPerRow:bpr];
+        if (!srcTex) { dispatch_semaphore_signal(g.inflight); return -1; }
+
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
-        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-        [blit copyFromBuffer:buf
-                sourceOffset:0
-           sourceBytesPerRow:bpr
-         sourceBytesPerImage:bytes
-                  sourceSize:MTLSizeMake(w, h, 1)
-                   toTexture:drawable.texture
-            destinationSlice:0
-            destinationLevel:0
-           destinationOrigin:MTLOriginMake(0, 0, 0)];
-        [blit endEncoding];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture    = drawable.texture;
+        rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:g.pipe];
+        [enc setFragmentTexture:srcTex atIndex:0];
+        [enc setFragmentBytes:&g.dither length:sizeof(g.dither) atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
         [cb presentDrawable:drawable];
         /* Capture the semaphore itself: reading g.inflight at completion time
          * would signal a *replacement* if the plane was torn down meanwhile. */
@@ -269,4 +388,12 @@ int tb_metal_plane_render_l10r(const uint8_t *px, int stride, int w, int h) {
         [cb commit];
     }
     return 0;
+}
+
+int tb_metal_plane_render_l10r(const uint8_t *px, int stride, int w, int h) {
+    return tb_metal_render(px, stride, w, h, MTLPixelFormatBGR10A2Unorm);
+}
+
+int tb_metal_plane_render_bgra8(const uint8_t *px, int stride, int w, int h) {
+    return tb_metal_render(px, stride, w, h, MTLPixelFormatBGRA8Unorm);
 }
