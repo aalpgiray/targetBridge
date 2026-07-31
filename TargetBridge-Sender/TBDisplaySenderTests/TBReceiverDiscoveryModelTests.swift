@@ -60,6 +60,14 @@ final class TBReceiverDiscoveryModelTests: XCTestCase {
         XCTAssertEqual(receiver.id, "TargetBridge Jonathans-iMac|192.168.1.64")
     }
 
+    func testStableIdentityDoesNotChangeWhenTheReceiverIPChanges() {
+        let beforeWake = makeReceiver(serviceName: "TargetBridge Jonathans-iMac", preferredIP: "169.254.89.80")
+        let afterWake = makeReceiver(serviceName: "TargetBridge Jonathans-iMac", preferredIP: "169.254.12.44")
+
+        XCTAssertNotEqual(beforeWake.id, afterWake.id)
+        XCTAssertEqual(beforeWake.stableIdentity, afterWake.stableIdentity)
+    }
+
     // MARK: - shortHostName
 
     func testShortHostNameStripsTrailingDotAndDomain() {

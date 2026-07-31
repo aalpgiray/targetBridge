@@ -13,6 +13,10 @@ struct TBDiscoveredReceiver: Identifiable, Equatable {
 
     var id: String { "\(serviceName)|\(preferredIP)" }
 
+    /// Bonjour service names survive link-local IP address changes after wake.
+    /// Use this only for persisted receiver preferences, not Picker selection.
+    var stableIdentity: String { "service:\(serviceName)" }
+
     var shortHostName: String? {
         guard let host = hostName, !host.isEmpty else { return nil }
         let stripped = host.hasSuffix(".") ? String(host.dropLast()) : host

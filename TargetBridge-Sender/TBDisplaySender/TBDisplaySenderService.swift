@@ -1599,8 +1599,35 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// (distinct per machine even when two identical iMacs report the same SDL
     /// display name), falling back to the receiver-reported name.
     private func receiverIdentityDiscriminator(for profile: TBMonitorDisplayProfile) -> String {
-        let trimmedIP = receiverIP.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmedIP.isEmpty ? profile.receiverName : trimmedIP
+        // Bonjour keeps the service name stable across Thunderbolt link-local IP
+        // changes. Using the address here made macOS forget a receiver's virtual
+        // display identity and saved placement after a wake or reconnect.
+        if let receiver = TBDisplaySenderService.shared.discoveredReceivers.first(where: {
+            $0.id == selectedReceiverID ||
+            $0.preferredIP == receiverIP ||
+            $0.thunderboltIP == receiverIP ||
+            $0.networkIP == receiverIP
+        }) {
+            return receiver.stableIdentity
+        }
+
+        let selectedID = selectedReceiverID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let serviceName = selectedID.split(separator: "|", maxSplits: 1).first,
+           !serviceName.isEmpty {
+            return "service:\(serviceName)"
+        }
+
+        if let host = shortHostName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !host.isEmpty {
+            return "host:\(host)"
+        }
+
+        let receiverName = profile.receiverName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !receiverName.isEmpty {
+            return "receiver:\(receiverName)"
+        }
+
+        return "address:\(receiverIP.trimmingCharacters(in: .whitespacesAndNewlines))"
     }
 
     /// Key used to derive the extended-desktop virtual display identity. Shares

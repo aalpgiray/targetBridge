@@ -107,6 +107,16 @@ final class ReceiverBackedVirtualDisplaySession {
         descriptor.maxPixelsWide = UInt32(profile.panelWidth)
         descriptor.maxPixelsHigh = UInt32(profile.panelHeight)
 
+        // A virtual display without chromaticity metadata can receive a generic
+        // ColorSync profile. In mirror mode that makes macOS render the same
+        // desktop differently from the built-in Display P3 panel. Advertise the
+        // iMac's wide-gamut SDR space explicitly so capture is colour-managed
+        // before it enters the 8-bit NV12 video pipeline.
+        descriptor.whitePoint = CGPoint(x: 0.3125, y: 0.3291) // D65
+        descriptor.redPrimary = CGPoint(x: 0.6797, y: 0.3203)
+        descriptor.greenPrimary = CGPoint(x: 0.2559, y: 0.6983)
+        descriptor.bluePrimary = CGPoint(x: 0.1494, y: 0.0557)
+
         let ppi = 218.0
         descriptor.sizeInMillimeters = CGSize(
             width: Double(profile.panelWidth) / ppi * 25.4,
