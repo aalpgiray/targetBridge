@@ -17,6 +17,8 @@ enum TBMonitorPacketType: UInt8 {
     case brightness = 0x35
     case clipboard = 0x36
     case volume = 0x37
+    /// Night Shift / True Tone on the receiver's panel.
+    case displayTweaks = 0x38
     case testData = 0x40
 }
 
@@ -44,6 +46,9 @@ struct TBMonitorDisplayProfile: Codable {
     var supportsRawNV12: Bool?
     var inputMonitoringTrusted: Bool?
     var accessibilityTrusted: Bool?
+    /// Optional so older receivers still decode; absent means "cannot".
+    var supportsNightShift: Bool?
+    var supportsTrueTone: Bool?
 }
 
 struct TBMonitorCreateSessionAck: Codable {
@@ -97,6 +102,11 @@ struct TBMonitorBrightness: Codable {
 
 struct TBMonitorVolume: Codable {
     var level: Double
+}
+
+struct TBMonitorDisplayTweaks: Codable {
+    var nightShift: Bool
+    var trueTone: Bool
 }
 
 struct TBMonitorClipboard: Codable {
