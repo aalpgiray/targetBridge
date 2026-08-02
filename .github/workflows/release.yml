@@ -12,8 +12,15 @@ permissions:
 
 jobs:
   build-sender:
-    name: Build Sender (Apple Silicon)
-    runs-on: macos-15
+    name: Build Sender (${{ matrix.os }} - ${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: x86_64
+          - os: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v6
@@ -26,22 +33,23 @@ jobs:
         run: |
           cd TargetBridge-Sender
           ./scripts/build_targetbridge_sender_app.sh
+          file ../build/TargetBridge.app/Contents/MacOS/TargetBridge | grep -q "${{ matrix.arch }}"
 
       - name: Zip App Bundle
         run: |
           cd build
-          zip -r TargetBridge-arm64.app.zip TargetBridge.app
+          zip -r TargetBridge-${{ matrix.arch }}.app.zip TargetBridge.app
 
       - name: Generate build provenance attestation
         uses: actions/attest@v4
         with:
-          subject-path: build/TargetBridge-arm64.app.zip
+          subject-path: build/TargetBridge-${{ matrix.arch }}.app.zip
 
       - name: Upload Sender Artifact
         uses: actions/upload-artifact@v7
         with:
-          name: TargetBridge-arm64.app.zip
-          path: build/TargetBridge-arm64.app.zip
+          name: TargetBridge-${{ matrix.arch }}.app.zip
+          path: build/TargetBridge-${{ matrix.arch }}.app.zip
           retention-days: 1
 
   build-receiver:
@@ -95,6 +103,12 @@ jobs:
       - name: Download Sender Artifact
         uses: actions/download-artifact@v8
         with:
+          name: TargetBridge-x86_64.app.zip
+          path: ./artifacts
+
+      - name: Download Sender Artifact (arm64)
+        uses: actions/download-artifact@v8
+        with:
           name: TargetBridge-arm64.app.zip
           path: ./artifacts
 
@@ -115,6 +129,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ github.ref_name }}" \
+            ./artifacts/TargetBridge-x86_64.app.zip \
             ./artifacts/TargetBridge-arm64.app.zip \
             ./artifacts/TargetBridge-Receiver-x86_64.app.zip \
             ./artifacts/TargetBridge-Receiver-arm64.app.zip \
