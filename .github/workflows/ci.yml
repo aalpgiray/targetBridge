@@ -33,7 +33,7 @@ jobs:
         run: |
           cd TargetBridge-Sender
           ./scripts/build_targetbridge_sender_app.sh
-          file build/TargetBridge.app/Contents/MacOS/TargetBridge | grep -q "${{ matrix.arch }}"
+          file ../build/TargetBridge.app/Contents/MacOS/TargetBridge | grep -q "${{ matrix.arch }}"
 
       - name: Run Sender Unit Tests
         run: |
