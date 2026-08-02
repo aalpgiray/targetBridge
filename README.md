@@ -21,10 +21,26 @@ contributions help keep the project moving forward.
 
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?logo=github)](https://github.com/sponsors/swellweb)
 
-## TargetBridge 3.3
+## Contributors
 
-TargetBridge 3.3 improves the reliability of the display connection while
-keeping the established multi-Mac workspace features:
+Thank you to everyone who tests TargetBridge on real hardware, reports issues,
+and improves the project. A special thank-you for this release goes to:
+
+- [@aalpgiray](https://github.com/aalpgiray) for receiver brightness, volume, Night Shift, and True Tone controls.
+- [@preggocl](https://github.com/preggocl) for the Apple Silicon and Intel Sender release build coverage.
+
+## TargetBridge 3.4.2
+
+TargetBridge 3.4.2 adds receiver controls that make the remote display feel
+more like part of the sender workspace, improves reliability after wake, and
+ships pre-built Sender and Receiver apps for both Apple Silicon and Intel Macs:
+
+- control receiver brightness and volume from the Sender menu
+- toggle receiver Night Shift and True Tone from the Sender when the receiver hardware supports them
+- retain receiver identity more reliably after wake and carry improved colour metadata through the session
+- download separate Apple Silicon and Intel Sender builds, with CI validating the architecture of every release artifact
+
+It also keeps the established multi-Mac workspace features:
 
 - mirror mode and extended desktop mode
 - multiple receivers from one sender
@@ -54,7 +70,7 @@ keeping the established multi-Mac workspace features:
 - Network Link (experimental): [docs/Features.md#network-link-experimental](docs/Features.md#network-link-experimental)
 - Audio Relay: [docs/Features.md#audio-relay](docs/Features.md#audio-relay)
 - Input Dockstation, clipboard sync, master/slave roles, and Receiver Master shortcuts: [docs/Features.md#input-dockstation](docs/Features.md#input-dockstation)
-- Remote brightness control: [docs/Features.md#remote-brightness-control](docs/Features.md#remote-brightness-control)
+- Receiver device controls (brightness, volume, Night Shift, True Tone): [docs/Features.md#receiver-device-controls](docs/Features.md#receiver-device-controls)
 - Remote connection & automation (URL scheme, launch args, SSH, login/wake): [docs/Automation.md](docs/Automation.md)
 - Shared translations (English, Italian, German, French, and Chinese): [docs/Features.md#shared-translations](docs/Features.md#shared-translations)
 - Thunderbolt networking extras (SSH/SFTP, file sharing, Internet Sharing): [docs/Features.md#thunderbolt-networking-extras](docs/Features.md#thunderbolt-networking-extras)
@@ -66,6 +82,7 @@ keeping the established multi-Mac workspace features:
 - Stream profiles range from `2560 x 1440` to `5120 x 2880` with H.264/HEVC selection based on capability. `5K 60` is an experimental profile for recent Apple Silicon; `5K 48` remains recommended for reliable daily work. See [Display Modes](docs/Features.md#display-modes).
 - Receiver discovery is automatic over Bonjour. Extended-display arrangement is remembered per receiver when possible. See [Display Modes](docs/Features.md#display-modes).
 - Thunderbolt Bridge remains the primary low-latency path, with `Network Link` available as an experimental addon-gated transport. See [Network Link](docs/Features.md#network-link-experimental).
+- The Sender menu can control a connected receiver's brightness, volume, Night Shift, and True Tone when supported. See [Receiver Device Controls](docs/Features.md#receiver-device-controls).
 
 ## Official Addons
 
@@ -77,7 +94,7 @@ TargetBridge now has a conservative manifest-based addon system. Official manife
 
 ## Requirements
 
-- Sender: Apple Silicon Mac (M1 or later), macOS 14 Sonoma or later
+- Sender: Apple Silicon Mac (M1 or later) or Intel Mac, macOS 14 Sonoma or later. Apple Silicon remains the primary tested path; Intel Sender builds are available for broader testing.
 - Receiver: Intel or Apple Silicon Mac, macOS 11 Big Sur or later
 - Thunderbolt cable
 - See also [docs/Hardware.md](docs/Hardware.md) for hardware details, tested cables, adapters, and Thunderbolt networking ideas.
@@ -87,6 +104,7 @@ TargetBridge now has a conservative manifest-based addon system. Official manife
 **[→ Download latest release (pre-built apps, no Xcode needed)](https://github.com/swellweb/targetBridge/releases/latest)**
 
 - `TargetBridge-arm64.app.zip` — Sender (for Apple Silicon Macs)
+- `TargetBridge-x86_64.app.zip` — Sender (for Intel Macs)
 - `TargetBridge-Receiver-arm64.app.zip` — Apple Silicon Receiver (use machine as monitor for sender)
 - `TargetBridge-Receiver-x86_64.app.zip` — Intel Receiver (use machine as monitor for sender)
 

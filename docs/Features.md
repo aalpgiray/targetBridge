@@ -129,13 +129,18 @@ Related reading:
 
 - [docs/Addons.md#input-dockstation](docs/Addons.md#input-dockstation)
 
-## Remote Brightness Control
+## Receiver Device Controls
 
-The sender can adjust receiver panel brightness directly from the session UI.
+The Sender menu can adjust a connected receiver's panel brightness and volume
+directly from the session controls. When the receiver hardware supports them,
+the same menu also offers Night Shift and True Tone toggles.
 
-This makes it easier to treat the receiver as part of the same workspace without manually opening receiver-side display settings each time.
+This makes it easier to treat the receiver as part of the same workspace
+without manually opening receiver-side display settings each time. Unsupported
+controls are simply not shown.
 
-The current implementation sends brightness updates over the session protocol and applies them on the receiver side.
+The Sender sends the selected setting over the session protocol and the
+Receiver applies it locally.
 
 ## Shared Translations
 
