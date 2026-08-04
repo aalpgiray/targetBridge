@@ -81,6 +81,16 @@ void tb_disp_render_packed32(struct tb_display *d,
                              const uint8_t *rgba, int stride,
                              int w, int h, int ten_bit);
 
+/* Decode and render one TBD1 blob (tb_dpcm.h) on the GPU. Returns 0 on success;
+ * non-zero means the frame was not displayed and the caller should count it as
+ * dropped rather than assume the screen is current. */
+int  tb_disp_render_dpcm(struct tb_display *d, const uint8_t *blob, size_t len);
+
+/* Whether this receiver can decode TBD1 at all, i.e. whether it should advertise
+ * "supportsDPCM" to the sender. False on any Mac without a working compute
+ * pipeline, which must keep receiving uncompressed frames. */
+int  tb_disp_supports_dpcm(void);
+
 /* Update low-latency local cursor overlay in source-frame coordinates. */
 void tb_disp_set_cursor(struct tb_display *d,
                         int x, int y,

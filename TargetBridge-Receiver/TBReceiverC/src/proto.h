@@ -58,6 +58,22 @@
  * A full TB_PKT_RAW_FRAME must arrive first (and periodically after) so the
  * receiver has a complete base image to patch into. */
 #define TB_PKT_RAW_DAMAGE       0x24
+/* Full frame, losslessly compressed with tile-DPCM (TBD1; see tb_dpcm.h). The
+ * payload is one TBD1 blob and nothing else — its own header carries the
+ * dimensions, so none are repeated here.
+ *
+ * This exists for the case damage rectangles cannot help: fullscreen video and
+ * fast scrolling, where most of the screen really is new every frame and the
+ * sender falls back to whole frames. Measured 2.96x on near-worst-case
+ * photographic content and 4.5-14x on desktop content, which turns a 23.4 ms
+ * receive into ~8 ms.
+ *
+ * Only sent to a receiver that advertised "supportsDPCM" in its display
+ * profile, which is conditional on a working Metal decoder: decoding costs
+ * ~44 million bit extractions per 5K frame, which this receiver's CPU cannot
+ * afford (measured 166 ms single-threaded on the target iMac, against 6.5 ms on
+ * its GPU). A silent peer is an old peer and keeps getting TB_PKT_RAW_FRAME. */
+#define TB_PKT_RAW_DPCM         0x25
 #define TB_PKT_HEARTBEAT        0x30
 #define TB_PKT_TEARDOWN         0x31
 #define TB_PKT_CURSOR           0x32

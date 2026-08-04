@@ -1223,7 +1223,7 @@ void tb_disp_render_packed32(struct tb_display *d,
         if (!tb_metal_plane_available()) tb_metal_plane_init(d->win);
         if (tb_metal_plane_available()) {
             double m0 = tb_now_ms();
-            if (tb_metal_plane_render_l10r(rgba, stride, w, h) == 0) {
+            if (tb_metal_plane_render_packed(rgba, stride, w, h, 1) == 0) {
                 tb_disp_set_connection_state(d, 1);
                 d->last_video_frame_time = SDL_GetTicks();
                 tb_frame_stats_add("10bit-metal", tb_now_ms() - m0, 0.0);
@@ -1248,7 +1248,7 @@ void tb_disp_render_packed32(struct tb_display *d,
     if (!tb_metal_plane_available()) tb_metal_plane_init(d->win);
     if (tb_metal_plane_available()) {
         double m0 = tb_now_ms();
-        if (tb_metal_plane_render_bgra8(rgba, stride, w, h) == 0) {
+        if (tb_metal_plane_render_packed(rgba, stride, w, h, 0) == 0) {
             tb_disp_set_connection_state(d, 1);
             d->last_video_frame_time = SDL_GetTicks();
             tb_frame_stats_add("8bit-metal", tb_now_ms() - m0, 0.0);
@@ -1270,6 +1270,28 @@ void tb_disp_render_packed32(struct tb_display *d,
     d->last_video_frame_time = SDL_GetTicks();
     tb_disp_render_current(d);
     tb_frame_stats_add(ten_bit ? "10bit" : "8bit", t1 - t0, tb_now_ms() - t1);
+}
+
+int tb_disp_supports_dpcm(void) {
+    return tb_metal_plane_supports_dpcm();
+}
+
+int tb_disp_render_dpcm(struct tb_display *d, const uint8_t *blob, size_t len) {
+    if (!d) return -1;
+    /* Same lazy creation as the other Metal paths: the plane sits over SDL's
+     * window, so it cannot exist while the status UI is showing. */
+    if (!tb_metal_plane_available()) tb_metal_plane_init(d->win);
+    if (!tb_metal_plane_available()) return -1;
+
+    double m0 = tb_now_ms();
+    if (tb_metal_plane_render_dpcm(blob, len) != 0) return -1;
+    tb_disp_set_connection_state(d, 1);
+    d->last_video_frame_time = SDL_GetTicks();
+    /* Reported as one number: unlike the uncompressed path there is no separate
+     * upload stage to attribute time to — the compressed blob goes up and the
+     * GPU expands it in the same command buffer. */
+    tb_frame_stats_add("dpcm", tb_now_ms() - m0, 0.0);
+    return 0;
 }
 
 void tb_disp_set_cursor(struct tb_display *d,

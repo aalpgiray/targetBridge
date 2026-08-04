@@ -1090,6 +1090,28 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
 }
 
 
+/* TB_PKT_RAW_DPCM — a whole frame, losslessly compressed (tb_dpcm.h). Decoded
+ * on the GPU; there is no CPU-side copy and no base image, which is why the
+ * sender does not mix damage packets into this path.
+ *
+ * Nothing is validated here on purpose: tb_metal_plane_render_dpcm calls
+ * tb_dpcm_parse, which checks every declared length against the actual one and
+ * re-derives the offset table from the width plane. That check is what allows
+ * the decode kernel to run with no bounds tests at all. */
+static void handle_raw_dpcm(struct app *a, const uint8_t *payload, size_t len) {
+    if (tb_disp_render_dpcm(a->disp, payload, len) != 0) {
+        a->frames_dropped++;
+        return;
+    }
+    /* A DPCM frame leaves no CPU base image behind, so a damage packet arriving
+     * after one has nothing to patch. Saying so here means a sender that mixes
+     * the two gets refused rather than showing a frame built on stale pixels. */
+    a->base_valid = 0;
+    a->have_video_frame = 1;
+    tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
+    a->frames++;
+}
+
 /* TB_PKT_RAW_DAMAGE — patch changed rectangles into the base image, then
  * render it. Every bounds check matters here: the payload is attacker-shaped
  * data and a bad rect would write outside the frame buffer. */
@@ -1317,6 +1339,9 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         break;
     case TB_PKT_RAW_DAMAGE:
         handle_raw_damage(a, payload, len);
+        break;
+    case TB_PKT_RAW_DPCM:
+        handle_raw_dpcm(a, payload, len);
         break;
     case TB_PKT_CURSOR:
         {
@@ -1999,7 +2024,7 @@ static void send_receiver_info(struct app *a) {
         "{\"receiverName\":\"%s\",\"panelWidth\":%u,\"panelHeight\":%u,"
         "\"modeWidth\":%u,\"modeHeight\":%u,\"refreshRate\":60,"
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
-        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsFloat32Audio\":true,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s,"
+        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsFloat32Audio\":true,\"supportsDPCM\":%s,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s,"
         "\"supportsNightShift\":%s,\"supportsTrueTone\":%s}",
         escaped_name,
         panel_w,
@@ -2009,6 +2034,7 @@ static void send_receiver_info(struct app *a) {
         capture_w,
         capture_h,
         tb_dec_supports_hevc_hwdecode() ? "true" : "false",
+        tb_disp_supports_dpcm() ? "true" : "false",
         tb_receiver_input_monitoring_trusted() ? "true" : "false",
         tb_receiver_accessibility_trusted() ? "true" : "false",
         tb_night_shift_supported() ? "true" : "false",
@@ -2041,7 +2067,8 @@ static void reader_on_packet(uint8_t type, const uint8_t *payload, size_t len, v
     struct tb_link_reader *r = (struct tb_link_reader *)ud;
     struct app *a = r->app;
 
-    if (type == TB_PKT_RAW_FRAME || type == TB_PKT_RAW_DAMAGE) {
+    if (type == TB_PKT_RAW_FRAME || type == TB_PKT_RAW_DAMAGE ||
+        type == TB_PKT_RAW_DPCM) {
         /* Keep this packet without copying it: ask the parser to yield its
          * buffer. The `payload` pointer stays valid inside that buffer, which
          * the reader loop collects and publishes right after commit returns. */
@@ -2228,8 +2255,9 @@ static int pump_network(struct app *a) {
         /* Frames bypass on_packet, so mark the session live here — otherwise
          * the fullscreen gate never opens. */
         a->session_active = 1;
-        if (ptype == TB_PKT_RAW_DAMAGE) handle_raw_damage(a, payload, plen);
-        else                            handle_raw_frame(a, payload, plen);
+        if (ptype == TB_PKT_RAW_DAMAGE)   handle_raw_damage(a, payload, plen);
+        else if (ptype == TB_PKT_RAW_DPCM) handle_raw_dpcm(a, payload, plen);
+        else                              handle_raw_frame(a, payload, plen);
         worked = 1;
 
         /* Return the buffer for a reader to reuse; only free if the pool is

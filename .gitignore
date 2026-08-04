@@ -19,4 +19,5 @@ tbreceiver
 
 # C test outputs
 test_net_parser
+test_dpcm
 *.dSYM/

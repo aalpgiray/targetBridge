@@ -1,16 +1,35 @@
-/* tb_metal_plane.m — 10-bit video plane on a CAMetalLayer.
+/* tb_metal_plane.m — the video plane, and the frame surface behind it.
+ *
+ * WHY THIS BYPASSES SDL AT ALL
  *
  * SDL2's 2D renderer has no 10-bit texture format on any macOS backend, so
  * asking it for ARGB2101010 silently lands on a scalar CPU converter that both
  * costs ~100 ms/frame at 5K and truncates to 8 bits. Measured on the target
- * iMac: 8-bit BGRA 12 ms/frame, the same frame as "10-bit" 102 ms/frame.
+ * iMac: 8-bit BGRA 12 ms/frame, the same frame as "10-bit" 102 ms/frame. SDL
+ * keeps the window, input and status UI; this owns a sibling layer shown only
+ * while video frames are arriving.
  *
- * This bypasses SDL_Renderer for the 10-bit path only. The sender's capture
- * format ('l10r', ARGB2101010 little-endian) is bit-identical to Metal's
- * MTLPixelFormatBGR10A2Unorm, which is also macOS's native 30-bit scanout
- * format — so capture -> wire -> texture -> drawable -> panel involves no
- * conversion anywhere. SDL keeps the window, input and status UI; this owns a
- * sibling layer that is shown only while 10-bit frames are arriving.
+ * TWO WAYS A FRAME ARRIVES
+ *
+ * An uncompressed frame is staged in a shared buffer and presented straight from
+ * there, as it always was. A TBD1 frame (tb_dpcm.h) is uploaded compressed —
+ * ~20 MB instead of 59 — and expanded by a compute kernel into a private buffer
+ * that lives in VRAM.
+ *
+ * That the decoded frame lands in VRAM rather than in CPU-visible memory was
+ * measured, not assumed: decoding into shared memory costs 17.2 ms/frame on the
+ * target GPU against 7.5 ms into VRAM, and 17.2 ms alone exceeds the 16.67 ms
+ * budget at 60 Hz.
+ *
+ * A compressed full frame therefore fits 60 Hz by itself, which is why damage
+ * rectangles are not part of the TBD1 path at all — no base image, no patching,
+ * no keyframe bookkeeping. Receivers that cannot decode TBD1 still get damage
+ * packets, patched on the CPU and presented through the uncompressed path, since
+ * for them it is the only thing that makes 5K viable.
+ *
+ * The cursor is composited by the render pass, NOT drawn into the frame. A TBD1
+ * frame never exists in CPU-visible memory, so there is nothing to stamp it
+ * into.
  */
 
 #import <Metal/Metal.h>
@@ -18,15 +37,24 @@
 #import <Cocoa/Cocoa.h>
 
 #include "tb_metal_plane.h"
+#include "tb_dpcm.h"
 
 #include <SDL.h>
 #include <stdio.h>
+#include <string.h>
 
-/* Enough in-flight buffers that the CPU can fill frame N+1 while the GPU still
- * reads frame N, without ever allocating inside the frame loop (SDL's own Metal
- * backend reallocates a full-size staging buffer per frame — at 5K that alone
- * is 59 MB of allocation and first-touch faulting every frame). */
+/* Enough in-flight upload buffers that the CPU can stage frame N+1 while the GPU
+ * still reads frame N, without ever allocating inside the frame loop. */
 #define TB_METAL_RING 3
+
+/* Mirrors DpcmParams in the shader. */
+struct tb_dpcm_gpu_params {
+    uint32_t width, height;
+    uint32_t tilesX, tilesY;
+    uint32_t tileCount;
+    uint32_t outStridePx;
+    uint32_t widthOff, seedOff, payOff;
+};
 
 static struct {
     int                   ready;
@@ -34,16 +62,30 @@ static struct {
     CAMetalLayer         *layer;
     id<MTLDevice>         dev;
     id<MTLCommandQueue>   queue;
-    id<MTLRenderPipelineState> pipe;
+    id<MTLRenderPipelineState>  pipe;        /* present + dither */
+    id<MTLRenderPipelineState>  cursorPipe;  /* cursor overlay */
+    id<MTLComputePipelineState> dpcmPipe;
     size_t                row_align;
     float                 dither;
+
     id<MTLBuffer>         ring[TB_METAL_RING];
     size_t                ring_cap[TB_METAL_RING];
     int                   ring_idx;
     dispatch_semaphore_t  inflight;
+
+    /* Destination for decoded TBD1 frames, in VRAM. 4 bytes per pixel, rows
+     * padded so a texture can be viewed over it. */
+    id<MTLBuffer>         frame;
+    size_t                frame_cap;
+    size_t                frame_bpr;
     int                   frame_w, frame_h;
-    int                   shown;
+
+    id<MTLTexture>        curTex;
+    int                   cur_tex_w, cur_tex_h;
+    float                 cur_tex_scale;      /* what curTex was built for */
     int                   cur_x, cur_y, cur_sw, cur_sh, cur_visible, cur_type;
+
+    int                   shown;
 } g;
 
 void tb_metal_plane_set_cursor(int x, int y, int source_w, int source_h,
@@ -55,12 +97,10 @@ void tb_metal_plane_set_cursor(int x, int y, int source_w, int source_h,
     g.cur_type = type;
 }
 
-static inline uint32_t tb_pack10(uint32_t r, uint32_t g_, uint32_t b) {
-    return (3u << 30) | ((r & 0x3FF) << 20) | ((g_ & 0x3FF) << 10) | (b & 0x3FF);
-}
+/* ------------------------------------------------------------- cursor sprite */
 
 /* Even-odd scanline fill; the arrow is non-convex so a simple span fill will
- * not do. Coordinates are floats in frame space. */
+ * not do. Coordinates are floats in sprite space. */
 static void tb_fill_poly(uint32_t *px, int w, int h, int stride,
                          const float *xs, const float *ys, int n,
                          uint32_t colour) {
@@ -92,37 +132,237 @@ static void tb_fill_poly(uint32_t *px, int w, int h, int stride,
     }
 }
 
-/* Classic arrow, drawn black-offset-then-white so it stays legible on any
- * background — the same reason the SDL path outlines it. */
-static void tb_draw_cursor_stride_fmt(uint32_t *px, int w, int h, int stride, int ten) {
-    if (!g.cur_visible) return;
+/* The arrow, in units later multiplied by `scale`. */
+static const float kArrowX[7] = { 0.f, 0.f,  4.5f, 7.5f, 10.5f, 7.5f, 12.f };
+static const float kArrowY[7] = { 0.f, 17.f, 13.f, 20.f, 19.f,  12.f, 12.f };
+#define TB_CUR_PAD 2   /* the black outline reaches this far from the shape */
 
-    const float ax[7] = { 0.f, 0.f,  4.5f, 7.5f, 10.5f, 7.5f, 12.f };
-    const float ay[7] = { 0.f, 17.f, 13.f, 20.f, 19.f,  12.f, 12.f };
+/* Build the cursor into a small texture, once per scale. Drawn black-offset-then
+ * white so it stays legible on any background — the same reason the SDL path
+ * outlines it. Alpha is zero everywhere the arrow is not, so the render pass can
+ * blend it over the video without touching the frame. */
+static void tb_cursor_build(float scale) {
+    if (g.curTex && g.cur_tex_scale == scale) return;
 
-    float sx = (float)w / (float)g.cur_sw;
-    float sy = (float)h / (float)g.cur_sh;
-    float ox = (float)g.cur_x * sx;
-    float oy = (float)g.cur_y * sy;
-    float scale = ((w >= 5000) ? 58.f : 44.f) / 24.f;
+    const int w = (int)(12.f * scale) + 2 * TB_CUR_PAD + 2;
+    const int h = (int)(20.f * scale) + 2 * TB_CUR_PAD + 2;
+    uint32_t *px = calloc((size_t)w * h, 4);
+    if (!px) return;
 
     float bx[7], by[7];
     const int off[8][2] = {{-2,0},{2,0},{0,-2},{0,2},{-2,-2},{2,-2},{-2,2},{2,2}};
     for (int k = 0; k < 8; ++k) {
         for (int i = 0; i < 7; ++i) {
-            bx[i] = ox + ax[i] * scale + (float)off[k][0];
-            by[i] = oy + ay[i] * scale + (float)off[k][1];
+            bx[i] = TB_CUR_PAD + kArrowX[i] * scale + (float)off[k][0];
+            by[i] = TB_CUR_PAD + kArrowY[i] * scale + (float)off[k][1];
         }
-        tb_fill_poly(px, w, h, stride, bx, by, 7, ten ? tb_pack10(0, 0, 0) : 0xFF000000u);
+        tb_fill_poly(px, w, h, w, bx, by, 7, 0xFF000000u);
     }
-    for (int i = 0; i < 7; ++i) { bx[i] = ox + ax[i] * scale; by[i] = oy + ay[i] * scale; }
-    tb_fill_poly(px, w, h, stride, bx, by, 7, ten ? tb_pack10(1023, 1023, 1023) : 0xFFFFFFFFu);
+    for (int i = 0; i < 7; ++i) {
+        bx[i] = TB_CUR_PAD + kArrowX[i] * scale;
+        by[i] = TB_CUR_PAD + kArrowY[i] * scale;
+    }
+    tb_fill_poly(px, w, h, w, bx, by, 7, 0xFFFFFFFFu);
+
+    MTLTextureDescriptor *td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                          width:(NSUInteger)w
+                                                         height:(NSUInteger)h
+                                                      mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeManaged;
+    g.curTex = [g.dev newTextureWithDescriptor:td];
+    if (g.curTex) {
+        [g.curTex replaceRegion:MTLRegionMake2D(0, 0, (NSUInteger)w, (NSUInteger)h)
+                    mipmapLevel:0
+                      withBytes:px
+                    bytesPerRow:(NSUInteger)w * 4];
+        g.cur_tex_w = w;
+        g.cur_tex_h = h;
+        g.cur_tex_scale = scale;
+    }
+    free(px);
 }
 
-/* The Metal view is a sibling layer over SDL's window, and SDL's renderer here
- * is OpenGL — an opaque Metal layer on top hides it completely, `hidden` or
- * not. So the plane is created lazily on the first 10-bit frame and torn down
- * the moment anything else draws, rather than existing for the whole session. */
+/* ------------------------------------------------------------------- shaders */
+
+static NSString *tb_shader_source(void) {
+    return
+    @"#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "\n"
+    "struct VOut { float4 pos [[position]]; float2 uv; };\n"
+    "\n"
+    "vertex VOut tb_vs(uint vid [[vertex_id]]) {\n"
+    "  float2 p = float2((vid << 1) & 2, vid & 2);\n"
+    "  VOut o; o.pos = float4(p * 2.0 - 1.0, 0, 1); o.uv = float2(p.x, 1.0 - p.y);\n"
+    "  return o;\n"
+    "}\n"
+    /* Dither on presentation.
+     *
+     * macOS adds sub-LSB noise on the way to the panel, which is why 8-bit
+     * gradients look smooth everywhere else in the OS. A CAMetalLayer writing
+     * straight to a 10-bit drawable never picks that up, so quantisation the
+     * rest of the system hides is plainly visible in our window — measured with
+     * a synthetic ramp: an 8-bit half banded here while the same data was
+     * smooth in any ordinary window.
+     *
+     * An 8x8 ordered matrix, not random noise. White noise of the same
+     * amplitude reads as canvas texture across the whole image, because its
+     * energy sits at all spatial frequencies including the low ones the eye is
+     * most sensitive to. An ordered pattern puts its energy where the eye does
+     * not resolve it, which is why GPUs dither this way. */
+    "constant float bayer[64] = {\n"
+    "  0,32,8,40,2,34,10,42, 48,16,56,24,50,18,58,26,\n"
+    " 12,44,4,36,14,46,6,38, 60,28,52,20,62,30,54,22,\n"
+    "  3,35,11,43,1,33,9,41, 51,19,59,27,49,17,57,25,\n"
+    " 15,47,7,39,13,45,5,37, 63,31,55,23,61,29,53,21 };\n"
+    "fragment float4 tb_fs(VOut in [[stage_in]],\n"
+    "                      texture2d<float> tex [[texture(0)]],\n"
+    "                      constant float &amp [[buffer(0)]]) {\n"
+    "  constexpr sampler s(filter::nearest, address::clamp_to_edge);\n"
+    "  float4 c = tex.sample(s, in.uv);\n"
+    "  uint2 q = uint2(in.pos.xy);\n"
+    "  float t = (bayer[(q.y & 7) * 8 + (q.x & 7)] + 0.5) / 64.0 - 0.5;\n"
+    "  c.rgb += t * amp;\n"
+    "  return c;\n"
+    "}\n"
+    "\n"
+    /* Cursor overlay: a blended quad, positioned in normalised device
+     * coordinates by the host so the sprite needs no scaling here. */
+    "vertex VOut tb_cursor_vs(uint vid [[vertex_id]],\n"
+    "                         constant float4 &r [[buffer(0)]]) {\n"
+    "  float2 c = float2((vid == 1 || vid == 2 || vid == 4) ? r.z : r.x,\n"
+    "                    (vid == 2 || vid == 4 || vid == 5) ? r.w : r.y);\n"
+    "  float2 uv = float2((c.x - r.x) / (r.z - r.x), (c.y - r.y) / (r.w - r.y));\n"
+    "  VOut o; o.pos = float4(c, 0, 1); o.uv = float2(uv.x, 1.0 - uv.y);\n"
+    "  return o;\n"
+    "}\n"
+    "fragment float4 tb_cursor_fs(VOut in [[stage_in]],\n"
+    "                             texture2d<float> tex [[texture(0)]]) {\n"
+    "  constexpr sampler s(filter::linear, address::clamp_to_edge);\n"
+    "  return tex.sample(s, in.uv);\n"
+    "}\n"
+    "\n"
+    /* ---- TBD1 decode ----
+     *
+     * One threadgroup per 8x8 tile, one thread per pixel. Tile size, and this
+     * mapping, are both measured choices:
+     *
+     * One thread per TILE — the obvious mapping, since DPCM is serial along the
+     * prediction direction — measured 100 ms/frame on the target GPU against
+     * 7.5 ms for this one. The reason is memory, not arithmetic: with a thread
+     * per tile, the 64 lanes of a wave each read a different scattered byte and
+     * each pulls its own cache line to extract a few bits from it. With a thread
+     * per pixel, adjacent lanes read adjacent bit ranges, so a whole
+     * tile-channel's residuals fall inside one or two lines.
+     *
+     * The serial dependency is not a problem because DPCM along a row is a
+     * prefix sum, and a prefix sum is parallel. Each thread reads only its own
+     * residual, then two short prefixes resolve out of threadgroup memory: down
+     * column 0 for the row starts, and along the row for everything else.
+     *
+     * The tile's own payload offset is derived here rather than transmitted. The
+     * blob carries one base offset per group of 64 tiles, and this threadgroup's
+     * 64 threads each price one earlier tile in their group and reduce. Shipping
+     * an offset per tile would cost 921 KB a frame and wreck the ratio on
+     * exactly the flat content where it is largest.
+     *
+     * There are no bounds checks: tb_dpcm_parse has already re-derived the whole
+     * offset table from the width plane and rejected the blob unless it agrees,
+     * so every offset computed here is inside the payload by construction. */
+    "struct DpcmParams {\n"
+    "  uint width, height, tilesX, tilesY, tileCount, outStridePx;\n"
+    "  uint widthOff, seedOff, payOff;\n"
+    "};\n"
+    "static inline uint tb_width_get(device const uchar *plane, uint idx) {\n"
+    "  uchar b = plane[idx >> 1];\n"
+    "  return (idx & 1u) ? uint(b >> 4) : uint(b & 0xF);\n"
+    "}\n"
+    "static inline uint tb_bits_at(device const uchar *buf, uint p, uint n) {\n"
+    "  if (n == 0u) return 0u;\n"
+    "  uint byte = p >> 3, sh = p & 7u;\n"
+    "  uint x = uint(buf[byte]);\n"
+    "  if (sh + n > 8u) x |= uint(buf[byte + 1]) << 8;\n"
+    "  return (x >> sh) & ((1u << n) - 1u);\n"
+    "}\n"
+    "static inline int tb_unzig(uint z) { return int((z >> 1) ^ (~(z & 1u) + 1u)); }\n"
+    "\n"
+    "kernel void tb_dpcm_decode(device const uchar *blob  [[buffer(0)]],\n"
+    "                           device const uint  *gtab  [[buffer(1)]],\n"
+    "                           device       uint  *out   [[buffer(2)]],\n"
+    "                           constant DpcmParams &P    [[buffer(3)]],\n"
+    "                           uint tile [[threadgroup_position_in_grid]],\n"
+    "                           uint lane [[thread_position_in_threadgroup]]) {\n"
+    "  device const uchar *wp = blob + P.widthOff;\n"
+    "  device const uchar *sp = blob + P.seedOff;\n"
+    "  device const uchar *pay = blob + P.payOff;\n"
+    "  const uint grp = tile / 64u, idx = tile % 64u;\n"
+    "\n"
+    "  uint jcost = 0u;\n"
+    "  {\n"
+    "    const uint jt = grp * 64u + lane;\n"
+    "    if (lane < idx && jt < P.tileCount) {\n"
+    "      const uint jx = jt % P.tilesX, jy = jt / P.tilesX;\n"
+    "      const uint jw = min(8u, P.width  - jx * 8u);\n"
+    "      const uint jh = min(8u, P.height - jy * 8u);\n"
+    "      const uint jn = tb_width_get(wp, jt * 3u + 0u)\n"
+    "                    + tb_width_get(wp, jt * 3u + 1u)\n"
+    "                    + tb_width_get(wp, jt * 3u + 2u);\n"
+    "      jcost = jn * (jw * jh - 1u);\n"
+    "    }\n"
+    "  }\n"
+    "  threadgroup uint red[64];\n"
+    "  red[lane] = jcost;\n"
+    "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "  for (uint off = 32u; off > 0u; off >>= 1) {\n"
+    "    if (lane < off) red[lane] += red[lane + off];\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "  }\n"
+    "\n"
+    "  const uint x = lane & 7u, y = lane >> 3;\n"
+    "  const uint txi = tile % P.tilesX, tyi = tile / P.tilesX;\n"
+    "  const uint tw = min(8u, P.width  - txi * 8u);\n"
+    "  const uint th = min(8u, P.height - tyi * 8u);\n"
+    "  const uint coded = tw * th - 1u;\n"
+    "  const bool live = (x < tw && y < th);\n"
+    "\n"
+    "  const uint n0 = tb_width_get(wp, tile * 3u + 0u);\n"
+    "  const uint n1 = tb_width_get(wp, tile * 3u + 1u);\n"
+    "  const uint n2 = tb_width_get(wp, tile * 3u + 2u);\n"
+    "  const uint b0 = gtab[grp] + red[0];\n"
+    "  const uint b1 = b0 + n0 * coded;\n"
+    "  const uint b2 = b1 + n1 * coded;\n"
+    "\n"
+    "  int3 d = int3(0);\n"
+    "  if (live && !(x == 0u && y == 0u)) {\n"
+    "    const uint k = y * tw + x - 1u;\n"
+    "    d.x = tb_unzig(tb_bits_at(pay, b0 + k * n0, n0));\n"
+    "    d.y = tb_unzig(tb_bits_at(pay, b1 + k * n1, n1));\n"
+    "    d.z = tb_unzig(tb_bits_at(pay, b2 + k * n2, n2));\n"
+    "  }\n"
+    "\n"
+    "  threadgroup int3 rowd[64];\n"
+    "  threadgroup int3 cold[8];\n"
+    "  rowd[lane] = (x == 0u) ? int3(0) : d;\n"
+    "  if (x == 0u) cold[y] = (y == 0u) ? int3(0) : d;\n"
+    "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "  if (!live) return;\n"
+    "\n"
+    "  int3 acc = int3(0);\n"
+    "  for (uint j = 1u; j <= y; ++j) acc += cold[j];\n"
+    "  for (uint i = 1u; i <= x; ++i) acc += rowd[y * 8u + i];\n"
+    "\n"
+    "  const int3 seed = int3(int(sp[tile * 3u + 0u]),\n"
+    "                         int(sp[tile * 3u + 1u]),\n"
+    "                         int(sp[tile * 3u + 2u]));\n"
+    "  const uint3 v = uint3(seed + acc) & 0xFFu;\n"
+    "  out[(tyi * 8u + y) * P.outStridePx + (txi * 8u + x)] =\n"
+    "      0xFF000000u | v.x | (v.y << 8) | (v.z << 16);\n"
+    "}\n";
+}
+
+/* ---------------------------------------------------------------------- setup */
 
 int tb_metal_plane_init(SDL_Window *win) {
     if (g.ready) return 0;
@@ -143,7 +383,6 @@ int tb_metal_plane_init(SDL_Window *win) {
 
     g.layer.device = g.dev;
     g.layer.pixelFormat = MTLPixelFormatBGR10A2Unorm;
-    /* The default (YES) forbids using the drawable as a blit destination. */
     g.layer.framebufferOnly = NO;
     g.layer.opaque = YES;
     g.layer.maximumDrawableCount = TB_METAL_RING;
@@ -179,58 +418,14 @@ int tb_metal_plane_init(SDL_Window *win) {
         if (dcs) CGColorSpaceRelease(dcs);
     }
 
-    /* Dither on presentation.
-     *
-     * macOS adds sub-LSB noise on the way to the panel, which is why 8-bit
-     * gradients look smooth everywhere else in the OS. A CAMetalLayer writing
-     * straight to a 10-bit drawable never picks that up, so quantisation the
-     * rest of the system hides is plainly visible in our window — measured with
-     * a synthetic ramp: an 8-bit half banded here while the same data was
-     * smooth in any ordinary window.
-     *
-     * The content arrives quantised to 256 levels even in a 10-bit container,
-     * so the noise is scaled to one 8-bit step by default.
-     *
-     * An 8x8 ordered matrix, not random noise. White noise of the same
-     * amplitude reads as canvas texture across the whole image — its energy
-     * sits at all spatial frequencies, including the low ones the eye is most
-     * sensitive to. An ordered pattern puts its energy at high frequencies
-     * where the eye does not resolve it, which is why GPUs dither this way.
-     *
-     * Amplitude is sized to the *output* quantiser, not the input step: the
-     * drawable is 10-bit, so one 8-bit step is already four output levels of
-     * noise. Half a step is enough to spread values across the levels between
-     * two 8-bit codes. TB_DITHER scales it, in units of 8-bit steps. */
-    NSString *src = @"#include <metal_stdlib>\n"
-        "using namespace metal;\n"
-        "struct VOut { float4 pos [[position]]; float2 uv; };\n"
-        "vertex VOut tb_vs(uint vid [[vertex_id]]) {\n"
-        "  float2 p = float2((vid << 1) & 2, vid & 2);\n"
-        "  VOut o; o.pos = float4(p * 2.0 - 1.0, 0, 1); o.uv = float2(p.x, 1.0 - p.y);\n"
-        "  return o;\n"
-        "}\n"
-        "constant float bayer[64] = {\n"
-        "  0,32,8,40,2,34,10,42, 48,16,56,24,50,18,58,26,\n"
-        " 12,44,4,36,14,46,6,38, 60,28,52,20,62,30,54,22,\n"
-        "  3,35,11,43,1,33,9,41, 51,19,59,27,49,17,57,25,\n"
-        " 15,47,7,39,13,45,5,37, 63,31,55,23,61,29,53,21 };\n"
-        "fragment float4 tb_fs(VOut in [[stage_in]],\n"
-        "                      texture2d<float> tex [[texture(0)]],\n"
-        "                      constant float &amp [[buffer(0)]]) {\n"
-        "  constexpr sampler s(filter::nearest, address::clamp_to_edge);\n"
-        "  float4 c = tex.sample(s, in.uv);\n"
-        "  uint2 q = uint2(in.pos.xy);\n"
-        "  float t = (bayer[(q.y & 7) * 8 + (q.x & 7)] + 0.5) / 64.0 - 0.5;\n"
-        "  c.rgb += t * amp;\n"
-        "  return c;\n"
-        "}\n";
     NSError *err = nil;
-    id<MTLLibrary> lib = [g.dev newLibraryWithSource:src options:nil error:&err];
+    id<MTLLibrary> lib = [g.dev newLibraryWithSource:tb_shader_source() options:nil error:&err];
     if (!lib) {
         fprintf(stderr, "[metal] shader compile failed: %s\n",
                 err.localizedDescription.UTF8String ?: "?");
         return -1;
     }
+
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
     pd.vertexFunction   = [lib newFunctionWithName:@"tb_vs"];
     pd.fragmentFunction = [lib newFunctionWithName:@"tb_fs"];
@@ -241,8 +436,30 @@ int tb_metal_plane_init(SDL_Window *win) {
                 err.localizedDescription.UTF8String ?: "?");
         return -1;
     }
-    /* Buffer-backed textures need their rows aligned; the staging copy pads to
-     * this rather than to the frame width. */
+
+    MTLRenderPipelineDescriptor *cd = [MTLRenderPipelineDescriptor new];
+    cd.vertexFunction   = [lib newFunctionWithName:@"tb_cursor_vs"];
+    cd.fragmentFunction = [lib newFunctionWithName:@"tb_cursor_fs"];
+    cd.colorAttachments[0].pixelFormat = MTLPixelFormatBGR10A2Unorm;
+    cd.colorAttachments[0].blendingEnabled = YES;
+    cd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    cd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    cd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    cd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    g.cursorPipe = [g.dev newRenderPipelineStateWithDescriptor:cd error:&err];
+    if (!g.cursorPipe)
+        fprintf(stderr, "[metal] cursor pipeline failed: %s\n",
+                err.localizedDescription.UTF8String ?: "?");
+
+    /* The decode pipeline is optional: without it the plane still presents
+     * uncompressed frames, and the receiver simply does not advertise
+     * "supportsDPCM", so the sender keeps sending them. */
+    g.dpcmPipe = [g.dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"tb_dpcm_decode"]
+                                                     error:&err];
+    if (!g.dpcmPipe)
+        fprintf(stderr, "[metal] dpcm pipeline failed: %s\n",
+                err.localizedDescription.UTF8String ?: "?");
+
     g.dither = 0.5f / 255.0f;   /* half an 8-bit step = ~2 levels at 10-bit */
     const char *denv = getenv("TB_DITHER");
     if (denv) {
@@ -252,6 +469,8 @@ int tb_metal_plane_init(SDL_Window *win) {
     fprintf(stderr, "[metal] dither %.2f of an 8-bit step (%.1f levels at 10-bit)\n",
             g.dither * 255.0f, g.dither * 1023.0f);
 
+    /* Buffer-backed textures need their rows aligned; the frame surface pads to
+     * this rather than to the frame width. */
     g.row_align = [g.dev minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatBGR10A2Unorm];
     if (g.row_align == 0) g.row_align = 256;
 
@@ -259,11 +478,10 @@ int tb_metal_plane_init(SDL_Window *win) {
     g.inflight = dispatch_semaphore_create(TB_METAL_RING);
     g.ring_idx = 0;
     g.ready = 1;
-
     g.shown = 1;
 
-    fprintf(stderr, "[metal] 10-bit plane ready on %s (BGR10A2Unorm)\n",
-            [[g.dev name] UTF8String]);
+    fprintf(stderr, "[metal] plane ready on %s (dpcm=%s)\n",
+            [[g.dev name] UTF8String], g.dpcmPipe ? "yes" : "no");
     return 0;
 }
 
@@ -288,6 +506,9 @@ void tb_metal_plane_shutdown(void) {
         g.inflight = nil;
     }
     for (int i = 0; i < TB_METAL_RING; ++i) { g.ring[i] = nil; g.ring_cap[i] = 0; }
+    g.frame = nil; g.frame_cap = 0;
+    g.curTex = nil; g.cur_tex_scale = 0.f;
+    g.pipe = nil; g.cursorPipe = nil; g.dpcmPipe = nil;
     g.queue = nil;
     g.dev = nil;
     g.layer = nil;
@@ -296,6 +517,40 @@ void tb_metal_plane_shutdown(void) {
 }
 
 int tb_metal_plane_available(void) { return g.ready; }
+
+int tb_metal_plane_supports_dpcm(void) {
+    if (g.ready) return g.dpcmPipe != nil;
+
+    /* The answer is needed at connect time, in the display profile, but the plane
+     * is not created until the first frame arrives — it sits over SDL's window
+     * and would hide the status UI. So probe standalone: make a device, compile
+     * the library, build the pipeline. Nothing short of that is evidence, and
+     * claiming the capability we cannot deliver would leave the sender
+     * transmitting frames this receiver has no way to display.
+     *
+     * Cached because it costs a shader compile, and answered once per process. */
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    cached = 0;
+    @autoreleasepool {
+        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+        if (!dev) return cached;
+        NSError *err = nil;
+        id<MTLLibrary> lib = [dev newLibraryWithSource:tb_shader_source() options:nil error:&err];
+        if (!lib) {
+            fprintf(stderr, "[metal] dpcm probe: shader failed: %s\n",
+                    err.localizedDescription.UTF8String ?: "?");
+            return cached;
+        }
+        id<MTLComputePipelineState> p =
+            [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"tb_dpcm_decode"]
+                                              error:&err];
+        cached = p != nil;
+        fprintf(stderr, "[metal] dpcm decode %s on %s\n",
+                cached ? "available" : "unavailable", [[dev name] UTF8String]);
+    }
+    return cached;
+}
 
 void tb_metal_plane_set_hidden(int hidden) {
     if (!hidden) return;
@@ -308,92 +563,194 @@ void tb_metal_plane_set_hidden(int hidden) {
     }
 }
 
-static int tb_metal_render(const uint8_t *px, int stride, int w, int h,
-                           MTLPixelFormat srcFmt) {
-    if (!g.ready || !px || w <= 0 || h <= 0) return -1;
+/* ---------------------------------------------------------------- geometry */
 
-    @autoreleasepool {
-        /* Drive the layer at the frame's own resolution and let Core Animation
-         * scale it to the window. On this 5K panel fullscreen they match, so
-         * scaling is free; when they don't, the compositor handles it without
-         * us needing a render pipeline just to blit. */
-        if (g.frame_w != w || g.frame_h != h) {
-            g.frame_w = w; g.frame_h = h;
-            g.layer.drawableSize = CGSizeMake(w, h);
-            fprintf(stderr, "[metal] drawable %dx%d\n", w, h);
-        }
+/* Drive the layer at the frame's own resolution and let Core Animation scale it
+ * to the window. On this 5K panel fullscreen they match, so scaling is free;
+ * when they don't, the compositor handles it. */
+static size_t tb_row_bytes(int w) {
+    const size_t tight = (size_t)w * 4;
+    return ((tight + g.row_align - 1) / g.row_align) * g.row_align;
+}
 
-        const size_t tight = (size_t)w * 4;
-        const size_t bpr   = ((tight + g.row_align - 1) / g.row_align) * g.row_align;
-        const int    ten   = (srcFmt == MTLPixelFormatBGR10A2Unorm);
-        const size_t bytes = bpr * (size_t)h;
+static void tb_geometry_set(int w, int h) {
+    if (g.frame_w == w && g.frame_h == h) return;
+    g.frame_w = w; g.frame_h = h;
+    g.frame_bpr = tb_row_bytes(w);
+    g.layer.drawableSize = CGSizeMake(w, h);
+    fprintf(stderr, "[metal] drawable %dx%d\n", w, h);
+}
 
-        /* Block only if all ring slots are still in GPU use. */
-        dispatch_semaphore_wait(g.inflight, DISPATCH_TIME_FOREVER);
-
-        int slot = g.ring_idx;
-        g.ring_idx = (g.ring_idx + 1) % TB_METAL_RING;
-
-        if (g.ring_cap[slot] < bytes) {
-            g.ring[slot] = [g.dev newBufferWithLength:bytes
-                                              options:MTLResourceStorageModeShared];
-            g.ring_cap[slot] = g.ring[slot] ? bytes : 0;
-        }
-        id<MTLBuffer> buf = g.ring[slot];
-        if (!buf) { dispatch_semaphore_signal(g.inflight); return -1; }
-
-        uint8_t *dst = (uint8_t *)[buf contents];
-
-        if ((size_t)stride == bpr) {
-            memcpy(dst, px, bytes);
-        } else {
-            for (int y = 0; y < h; ++y) memcpy(dst + (size_t)y * bpr,
-                                               px + (size_t)y * stride, tight);
-        }
-
-        tb_draw_cursor_stride_fmt((uint32_t *)dst, w, h, (int)(bpr / 4), ten);
-
-        id<CAMetalDrawable> drawable = [g.layer nextDrawable];
-        if (!drawable) { dispatch_semaphore_signal(g.inflight); return -1; }
-
-        /* A texture view over the staging buffer — no copy, the shader samples
-         * the bytes we just wrote. */
-        MTLTextureDescriptor *td =
-            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:srcFmt
-                                                               width:w height:h mipmapped:NO];
-        td.usage = MTLTextureUsageShaderRead;
-        td.storageMode = MTLStorageModeShared;
-        id<MTLTexture> srcTex = [buf newTextureWithDescriptor:td offset:0 bytesPerRow:bpr];
-        if (!srcTex) { dispatch_semaphore_signal(g.inflight); return -1; }
-
-        id<MTLCommandBuffer> cb = [g.queue commandBuffer];
-        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        rp.colorAttachments[0].texture    = drawable.texture;
-        rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
-        [enc setRenderPipelineState:g.pipe];
-        [enc setFragmentTexture:srcTex atIndex:0];
-        [enc setFragmentBytes:&g.dither length:sizeof(g.dither) atIndex:0];
-        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-        [enc endEncoding];
-        [cb presentDrawable:drawable];
-        /* Capture the semaphore itself: reading g.inflight at completion time
-         * would signal a *replacement* if the plane was torn down meanwhile. */
-        dispatch_semaphore_t sem = g.inflight;
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
-            (void)done;
-            dispatch_semaphore_signal(sem);
-        }];
-        [cb commit];
+/* Take an upload slot. The caller must signal `inflight` if it does not go on to
+ * submit a command buffer that signals it on completion. */
+static id<MTLBuffer> tb_upload_take(size_t bytes) {
+    dispatch_semaphore_wait(g.inflight, DISPATCH_TIME_FOREVER);
+    int slot = g.ring_idx;
+    g.ring_idx = (g.ring_idx + 1) % TB_METAL_RING;
+    if (g.ring_cap[slot] < bytes) {
+        g.ring[slot] = [g.dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        g.ring_cap[slot] = g.ring[slot] ? bytes : 0;
     }
+    if (!g.ring[slot]) { dispatch_semaphore_signal(g.inflight); return nil; }
+    return g.ring[slot];
+}
+
+/* Draw `src` into the next drawable, dither it, and blend the cursor on top.
+ * Consumes the `inflight` count that the caller took.
+ *
+ * `src` is a texture VIEW over a buffer, not a copy — for an uncompressed frame
+ * that is the staging buffer the CPU just filled, and for a TBD1 frame it is the
+ * VRAM buffer the decode kernel just wrote. Either way the shader samples those
+ * bytes in place. */
+static int tb_present(id<MTLCommandBuffer> cb, id<MTLBuffer> src,
+                      MTLStorageMode mode, int ten_bit) {
+    id<CAMetalDrawable> drawable = [g.layer nextDrawable];
+    if (!drawable) { dispatch_semaphore_signal(g.inflight); return -1; }
+
+    MTLTextureDescriptor *td =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+             ten_bit ? MTLPixelFormatBGR10A2Unorm : MTLPixelFormatBGRA8Unorm
+                                                          width:(NSUInteger)g.frame_w
+                                                         height:(NSUInteger)g.frame_h
+                                                      mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = mode;
+    id<MTLTexture> srcTex = [src newTextureWithDescriptor:td offset:0
+                                             bytesPerRow:g.frame_bpr];
+    if (!srcTex) { dispatch_semaphore_signal(g.inflight); return -1; }
+
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture     = drawable.texture;
+    rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+    [enc setRenderPipelineState:g.pipe];
+    [enc setFragmentTexture:srcTex atIndex:0];
+    [enc setFragmentBytes:&g.dither length:sizeof(g.dither) atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+
+    if (g.cur_visible && g.cursorPipe) {
+        const float scale = ((g.frame_w >= 5000) ? 58.f : 44.f) / 24.f;
+        tb_cursor_build(scale);
+        if (g.curTex) {
+            /* Cursor coordinates arrive in the sender's source-frame space, which
+             * is not necessarily the frame we are showing. */
+            const float sx = (float)g.frame_w / (float)g.cur_sw;
+            const float sy = (float)g.frame_h / (float)g.cur_sh;
+            const float px = (float)g.cur_x * sx - (float)TB_CUR_PAD;
+            const float py = (float)g.cur_y * sy - (float)TB_CUR_PAD;
+            /* Pixels to normalised device coordinates; y is flipped. */
+            const float x0 =  (px / (float)g.frame_w) * 2.f - 1.f;
+            const float x1 = ((px + (float)g.cur_tex_w) / (float)g.frame_w) * 2.f - 1.f;
+            const float y0 = 1.f -  (py / (float)g.frame_h) * 2.f;
+            const float y1 = 1.f - ((py + (float)g.cur_tex_h) / (float)g.frame_h) * 2.f;
+            const float rect[4] = { x0, y0, x1, y1 };
+            [enc setRenderPipelineState:g.cursorPipe];
+            [enc setVertexBytes:rect length:sizeof(rect) atIndex:0];
+            [enc setFragmentTexture:g.curTex atIndex:0];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+        }
+    }
+    [enc endEncoding];
+
+    [cb presentDrawable:drawable];
+    /* Capture the semaphore itself: reading g.inflight at completion time would
+     * signal a *replacement* if the plane was torn down meanwhile. */
+    dispatch_semaphore_t sem = g.inflight;
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
+        (void)done;
+        dispatch_semaphore_signal(sem);
+    }];
+    [cb commit];
     return 0;
 }
 
-int tb_metal_plane_render_l10r(const uint8_t *px, int stride, int w, int h) {
-    return tb_metal_render(px, stride, w, h, MTLPixelFormatBGR10A2Unorm);
+/* -------------------------------------------------------------- entry points */
+
+int tb_metal_plane_render_packed(const uint8_t *px, int stride, int w, int h,
+                                 int ten_bit) {
+    if (!g.ready || !px || w <= 0 || h <= 0) return -1;
+
+    @autoreleasepool {
+        tb_geometry_set(w, h);
+
+        const size_t tight = (size_t)w * 4;
+        const size_t bytes = g.frame_bpr * (size_t)h;
+        id<MTLBuffer> up = tb_upload_take(bytes);
+        if (!up) return -1;
+
+        uint8_t *dst = (uint8_t *)[up contents];
+        if ((size_t)stride == g.frame_bpr) {
+            memcpy(dst, px, bytes);
+        } else {
+            for (int y = 0; y < h; ++y)
+                memcpy(dst + (size_t)y * g.frame_bpr, px + (size_t)y * stride, tight);
+        }
+
+        id<MTLCommandBuffer> cb = [g.queue commandBuffer];
+        return tb_present(cb, up, MTLStorageModeShared, ten_bit);
+    }
 }
 
-int tb_metal_plane_render_bgra8(const uint8_t *px, int stride, int w, int h) {
-    return tb_metal_render(px, stride, w, h, MTLPixelFormatBGRA8Unorm);
+/* Size the VRAM destination for a decoded frame. Returns 0 on success. */
+static int tb_frame_ensure(void) {
+    const size_t need = g.frame_bpr * (size_t)g.frame_h;
+    if (g.frame_cap < need) {
+        g.frame = [g.dev newBufferWithLength:need options:MTLResourceStorageModePrivate];
+        g.frame_cap = g.frame ? need : 0;
+    }
+    return g.frame ? 0 : -1;
+}
+
+int tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len) {
+    if (!g.ready || !g.dpcmPipe || !blob) return -1;
+
+    /* Validate before anything touches the GPU. This is also what lets the
+     * shader run without a single bounds check: parse re-derives the entire
+     * offset table from the width plane and rejects the blob unless its own
+     * table agrees. */
+    struct tb_dpcm_info in;
+    if (tb_dpcm_parse(blob, len, &in) != 0) {
+        fprintf(stderr, "[metal] rejected malformed TBD1 blob (%zu bytes)\n", len);
+        return -1;
+    }
+
+    @autoreleasepool {
+        tb_geometry_set(in.width, in.height);
+        if (tb_frame_ensure() != 0) return -1;
+
+        id<MTLBuffer> up = tb_upload_take(len);
+        if (!up) return -1;
+        memcpy([up contents], blob, len);
+
+        /* The blob is bound whole and the planes reached by offset, because
+         * Metal wants buffer offsets 4-byte aligned and the seed and payload
+         * planes can start anywhere. The group table is the one exception: it
+         * always begins at TB_DPCM_HEADER, which is aligned, so it can be bound
+         * as uint32 directly. */
+        struct tb_dpcm_gpu_params P = {
+            (uint32_t)in.width, (uint32_t)in.height,
+            (uint32_t)in.tiles_x, (uint32_t)in.tiles_y,
+            in.tile_count, (uint32_t)(g.frame_bpr / 4),
+            (uint32_t)in.width_plane_off, (uint32_t)in.seed_plane_off,
+            (uint32_t)in.payload_off
+        };
+
+        id<MTLCommandBuffer> cb = [g.queue commandBuffer];
+        id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+        [ce setComputePipelineState:g.dpcmPipe];
+        [ce setBuffer:up offset:0 atIndex:0];
+        [ce setBuffer:up offset:in.group_table_off atIndex:1];
+        [ce setBuffer:g.frame offset:0 atIndex:2];
+        [ce setBytes:&P length:sizeof(P) atIndex:3];
+        [ce dispatchThreadgroups:MTLSizeMake(in.tile_count, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        [ce endEncoding];
+
+        /* TBD1 carries 8 bits per channel, so the view is BGRA8 and the shader
+         * dithers it into the 10-bit drawable — which is what macOS does with
+         * 8-bit content everywhere else, and what stops desktop gradients
+         * banding here. */
+        return tb_present(cb, g.frame, MTLStorageModePrivate, 0);
+    }
 }
