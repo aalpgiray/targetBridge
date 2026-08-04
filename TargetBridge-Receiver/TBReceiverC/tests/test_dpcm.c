@@ -8,7 +8,7 @@
  * round-tripping real-shaped content and on rejecting malformed blobs, since
  * tb_dpcm_parse is what lets the shader skip bounds checks entirely. */
 
-#include "../src/tb_dpcm.h"
+#include "tb_dpcm.h"
 
 #include <stdio.h>
 #include <stdlib.h>

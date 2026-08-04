@@ -13,6 +13,18 @@ enum TBMonitorPacketType: UInt8 {
     /// free — ScreenCaptureKit attaches the WindowServer's own dirty rects —
     /// and a typical desktop changes a few percent of its pixels per frame.
     case rawDamage = 0x24
+    /// A whole frame, losslessly compressed with tile-DPCM (see tb_dpcm.h).
+    ///
+    /// Covers what damage rectangles cannot: fullscreen video and fast
+    /// scrolling, where most of the screen really is new every frame. Measured
+    /// 2.96x on near-worst-case photographic content and 4.5-14x on desktop
+    /// content, which is enough that the receiver stops needing damage
+    /// rectangles at all — a compressed full frame fits inside a 60 Hz period
+    /// on its own, so this path sends whole frames and keeps no base image.
+    ///
+    /// Only sent to a receiver that advertised `supportsDPCM`, which it does
+    /// only if its GPU decoder actually built.
+    case rawDPCM = 0x25
     case heartbeat = 0x30
     case teardown = 0x31
     case cursor = 0x32
@@ -56,6 +68,11 @@ struct TBMonitorDisplayProfile: Codable {
     /// Absent on receivers older than the Float32 audio change, which is the
     /// point: audio stays Int16 for them rather than arriving as noise.
     var supportsFloat32Audio: Bool?
+    /// Whether the receiver can decode tile-DPCM frames on its GPU. Absent means
+    /// no, which is also what an older receiver says by saying nothing. The
+    /// receiver only claims this if the compute pipeline actually built, since
+    /// decoding on a CPU is far too slow at 5K to stand in.
+    var supportsDPCM: Bool?
     var inputMonitoringTrusted: Bool?
     var accessibilityTrusted: Bool?
     /// Optional so older receivers still decode; absent means "cannot".

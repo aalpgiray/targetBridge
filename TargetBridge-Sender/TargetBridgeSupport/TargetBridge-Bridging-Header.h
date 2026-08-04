@@ -12,6 +12,10 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 
+// The wire codec, shared verbatim with the receiver so both ends cannot drift
+// apart on a format neither of them owns alone.
+#import "tb_dpcm.h"
+
 // MARK: - CGVirtualDisplay Private API (macOS 14+)
 
 @interface CGVirtualDisplayDescriptor : NSObject

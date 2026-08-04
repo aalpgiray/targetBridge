@@ -410,6 +410,19 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// Send only changed rectangles instead of whole frames. Set from the
     /// session's user-facing toggle before start().
     var damageEnabled = true
+    /// Whether the receiver can decode tile-DPCM on its GPU, from its display
+    /// profile. A receiver that says nothing is an older one and keeps getting
+    /// uncompressed frames. Set before start().
+    ///
+    /// When this is on, damage is not used at all: a compressed full frame fits
+    /// inside a 60 Hz period, and the receiver decodes into VRAM where there is
+    /// no CPU-side image for a rectangle to patch.
+    var dpcmEnabled = false
+    /// Reused across frames. An encoded frame is tens of megabytes and this runs
+    /// at up to 60 Hz, so allocating per frame would fault in fresh pages every
+    /// time — the same cost that made SDL's Metal backend unusable on the
+    /// receiver.
+    private var dpcmBuffer: [UInt8] = []
     private var framesSinceKeyframe = 0
     /// Set whenever a frame is skipped (backpressure) or anything else could
     /// have left the receiver's base image stale. Forces one full frame.
@@ -899,6 +912,58 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 probeAlphaConstant(base, width: width, height: height, stride: stride)
             }
             let fmt: UInt8 = isTenBit ? 3 : 2
+
+            // Lossless tile-DPCM, when the receiver can decode it on its GPU.
+            //
+            // This replaces both the full-frame and the damage paths rather than
+            // layering on top of them. A compressed frame is ~20 MB at 5K in the
+            // worst case and ~4 MB on ordinary desktop content, which the
+            // receiver takes ~8 ms to read and ~7.5 ms to decode — inside a 60 Hz
+            // period without any incremental update. Damage would buy nothing
+            // here and cost a great deal: the decoded frame lives in the
+            // receiver's VRAM, where there is no CPU-side copy to patch.
+            //
+            // 8-bit only. TBD1 codes three 8-bit channels, and the 10-bit path
+            // carries 2-10-10-10; the extra depth measured invisible on this
+            // panel anyway, since the virtual display's framebuffer is 8-bit.
+            if dpcmEnabled, !isTenBit, secondaryConnection == nil {
+                let cap = tb_dpcm_max_size(Int32(width), Int32(height))
+                if dpcmBuffer.count < cap { dpcmBuffer = [UInt8](repeating: 0, count: cap) }
+                let written = dpcmBuffer.withUnsafeMutableBufferPointer { dst in
+                    tb_dpcm_encode(base.assumingMemoryBound(to: UInt8.self),
+                                   Int32(stride), Int32(width), Int32(height),
+                                   dst.baseAddress, cap)
+                }
+                if written > 0 {
+                    // Nothing incremental is in flight, so a later fall back to
+                    // the uncompressed path must start from a full frame.
+                    needsKeyframe = true
+                    lastDamageW = 0
+                    lastDamageH = 0
+                    carriedDirty.removeAll(keepingCapacity: true)
+
+                    let pkt = TBMonitorProtocol.makePacket(
+                        type: .rawDPCM,
+                        payload: dpcmBuffer.withUnsafeBufferPointer {
+                            Data(bytes: $0.baseAddress!, count: written)
+                        })
+                    pendingVideoPackets += 1
+                    targetConnection.send(content: pkt, completion: .contentProcessed({ [weak self] _ in
+                        guard let self else { return }
+                        self.queue.async {
+                            self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+                        }
+                    }))
+                    lock.lock()
+                    _sentFrames += 1
+                    _rawFormatIsBGRA = true
+                    _rawFormatIsTenBit = false
+                    lock.unlock()
+                    return
+                }
+                // Encoder refused (only possible on a bad size or capacity):
+                // fall through and send the frame uncompressed.
+            }
 
             // Damage path: resend only what the WindowServer says changed.
             // A full frame is still required on the first frame, on any format
@@ -1577,6 +1642,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// False until the receiver says otherwise, so an unknown receiver gets the
     /// older format instead of noise.
     private var receiverSupportsFloat32Audio = false
+    private var receiverSupportsDPCM = false
     private var activeProfile: TBMonitorDisplayProfile?
     private var activeCodecType: CMVideoCodecType?
     private var activeCodecName: String?
@@ -2818,6 +2884,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // than requiring both ends to be updated together.
         receiverSupportsFloat32Audio = profile.supportsFloat32Audio ?? false
         audioConverter.setFloatOutput(receiverSupportsFloat32Audio)
+        // The profile normally arrives before the pipeline is built, so the
+        // value is stored and applied at construction; the optional assignment
+        // covers a profile that turns up on an already-running pipeline.
+        receiverSupportsDPCM = profile.supportsDPCM ?? false
+        pipeline?.dpcmEnabled = receiverSupportsDPCM
         receiverSupportsNightShift = profile.supportsNightShift ?? false
         receiverSupportsTrueTone = profile.supportsTrueTone ?? false
         receiverPanelText = TBDisplaySenderL10n.receiverSummary(profile, language: language)
@@ -2937,6 +3008,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 }
             )
             pipeline.damageEnabled = damageRects
+            pipeline.dpcmEnabled = receiverSupportsDPCM
             guard pipeline.start() else { return false }
             startAudioDeviceCaptureIfNeeded()
             self.pipeline = pipeline
