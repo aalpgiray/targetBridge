@@ -423,6 +423,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// time — the same cost that made SDL's Metal backend unusable on the
     /// receiver.
     private var dpcmBuffer: [UInt8] = []
+    /// The compression ratio is worth seeing once per session, not 60 times a
+    /// second.
+    private var dpcmLogged = false
     private var framesSinceKeyframe = 0
     /// Set whenever a frame is skipped (backpressure) or anything else could
     /// have left the receiver's base image stale. Forces one full frame.
@@ -935,6 +938,11 @@ private final class TBVideoPipeline: @unchecked Sendable {
                                    dst.baseAddress, cap)
                 }
                 if written > 0 {
+                    if !dpcmLogged {
+                        dpcmLogged = true
+                        let raw = stride * height
+                        TBLog.connection.info("dpcm: \(width, privacy: .public)x\(height, privacy: .public) \(raw / 1_000_000, privacy: .public) MB -> \(written / 1_000_000, privacy: .public) MB (\(String(format: "%.2fx", Double(raw) / Double(written)), privacy: .public))")
+                    }
                     // Nothing incremental is in flight, so a later fall back to
                     // the uncompressed path must start from a full frame.
                     needsKeyframe = true
@@ -2889,6 +2897,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // covers a profile that turns up on an already-running pipeline.
         receiverSupportsDPCM = profile.supportsDPCM ?? false
         pipeline?.dpcmEnabled = receiverSupportsDPCM
+        TBLog.connection.info("receiver caps: dpcm=\(self.receiverSupportsDPCM, privacy: .public) float32Audio=\(self.receiverSupportsFloat32Audio, privacy: .public)")
         receiverSupportsNightShift = profile.supportsNightShift ?? false
         receiverSupportsTrueTone = profile.supportsTrueTone ?? false
         receiverPanelText = TBDisplaySenderL10n.receiverSummary(profile, language: language)

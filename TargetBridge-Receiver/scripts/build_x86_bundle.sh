@@ -23,7 +23,7 @@
 #   ./build_x86_bundle.sh              build the bundle
 #   ./build_x86_bundle.sh --clean      discard the staged toolchain first
 #
-# Output: dist/TargetBridge Receiver.app, ad-hoc signed, no dependencies.
+# Output: dist/TBReceiver.app, ad-hoc signed, no dependencies.
 
 set -euo pipefail
 
@@ -41,7 +41,7 @@ LANGUAGES="$(cd "$RECEIVER/../TargetBridge-Shared/Languages" && pwd)"
 CACHE="${TB_X86_CACHE:-$HOME/Library/Caches/TargetBridge/x86-toolchain}"
 STAGE="$CACHE/stage"
 OUT="$HERE/dist"
-APP="$OUT/TargetBridge Receiver.app"
+APP="$OUT/TBReceiver.app"
 
 if [ "${1:-}" = "--clean" ]; then
     echo "==> discarding $CACHE"
@@ -164,7 +164,7 @@ echo "==> assembling bundle"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Frameworks" "$APP/Contents/Resources"
 
-cp "$OBJ/tbreceiver" "$APP/Contents/MacOS/TargetBridge Receiver"
+cp "$OBJ/tbreceiver" "$APP/Contents/MacOS/TBReceiver"
 ditto "$STAGE/SDL2.framework" "$APP/Contents/Frameworks/SDL2.framework"
 # Resolve the symlinks: a bundle carries the real file, not a link into a
 # staging directory that will not exist on the target machine.
@@ -181,7 +181,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleExecutable</key><string>TargetBridge Receiver</string>
+	<key>CFBundleExecutable</key><string>TBReceiver</string>
 	<key>CFBundleIdentifier</key><string>com.targetbridge.receiver</string>
 	<key>CFBundleName</key><string>TargetBridge Receiver</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
@@ -199,7 +199,7 @@ PLIST
 
 # Point the executable at the copies inside the bundle rather than at the
 # staging directory it was linked against.
-BIN="$APP/Contents/MacOS/TargetBridge Receiver"
+BIN="$APP/Contents/MacOS/TBReceiver"
 for lib in libavcodec libavutil libswscale; do
     old="$(otool -L "$BIN" | awk -v l="$lib" '$1 ~ l {print $1; exit}')"
     [ -n "$old" ] && install_name_tool -change "$old" "@loader_path/../Frameworks/$lib.dylib" "$BIN"
