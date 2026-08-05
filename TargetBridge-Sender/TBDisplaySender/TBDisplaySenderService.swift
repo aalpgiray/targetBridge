@@ -441,6 +441,23 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// packets actually going out. Ragged capture means the compositor is doing
     /// this and it is not ours to fix; clean capture with ragged send means we
     /// are the cause.
+    /// Latency accounting, to replace guesses with measurements.
+    ///
+    /// The end-to-end estimate had four assumed terms and only three measured
+    /// ones, and the assumptions were the biggest. Two of them can be measured
+    /// here with no cross-machine clock sync at all, because a sample buffer's
+    /// presentation timestamp is on the host time clock:
+    ///
+    ///   delivery = now - PTS at callback entry, i.e. how long the compositor and
+    ///              ScreenCaptureKit took to hand us a frame after it existed.
+    ///              This was the single largest assumed term (~8 ms, a guess).
+    ///   process  = callback entry to the send call, i.e. encode plus the copies.
+    ///              Bounds what pipelining the encoder or removing a copy could
+    ///              possibly win, before building either.
+    private var latDeliverySum = 0.0, latDeliveryMax = 0.0
+    private var latProcessSum = 0.0, latProcessMax = 0.0
+    private var latSamples = 0
+
     private var capCadenceBin = [Int](repeating: 0, count: 8)
     private var sendCadenceBin = [Int](repeating: 0, count: 8)
     private var capCadenceCount = 0
@@ -799,8 +816,20 @@ private final class TBVideoPipeline: @unchecked Sendable {
         return max(0, min(7, periods))
     }
 
+    /// Host-clock seconds, the same timebase sample buffer timestamps use.
+    private static func hostNow() -> Double {
+        CMClockGetTime(CMClockGetHostTimeClock()).seconds
+    }
+
     private func noteCapture(_ sampleBuffer: CMSampleBuffer) {
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+        let delivery = (Self.hostNow() - pts) * 1000.0
+        // Negative or absurd values mean the buffer is not on the host clock as
+        // expected; ignore rather than poison the average.
+        if delivery > 0, delivery < 500 {
+            latDeliverySum += delivery
+            latDeliveryMax = max(latDeliveryMax, delivery)
+        }
         if lastCapturePTS > 0, pts > lastCapturePTS {
             capCadenceBin[cadenceBin(pts - lastCapturePTS)] += 1
             capCadenceCount += 1
@@ -817,6 +846,13 @@ private final class TBVideoPipeline: @unchecked Sendable {
         }
         TBLog.connection.info("cadence capture(pts) \(fmt(self.capCadenceBin), privacy: .public)")
         TBLog.connection.info("cadence send(wall)   \(fmt(self.sendCadenceBin), privacy: .public)  drops \(self.cadenceDrops, privacy: .public)")
+        if latSamples > 0 {
+            let n = Double(latSamples)
+            TBLog.connection.info("latency delivery \(String(format: "%.1f", self.latDeliverySum / n), privacy: .public) ms avg / \(String(format: "%.1f", self.latDeliveryMax), privacy: .public) max | process \(String(format: "%.1f", self.latProcessSum / n), privacy: .public) ms avg / \(String(format: "%.1f", self.latProcessMax), privacy: .public) max")
+        }
+        latDeliverySum = 0; latDeliveryMax = 0
+        latProcessSum = 0; latProcessMax = 0
+        latSamples = 0
         capCadenceBin = [Int](repeating: 0, count: 8)
         sendCadenceBin = [Int](repeating: 0, count: 8)
         capCadenceCount = 0
@@ -834,6 +870,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
         noteCapture(sampleBuffer)
+        let frameEnteredAt = Self.hostNow()
         let planar = CVPixelBufferGetPlaneCount(pixelBuffer) >= 2
 
         // Dual-cable: alternate whole frames across the two links (even →
@@ -1043,6 +1080,12 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     let pkt = TBMonitorProtocol.makePacket(
                         type: .rawDPCM,
                         payload: Data(bytes: blob, count: written))
+                    let process = (Self.hostNow() - frameEnteredAt) * 1000.0
+                    if process >= 0, process < 500 {
+                        latProcessSum += process
+                        latProcessMax = max(latProcessMax, process)
+                        latSamples += 1
+                    }
                     pendingVideoPackets += 1
                     noteSend()
                     targetConnection.send(content: pkt, completion: .contentProcessed({ [weak self] _ in
