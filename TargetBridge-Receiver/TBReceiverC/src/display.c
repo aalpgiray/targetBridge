@@ -667,7 +667,65 @@ static struct {
     double last_report_ms;
 } tb_frame_stats;
 
+/* Presentation cadence, in units of the 60 Hz refresh period.
+ *
+ * Diagnostic for judder on low-frame-rate content. 25 fps on a 60 Hz panel can
+ * only ever be shown as an alternating 2-then-3 refresh pattern (2.4 periods per
+ * frame, and fractions of a refresh do not exist). That REGULAR pattern is what
+ * a native player produces and it looks fine — 24 fps film has been watched that
+ * way for decades. What the eye objects to is an IRREGULAR one.
+ *
+ * Vsync quantises presentation into 16.67 ms slots, so it absorbs arrival jitter
+ * only while total latency varies by less than one slot. Ours may not: encode is
+ * 4-8 ms depending on content and wire time 8-16 ms depending on compressed
+ * size, which swings hard on video because busy frames compress worse. If the
+ * spread crosses a slot boundary, frames land in the wrong slot and a clean
+ * 2,3,2,3 becomes 2,4,1,3.
+ *
+ * So this bins the gap between presentations by how many refresh periods it
+ * spans. A tidy two-column histogram at 2 and 3 means our timing is clean and
+ * the judder is elsewhere; anything smeared across 1, 4 and 5 is us, and the
+ * spread says how much buffering it would take to absorb. */
+#define TB_REFRESH_MS 16.667
+#define TB_CADENCE_BINS 8
+static struct {
+    double   last_present_ms;
+    uint32_t bin[TB_CADENCE_BINS];   /* index = refresh periods, clamped */
+    uint32_t frames;
+    double   worst_ms, best_ms;
+} tb_cadence;
+
+static void tb_cadence_note(double now) {
+    if (tb_cadence.last_present_ms > 0.0) {
+        const double gap = now - tb_cadence.last_present_ms;
+        /* Round to nearest whole refresh: a frame shown for 2 periods lands at
+         * ~33 ms, one shown for 3 at ~50, and we want those as 2 and 3 rather
+         * than as a continuum. */
+        int periods = (int)(gap / TB_REFRESH_MS + 0.5);
+        if (periods < 0) periods = 0;
+        if (periods >= TB_CADENCE_BINS) periods = TB_CADENCE_BINS - 1;
+        tb_cadence.bin[periods]++;
+        if (gap > tb_cadence.worst_ms) tb_cadence.worst_ms = gap;
+        if (tb_cadence.best_ms == 0.0 || gap < tb_cadence.best_ms) tb_cadence.best_ms = gap;
+        tb_cadence.frames++;
+    }
+    tb_cadence.last_present_ms = now;
+
+    if (tb_cadence.frames < 240) return;   /* ~10 s of 25 fps content */
+    fprintf(stderr, "[cadence] over %u frames, gap in 60Hz periods:", tb_cadence.frames);
+    for (int i = 0; i < TB_CADENCE_BINS; ++i) {
+        if (!tb_cadence.bin[i]) continue;
+        fprintf(stderr, "  %d:%u (%.0f%%)", i, tb_cadence.bin[i],
+                100.0 * tb_cadence.bin[i] / tb_cadence.frames);
+    }
+    fprintf(stderr, "   best %.1f ms worst %.1f ms\n", tb_cadence.best_ms, tb_cadence.worst_ms);
+    memset(tb_cadence.bin, 0, sizeof(tb_cadence.bin));
+    tb_cadence.frames = 0;
+    tb_cadence.worst_ms = tb_cadence.best_ms = 0.0;
+}
+
 static void tb_frame_stats_add(const char *tag, double upload_ms, double present_ms) {
+    tb_cadence_note(tb_now_ms());
     tb_frame_stats.upload_ms  += upload_ms;
     tb_frame_stats.present_ms += present_ms;
     tb_frame_stats.frames++;
