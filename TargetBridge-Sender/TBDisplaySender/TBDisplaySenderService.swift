@@ -426,6 +426,28 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// Created lazily because building it compiles shaders, and nil if this Mac
     /// cannot host it — in which case frames go out uncompressed rather than
     /// stalling the capture queue on a software encoder.
+    /// Cadence diagnostic for judder on low-frame-rate content.
+    ///
+    /// The receiver showed 25 fps arriving at the right AVERAGE rate (2.39
+    /// refresh periods per frame, against the 2.4 that 25 fps demands) but
+    /// smeared across gaps of 1 to 5 periods instead of a clean alternating 2
+    /// and 3. Its own loop was idle 80% of the time, so the irregularity is
+    /// already present by the time frames reach it.
+    ///
+    /// These two histograms split what is left. `capture` bins the interval
+    /// between sample buffers' own PRESENTATION TIMESTAMPS — when the compositor
+    /// produced each frame, independent of any delay our queue adds, so it
+    /// measures what we were handed. `send` bins wall-clock intervals between
+    /// packets actually going out. Ragged capture means the compositor is doing
+    /// this and it is not ours to fix; clean capture with ragged send means we
+    /// are the cause.
+    private var capCadenceBin = [Int](repeating: 0, count: 8)
+    private var sendCadenceBin = [Int](repeating: 0, count: 8)
+    private var capCadenceCount = 0
+    private var lastCapturePTS: Double = 0
+    private var lastSendAt: Double = 0
+    private var cadenceDrops = 0
+
     private var dpcmGPU: OpaquePointer?
     private var dpcmGPUTried = false
     /// The compression ratio is worth seeing once per session, not 60 times a
@@ -769,10 +791,49 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// and send them uncompressed. The receiver blits them directly (no decode).
     /// Payload: [1: format=1(NV12)][BE32 w][BE32 h][BE32 yStride][BE32 uvStride]
     ///          [Y plane: yStride*h][CbCr plane: uvStride*(h/2)]
+    /// One 60 Hz refresh period, the unit both cadence histograms are binned in.
+    private static let refreshPeriod = 1.0 / 60.0
+
+    private func cadenceBin(_ seconds: Double) -> Int {
+        let periods = Int((seconds / Self.refreshPeriod).rounded())
+        return max(0, min(7, periods))
+    }
+
+    private func noteCapture(_ sampleBuffer: CMSampleBuffer) {
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
+        if lastCapturePTS > 0, pts > lastCapturePTS {
+            capCadenceBin[cadenceBin(pts - lastCapturePTS)] += 1
+            capCadenceCount += 1
+        }
+        lastCapturePTS = pts
+
+        guard capCadenceCount >= 240 else { return }
+        func fmt(_ bins: [Int]) -> String {
+            let total = max(1, bins.reduce(0, +))
+            return bins.enumerated()
+                .filter { $0.element > 0 }
+                .map { "\($0.offset):\($0.element) (\(Int(100.0 * Double($0.element) / Double(total)))%)" }
+                .joined(separator: "  ")
+        }
+        TBLog.connection.info("cadence capture(pts) \(fmt(self.capCadenceBin), privacy: .public)")
+        TBLog.connection.info("cadence send(wall)   \(fmt(self.sendCadenceBin), privacy: .public)  drops \(self.cadenceDrops, privacy: .public)")
+        capCadenceBin = [Int](repeating: 0, count: 8)
+        sendCadenceBin = [Int](repeating: 0, count: 8)
+        capCadenceCount = 0
+        cadenceDrops = 0
+    }
+
+    private func noteSend() {
+        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        if lastSendAt > 0 { sendCadenceBin[cadenceBin(now - lastSendAt)] += 1 }
+        lastSendAt = now
+    }
+
     private func sendRawFrame(_ sampleBuffer: CMSampleBuffer) {
         guard running,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
+        noteCapture(sampleBuffer)
         let planar = CVPixelBufferGetPlaneCount(pixelBuffer) >= 2
 
         // Dual-cable: alternate whole frames across the two links (even →
@@ -799,6 +860,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
             } else {
                 needsKeyframe = true
             }
+            cadenceDrops += 1
             return
         }
 
@@ -982,6 +1044,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
                         type: .rawDPCM,
                         payload: Data(bytes: blob, count: written))
                     pendingVideoPackets += 1
+                    noteSend()
                     targetConnection.send(content: pkt, completion: .contentProcessed({ [weak self] _ in
                         guard let self else { return }
                         self.queue.async {
