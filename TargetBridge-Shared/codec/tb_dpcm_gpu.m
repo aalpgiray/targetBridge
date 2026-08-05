@@ -271,6 +271,11 @@ size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
                           const uint8_t *src, int stride, int w, int h,
                           int ten_bit, const uint8_t **out_blob) {
     if (!e || !src || !out_blob || w <= 0 || h <= 0 || stride < w * 4) return 0;
+    /* Same pixel cap as the C codec, for the same reason: every bit offset the
+     * kernels compute is a uint. tb_dpcm_max_size() enforces it too (returning
+     * 0 makes ensure_buffer fail), but checking here keeps the failure mode a
+     * clean refusal instead of a zero-sized allocation. */
+    if ((uint64_t)w * (uint64_t)h > ((uint64_t)1 << 27)) return 0;
     /* The shaders index the source as 32-bit words, so a row must be a whole
      * number of them. Every CVPixelBuffer stride is, but an arbitrary caller's
      * might not be. */

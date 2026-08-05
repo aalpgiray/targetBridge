@@ -159,8 +159,19 @@ static void geom_of(int w, int h, struct geom *g) {
     g->payload_off     = g->seed_plane_off  + g->seed_plane_bytes;
 }
 
+/* Every bit offset in the format — the group table, and every position a shader
+ * computes — is 32 bits. The worst-case payload is 30 bits per pixel, so total
+ * pixels must stay below 2^32/30; 2^27 (134M, four 5K frames) keeps the widest
+ * blob under 2^32 with margin. Without this cap the parser's offset
+ * cross-check would compare truncated values and could bless a blob whose
+ * offsets wrap in the shader. */
+static inline int dims_ok(int w, int h) {
+    return w > 0 && h > 0 && w <= 16384 && h <= 16384 &&
+           (uint64_t)w * (uint64_t)h <= (uint64_t)1 << 27;
+}
+
 size_t tb_dpcm_max_size(int w, int h) {
-    if (w <= 0 || h <= 0) return 0;
+    if (!dims_ok(w, h)) return 0;
     struct geom g;
     geom_of(w, h, &g);
     /* Worst case is the deeper format at its widest: 10 bits per coded sample,
@@ -216,7 +227,7 @@ static inline size_t group_align(size_t bitpos, uint32_t t) {
 
 size_t tb_dpcm_encode(const uint8_t *src, int stride, int w, int h,
                       int ten_bit, uint8_t *dst, size_t dst_cap) {
-    if (!src || !dst || w <= 0 || h <= 0 || stride < w * 4) return 0;
+    if (!src || !dst || !dims_ok(w, h) || stride < w * 4) return 0;
 
     struct geom g;
     geom_of(w, h, &g);
@@ -319,9 +330,7 @@ int tb_dpcm_parse(const uint8_t *src, size_t len, struct tb_dpcm_info *out) {
 
     const uint32_t w = get_u32(src + 4);
     const uint32_t h = get_u32(src + 8);
-    /* 16384 is far above any real display and keeps every product below from
-     * overflowing 32 bits. */
-    if (w == 0 || h == 0 || w > 16384 || h > 16384) return -1;
+    if (!dims_ok((int)w, (int)h)) return -1;
     if (src[12] != 3 || src[13] != TB_DPCM_CHANNELS) return -1;
 
     const uint8_t flags = src[14];

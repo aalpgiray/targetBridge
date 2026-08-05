@@ -500,6 +500,13 @@ private final class TBVideoPipeline: @unchecked Sendable {
             vtEncoder = nil
             vtEncoderRef?.release()
             vtEncoderRef = nil
+            // The DPCM encoder holds a Metal device and ~60-90 MB of reusable
+            // buffers; without this every session start/stop stranded a copy.
+            // Safe here for the same reason the VT teardown is: `queue` is
+            // serial, so no encode is mid-flight when this runs.
+            if let e = dpcmGPU { tb_dpcm_gpu_destroy(e) }
+            dpcmGPU = nil
+            dpcmGPUTried = false
         }
     }
 
