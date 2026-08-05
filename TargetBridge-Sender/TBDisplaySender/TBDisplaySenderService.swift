@@ -441,37 +441,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// packets actually going out. Ragged capture means the compositor is doing
     /// this and it is not ours to fix; clean capture with ragged send means we
     /// are the cause.
-    /// Cadence pacing: send each frame at the interval the COMPOSITOR produced
-    /// it at, not at whatever moment encode happened to finish.
-    ///
-    /// Measured cause of judder on 25 fps content. The compositor hands us a
-    /// correct pulldown pattern — gaps of 2 and 3 refresh periods, which is the
-    /// only way 25 fps can be shown on a 60 Hz display — but our per-frame
-    /// processing varies by roughly +/-8 ms (encode 4-8 ms, plus queue
-    /// scheduling). A 2-period gap is 33 ms, and 8 ms either side of that lands
-    /// under 25 ms or over 42 ms, i.e. in the 1-period or 3-period bin. So an
-    /// evenly spaced pair went out unevenly: 108 two-period gaps arrived and 8
-    /// left, the rest redistributed into 1s and 3s. Average rate was always
-    /// correct; only the spacing was wrong, and irregular spacing is what the eye
-    /// objects to — a REGULAR 2,3,2,3 is how 24 fps film has always been shown.
-    ///
-    /// Sample buffers carry exact presentation timestamps, so the original
-    /// spacing is knowable rather than guessable. Each send is scheduled at the
-    /// previous send plus the true PTS delta.
-    ///
-    /// Deliberately capped at `pacingMaxHold`: this exists to remove jitter, not
-    /// to become a buffer, and every millisecond held is added latency on
-    /// interactive content too. A frame already late goes immediately and the
-    /// clock resynchronises, so the pacer can never accumulate delay.
-    private var paceLastPTS: Double = 0
-    private var paceNextSendAt: Double = 0
-    private static let pacingMaxHold = 2.0 / 60.0
-    /// `defaults write com.targetbridge.sender TBPacing -bool false` to A/B it.
-    private lazy var pacingEnabled: Bool = {
-        if UserDefaults.standard.object(forKey: "TBPacing") == nil { return true }
-        return UserDefaults.standard.bool(forKey: "TBPacing")
-    }()
-
     private var capCadenceBin = [Int](repeating: 0, count: 8)
     private var sendCadenceBin = [Int](repeating: 0, count: 8)
     private var capCadenceCount = 0
@@ -854,27 +823,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
         cadenceDrops = 0
     }
 
-    /// When this frame should go out, in `DispatchTime` uptime seconds. Returns
-    /// `now` when pacing is off or we are already behind.
-    private func paceDeadline(forPTS pts: Double, now: Double) -> Double {
-        guard pacingEnabled else { return now }
-        defer { paceLastPTS = pts }
-
-        // First frame, or a discontinuity (session restart, clock reset): start
-        // the cadence clock here rather than extrapolating from a stale anchor.
-        guard paceLastPTS > 0, pts > paceLastPTS else {
-            paceNextSendAt = now
-            return now
-        }
-        // max() keeps the schedule monotonic, which is what keeps frames in
-        // order: a later frame can never be scheduled before an earlier one that
-        // is still waiting.
-        var target = max(paceNextSendAt + (pts - paceLastPTS), now)
-        if target > now + Self.pacingMaxHold { target = now + Self.pacingMaxHold }
-        paceNextSendAt = target
-        return target
-    }
-
     private func noteSend() {
         let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
         if lastSendAt > 0 { sendCadenceBin[cadenceBin(now - lastSendAt)] += 1 }
@@ -1095,30 +1043,14 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     let pkt = TBMonitorProtocol.makePacket(
                         type: .rawDPCM,
                         payload: Data(bytes: blob, count: written))
-                    // Safe to defer because `pkt` already owns its bytes — the
-                    // encoder reuses its output buffer, which is why the copy
-                    // above exists.
-                    let emit = { [weak self] in
-                        guard let self, self.running else { return }
-                        self.pendingVideoPackets += 1
-                        self.noteSend()
-                        targetConnection.send(content: pkt, completion: .contentProcessed({ [weak self] _ in
-                            guard let self else { return }
-                            self.queue.async {
-                                self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
-                            }
-                        }))
-                    }
-                    let nowSec = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
-                    let hold = paceDeadline(forPTS: CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds,
-                                            now: nowSec) - nowSec
-                    // Sub-millisecond holds are not worth a dispatch hop, and
-                    // asyncAfter cannot resolve them anyway.
-                    if hold > 0.001 {
-                        queue.asyncAfter(deadline: .now() + hold, execute: emit)
-                    } else {
-                        emit()
-                    }
+                    pendingVideoPackets += 1
+                    noteSend()
+                    targetConnection.send(content: pkt, completion: .contentProcessed({ [weak self] _ in
+                        guard let self else { return }
+                        self.queue.async {
+                            self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+                        }
+                    }))
                     lock.lock()
                     _sentFrames += 1
                     _rawFormatIsBGRA = true
