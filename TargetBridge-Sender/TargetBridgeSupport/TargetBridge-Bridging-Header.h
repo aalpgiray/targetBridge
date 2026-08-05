@@ -15,6 +15,7 @@
 // The wire codec, shared verbatim with the receiver so both ends cannot drift
 // apart on a format neither of them owns alone.
 #import "tb_dpcm.h"
+#import "tb_dpcm_gpu.h"
 
 // MARK: - CGVirtualDisplay Private API (macOS 14+)
 

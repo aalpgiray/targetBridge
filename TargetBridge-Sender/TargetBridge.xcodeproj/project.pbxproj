@@ -48,6 +48,7 @@
 		C1A77120267A12D9E355DCEA /* network-link.json in Resources */ = {isa = PBXBuildFile; fileRef = 6579B499CBC11196966318EA /* network-link.json */; };
 		C2CCAB017BC3CAB1DCFA5CCC /* TBMonitorProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA01317B43B46B1B323A7008 /* TBMonitorProtocol.swift */; };
 		7BD0C1AA0000000000000003 /* tb_dpcm.c in Sources */ = {isa = PBXBuildFile; fileRef = 7BD0C1AA0000000000000001 /* tb_dpcm.c */; };
+		7BD0C1AA0000000000000013 /* tb_dpcm_gpu.m in Sources */ = {isa = PBXBuildFile; fileRef = 7BD0C1AA0000000000000011 /* tb_dpcm_gpu.m */; };
 		C7A1D4E29B3F45A88C3D0032 /* TBAudioWireFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7A1D4E29B3F45A88C3D0031 /* TBAudioWireFormat.swift */; };
 		CBA7C2F0FA57CC475E2307AF /* TBInputRelayController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E3DC447E3E8E522565E725B /* TBInputRelayController.swift */; };
 		D09EC25DE2C5CA70787BCEB3 /* TBDefaultOutputGuard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D82666B6BF195612AC4F18D /* TBDefaultOutputGuard.swift */; };
@@ -124,6 +125,8 @@
 		DA01317B43B46B1B323A7008 /* TBMonitorProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBMonitorProtocol.swift; sourceTree = "<group>"; };
 		7BD0C1AA0000000000000001 /* tb_dpcm.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; name = tb_dpcm.c; path = "../TargetBridge-Shared/codec/tb_dpcm.c"; sourceTree = SOURCE_ROOT; };
 		7BD0C1AA0000000000000002 /* tb_dpcm.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = tb_dpcm.h; path = "../TargetBridge-Shared/codec/tb_dpcm.h"; sourceTree = SOURCE_ROOT; };
+		7BD0C1AA0000000000000011 /* tb_dpcm_gpu.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = tb_dpcm_gpu.m; path = "../TargetBridge-Shared/codec/tb_dpcm_gpu.m"; sourceTree = SOURCE_ROOT; };
+		7BD0C1AA0000000000000012 /* tb_dpcm_gpu.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = tb_dpcm_gpu.h; path = "../TargetBridge-Shared/codec/tb_dpcm_gpu.h"; sourceTree = SOURCE_ROOT; };
 		C7A1D4E29B3F45A88C3D0031 /* TBAudioWireFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBAudioWireFormat.swift; sourceTree = "<group>"; };
 		DD33D06A2FA6BA7E075A9E46 /* TBDisplaySenderSurfaceViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBDisplaySenderSurfaceViews.swift; sourceTree = "<group>"; };
 		DEBE8642140AD18D80D11FC1 /* TBMicForwarder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBMicForwarder.swift; sourceTree = "<group>"; };
@@ -205,6 +208,8 @@
 				DA01317B43B46B1B323A7008 /* TBMonitorProtocol.swift */,
 				7BD0C1AA0000000000000001 /* tb_dpcm.c */,
 				7BD0C1AA0000000000000002 /* tb_dpcm.h */,
+				7BD0C1AA0000000000000011 /* tb_dpcm_gpu.m */,
+				7BD0C1AA0000000000000012 /* tb_dpcm_gpu.h */,
 				C7A1D4E29B3F45A88C3D0031 /* TBAudioWireFormat.swift */,
 			);
 			path = TBDisplayShared;
@@ -454,6 +459,7 @@
 				DC28CA08C92AF33ECD69EFDF /* TBMicForwarder.swift in Sources */,
 				C2CCAB017BC3CAB1DCFA5CCC /* TBMonitorProtocol.swift in Sources */,
 				7BD0C1AA0000000000000003 /* tb_dpcm.c in Sources */,
+				7BD0C1AA0000000000000013 /* tb_dpcm_gpu.m in Sources */,
 				C7A1D4E29B3F45A88C3D0032 /* TBAudioWireFormat.swift in Sources */,
 				06E4F7B33C77762A5E2CB616 /* TBReceiverDiscovery.swift in Sources */,
 				58980FE95A48D8F8EDB42055 /* TBVirtualDisplayModeMemory.swift in Sources */,

@@ -418,11 +418,16 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// inside a 60 Hz period, and the receiver decodes into VRAM where there is
     /// no CPU-side image for a rectangle to patch.
     var dpcmEnabled = false
-    /// Reused across frames. An encoded frame is tens of megabytes and this runs
-    /// at up to 60 Hz, so allocating per frame would fault in fresh pages every
-    /// time — the same cost that made SDL's Metal backend unusable on the
-    /// receiver.
-    private var dpcmBuffer: [UInt8] = []
+    /// Encoding runs on the GPU. The reference C encoder costs ~118 ms/frame at
+    /// 5K single-threaded; this measures 5.7 ms, and more to the point it leaves
+    /// the CPU to whoever is using the machine, which is the whole reason the
+    /// second display is being driven at all.
+    ///
+    /// Created lazily because building it compiles shaders, and nil if this Mac
+    /// cannot host it — in which case frames go out uncompressed rather than
+    /// stalling the capture queue on a software encoder.
+    private var dpcmGPU: OpaquePointer?
+    private var dpcmGPUTried = false
     /// The compression ratio is worth seeing once per session, not 60 times a
     /// second.
     private var dpcmLogged = false
@@ -934,18 +939,26 @@ private final class TBVideoPipeline: @unchecked Sendable {
             // low bits, and on the panel that detail is the difference between a
             // smooth gradient and a banded one.
             if dpcmEnabled, secondaryConnection == nil {
-                let cap = tb_dpcm_max_size(Int32(width), Int32(height))
-                if dpcmBuffer.count < cap { dpcmBuffer = [UInt8](repeating: 0, count: cap) }
-                let written = dpcmBuffer.withUnsafeMutableBufferPointer { dst in
-                    tb_dpcm_encode(base.assumingMemoryBound(to: UInt8.self),
-                                   Int32(stride), Int32(width), Int32(height),
-                                   isTenBit ? 1 : 0, dst.baseAddress, cap)
+                if !dpcmGPUTried {
+                    dpcmGPUTried = true
+                    dpcmGPU = tb_dpcm_gpu_create()
+                    if let e = dpcmGPU {
+                        TBLog.connection.info("dpcm: gpu encoder on \(String(cString: tb_dpcm_gpu_device_name(e)), privacy: .public)")
+                    } else {
+                        TBLog.connection.error("dpcm: gpu encoder unavailable; sending uncompressed")
+                    }
                 }
-                if written > 0 {
+                var blob: UnsafePointer<UInt8>? = nil
+                let written = dpcmGPU.map {
+                    tb_dpcm_gpu_encode($0, base.assumingMemoryBound(to: UInt8.self),
+                                       Int32(stride), Int32(width), Int32(height),
+                                       isTenBit ? 1 : 0, &blob)
+                } ?? 0
+                if written > 0, let blob {
                     if !dpcmLogged {
                         dpcmLogged = true
                         let raw = stride * height
-                        TBLog.connection.info("dpcm: \(width, privacy: .public)x\(height, privacy: .public) \(raw / 1_000_000, privacy: .public) MB -> \(written / 1_000_000, privacy: .public) MB (\(String(format: "%.2fx", Double(raw) / Double(written)), privacy: .public))")
+                        TBLog.connection.info("dpcm: \(width, privacy: .public)x\(height, privacy: .public) \(isTenBit ? 10 : 8, privacy: .public)-bit \(raw / 1_000_000, privacy: .public) MB -> \(written / 1_000_000, privacy: .public) MB (\(String(format: "%.2fx", Double(raw) / Double(written)), privacy: .public)) \(tb_dpcm_gpu_last_was_zero_copy(self.dpcmGPU!) != 0 ? "zero-copy" : "staged", privacy: .public)")
                     }
                     // Nothing incremental is in flight, so a later fall back to
                     // the uncompressed path must start from a full frame.
@@ -954,11 +967,13 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     lastDamageH = 0
                     carriedDirty.removeAll(keepingCapacity: true)
 
+                    // Copied rather than wrapped: the encoder reuses its output
+                    // buffer on the next frame, and the send is asynchronous. At
+                    // ~30 MB this is around a millisecond, which is not worth the
+                    // buffer-lifetime bookkeeping that avoiding it would need.
                     let pkt = TBMonitorProtocol.makePacket(
                         type: .rawDPCM,
-                        payload: dpcmBuffer.withUnsafeBufferPointer {
-                            Data(bytes: $0.baseAddress!, count: written)
-                        })
+                        payload: Data(bytes: blob, count: written))
                     pendingVideoPackets += 1
                     targetConnection.send(content: pkt, completion: .contentProcessed({ [weak self] _ in
                         guard let self else { return }
