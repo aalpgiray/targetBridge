@@ -12,9 +12,9 @@
  * TWO WAYS A FRAME ARRIVES
  *
  * An uncompressed frame is staged in a shared buffer and presented straight from
- * there, as it always was. A TBD1 frame (tb_dpcm.h) is uploaded compressed —
- * ~20 MB instead of 59 — and expanded by a compute kernel into a private buffer
- * that lives in VRAM.
+ * there, as it always was. A TBD2 frame (tb_dpcm.h) is uploaded compressed and
+ * expanded by a compute kernel into a private buffer that lives in VRAM — at 5K
+ * that is ~20 MB instead of 59 at 8-bit depth, ~32 MB at 10-bit.
  *
  * That the decoded frame lands in VRAM rather than in CPU-visible memory was
  * measured, not assumed: decoding into shared memory costs 17.2 ms/frame on the
@@ -22,14 +22,14 @@
  * budget at 60 Hz.
  *
  * A compressed full frame therefore fits 60 Hz by itself, which is why damage
- * rectangles are not part of the TBD1 path at all — no base image, no patching,
- * no keyframe bookkeeping. Receivers that cannot decode TBD1 still get damage
+ * rectangles are not part of the TBD2 path at all — no base image, no patching,
+ * no keyframe bookkeeping. Receivers that cannot decode TBD2 still get damage
  * packets, patched on the CPU and presented through the uncompressed path, since
  * for them it is the only thing that makes 5K viable.
  *
- * The cursor is composited by the render pass, NOT drawn into the frame. A TBD1
- * frame never exists in CPU-visible memory, so there is nothing to stamp it
- * into.
+ * The cursor is composited by the render pass, NOT drawn into the frame. A
+ * compressed frame never exists in CPU-visible memory, so there is nothing to
+ * stamp it into.
  */
 
 #import <Metal/Metal.h>
@@ -54,6 +54,8 @@ struct tb_dpcm_gpu_params {
     uint32_t tileCount;
     uint32_t outStridePx;
     uint32_t widthOff, seedOff, payOff;
+    uint32_t bits;      /* 8 or 10; channel c sits at bit c*bits */
+    uint32_t alpha;     /* opaque alpha, pre-shifted for this depth */
 };
 
 static struct {
@@ -274,16 +276,20 @@ static NSString *tb_shader_source(void) {
     "struct DpcmParams {\n"
     "  uint width, height, tilesX, tilesY, tileCount, outStridePx;\n"
     "  uint widthOff, seedOff, payOff;\n"
+    "  uint bits, alpha;\n"
     "};\n"
     "static inline uint tb_width_get(device const uchar *plane, uint idx) {\n"
     "  uchar b = plane[idx >> 1];\n"
     "  return (idx & 1u) ? uint(b >> 4) : uint(b & 0xF);\n"
     "}\n"
+    /* n reaches 10 at 10-bit depth and the offset within a byte reaches 7, so a
+     * value can span three bytes. */
     "static inline uint tb_bits_at(device const uchar *buf, uint p, uint n) {\n"
     "  if (n == 0u) return 0u;\n"
     "  uint byte = p >> 3, sh = p & 7u;\n"
     "  uint x = uint(buf[byte]);\n"
-    "  if (sh + n > 8u) x |= uint(buf[byte + 1]) << 8;\n"
+    "  if (sh + n >  8u) x |= uint(buf[byte + 1]) << 8;\n"
+    "  if (sh + n > 16u) x |= uint(buf[byte + 2]) << 16;\n"
     "  return (x >> sh) & ((1u << n) - 1u);\n"
     "}\n"
     "static inline int tb_unzig(uint z) { return int((z >> 1) ^ (~(z & 1u) + 1u)); }\n"
@@ -295,7 +301,7 @@ static NSString *tb_shader_source(void) {
     "                           uint tile [[threadgroup_position_in_grid]],\n"
     "                           uint lane [[thread_position_in_threadgroup]]) {\n"
     "  device const uchar *wp = blob + P.widthOff;\n"
-    "  device const uchar *sp = blob + P.seedOff;\n"
+    "  device const uint  *seeds = (device const uint *)(blob + P.seedOff);\n"
     "  device const uchar *pay = blob + P.payOff;\n"
     "  const uint grp = tile / 64u, idx = tile % 64u;\n"
     "\n"
@@ -330,6 +336,8 @@ static NSString *tb_shader_source(void) {
     "  const uint n0 = tb_width_get(wp, tile * 3u + 0u);\n"
     "  const uint n1 = tb_width_get(wp, tile * 3u + 1u);\n"
     "  const uint n2 = tb_width_get(wp, tile * 3u + 2u);\n"
+    /* The group base the wire carries is already byte-aligned; within a group
+     * residuals are packed with no padding, so the scan is an exact bit sum. */
     "  const uint b0 = gtab[grp] + red[0];\n"
     "  const uint b1 = b0 + n0 * coded;\n"
     "  const uint b2 = b1 + n1 * coded;\n"
@@ -353,12 +361,15 @@ static NSString *tb_shader_source(void) {
     "  for (uint j = 1u; j <= y; ++j) acc += cold[j];\n"
     "  for (uint i = 1u; i <= x; ++i) acc += rowd[y * 8u + i];\n"
     "\n"
-    "  const int3 seed = int3(int(sp[tile * 3u + 0u]),\n"
-    "                         int(sp[tile * 3u + 1u]),\n"
-    "                         int(sp[tile * 3u + 2u]));\n"
-    "  const uint3 v = uint3(seed + acc) & 0xFFu;\n"
+    /* One LE uint32 per tile holds the seed pixel at either depth. */
+    "  const uint mask = (1u << P.bits) - 1u;\n"
+    "  const uint sraw = seeds[tile];\n"
+    "  const int3 seed = int3(int((sraw >> (0u * P.bits)) & mask),\n"
+    "                         int((sraw >> (1u * P.bits)) & mask),\n"
+    "                         int((sraw >> (2u * P.bits)) & mask));\n"
+    "  const uint3 v = uint3(seed + acc) & mask;\n"
     "  out[(tyi * 8u + y) * P.outStridePx + (txi * 8u + x)] =\n"
-    "      0xFF000000u | v.x | (v.y << 8) | (v.z << 16);\n"
+    "      P.alpha | v.x | (v.y << P.bits) | (v.z << (2u * P.bits));\n"
     "}\n";
 }
 
@@ -711,7 +722,7 @@ int tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len) {
      * table agrees. */
     struct tb_dpcm_info in;
     if (tb_dpcm_parse(blob, len, &in) != 0) {
-        fprintf(stderr, "[metal] rejected malformed TBD1 blob (%zu bytes)\n", len);
+        fprintf(stderr, "[metal] rejected malformed TBD2 blob (%zu bytes)\n", len);
         return -1;
     }
 
@@ -733,7 +744,9 @@ int tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len) {
             (uint32_t)in.tiles_x, (uint32_t)in.tiles_y,
             in.tile_count, (uint32_t)(g.frame_bpr / 4),
             (uint32_t)in.width_plane_off, (uint32_t)in.seed_plane_off,
-            (uint32_t)in.payload_off
+            (uint32_t)in.payload_off,
+            in.ten_bit ? 10u : 8u,
+            in.ten_bit ? (3u << 30) : (0xFFu << 24)
         };
 
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
@@ -747,10 +760,11 @@ int tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len) {
            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         [ce endEncoding];
 
-        /* TBD1 carries 8 bits per channel, so the view is BGRA8 and the shader
-         * dithers it into the 10-bit drawable — which is what macOS does with
-         * 8-bit content everywhere else, and what stops desktop gradients
-         * banding here. */
-        return tb_present(cb, g.frame, MTLStorageModePrivate, 0);
+        /* The blob says which depth it carries, so the texture view matches it.
+         * At 8 bits the shader dithers into the 10-bit drawable — what macOS
+         * does with 8-bit content everywhere else. At 10 bits the dither is
+         * still applied but has almost nothing left to spread, because the
+         * samples already resolve the drawable. */
+        return tb_present(cb, g.frame, MTLStorageModePrivate, in.ten_bit);
     }
 }
