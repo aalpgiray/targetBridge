@@ -131,6 +131,15 @@ struct TBMonitorVolume: Codable {
 struct TBMonitorDisplayTweaks: Codable {
     var nightShift: Bool
     var trueTone: Bool
+    /// Whether the receiver waits for its display's refresh boundary before
+    /// presenting. Off trades tearing for up to a refresh period of latency
+    /// (~8 ms at 60 Hz), which measured as the largest addressable term left in
+    /// the end-to-end budget.
+    ///
+    /// Optional so an older receiver — which ignores the key — and an older
+    /// sender — which omits it, leaving the receiver's default of on — both keep
+    /// working.
+    var vsync: Bool?
 }
 
 struct TBMonitorClipboard: Codable {

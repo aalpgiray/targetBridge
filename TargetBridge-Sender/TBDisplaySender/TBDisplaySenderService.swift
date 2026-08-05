@@ -1678,6 +1678,17 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// Night Shift / True Tone on the receiver's own panel. Only offered when
     /// the receiver reports it can honour them (both are private CoreBrightness
     /// features, and True Tone needs supporting hardware).
+    /// Receiver presents without waiting for its refresh boundary. Trades tearing
+    /// for ~8 ms of latency — the largest addressable term left in the budget, and
+    /// a question of taste rather than of measurement, so it is exposed rather
+    /// than decided here.
+    @Published var vsyncEnabled = (UserDefaults.standard.object(forKey: "TBVsync") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(vsyncEnabled, forKey: "TBVsync")
+            if !adoptingReportedTweaks { sendDisplayTweaks() }
+        }
+    }
+
     @Published var nightShiftEnabled = false {
         didSet { if !adoptingReportedTweaks { sendDisplayTweaks() } }
     }
@@ -2526,6 +2537,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func applyReportedDisplayTweaks(_ tweaks: TBMonitorDisplayTweaks) {
+        // vsync is deliberately absent here: the receiver reports the two panel
+        // features it can read back from the hardware, and echoing our own vsync
+        // choice would be a round trip that can only lose information.
         guard nightShiftEnabled != tweaks.nightShift || trueToneEnabled != tweaks.trueTone else { return }
         adoptingReportedTweaks = true
         nightShiftEnabled = tweaks.nightShift
@@ -2536,7 +2550,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private func sendDisplayTweaks() {
         guard let packet = TBMonitorProtocol.makeJSONPacket(
             type: .displayTweaks,
-            value: TBMonitorDisplayTweaks(nightShift: nightShiftEnabled, trueTone: trueToneEnabled)
+            value: TBMonitorDisplayTweaks(nightShift: nightShiftEnabled,
+                                          trueTone: trueToneEnabled,
+                                          vsync: vsyncEnabled)
         ) else { return }
         send(packet)
     }

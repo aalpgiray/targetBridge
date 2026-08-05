@@ -88,7 +88,20 @@ static struct {
     int                   cur_x, cur_y, cur_sw, cur_sh, cur_visible, cur_type;
 
     int                   shown;
+    /* Default on: tearing should be opted into, never inherited. */
+    int                   vsync;
+    int                   vsync_initialised;
 } g;
+
+void tb_metal_plane_set_vsync(int enabled) {
+    const int want = enabled ? 1 : 0;
+    if (g.vsync == want) return;
+    g.vsync = want;
+    /* Applies immediately when a layer exists, and is re-applied at init, so the
+     * choice survives the plane being torn down and rebuilt. */
+    if (g.layer) g.layer.displaySyncEnabled = want ? YES : NO;
+    fprintf(stderr, "[metal] vsync %s\n", want ? "on" : "off (lower latency, may tear)");
+}
 
 void tb_metal_plane_set_cursor(int x, int y, int source_w, int source_h,
                                int visible, int type) {
@@ -378,6 +391,9 @@ static NSString *tb_shader_source(void) {
 int tb_metal_plane_init(SDL_Window *win) {
     if (g.ready) return 0;
     if (!win) return -1;
+    /* `g` is zero-initialised, so without this the first plane would come up
+     * with vsync off — the opposite of the intended default. */
+    if (!g.vsync_initialised) { g.vsync_initialised = 1; g.vsync = 1; }
 
     g.dev = MTLCreateSystemDefaultDevice();
     if (!g.dev) { fprintf(stderr, "[metal] no Metal device\n"); return -1; }
@@ -397,7 +413,7 @@ int tb_metal_plane_init(SDL_Window *win) {
     g.layer.framebufferOnly = NO;
     g.layer.opaque = YES;
     g.layer.maximumDrawableCount = TB_METAL_RING;
-    g.layer.displaySyncEnabled = YES;
+    g.layer.displaySyncEnabled = g.vsync ? YES : NO;
     /* Tag the layer with the space the pixels are actually in, which is what
      * the sender captures: Display P3.
      *

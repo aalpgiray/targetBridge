@@ -28,6 +28,19 @@ int  tb_metal_plane_available(void);
  * compute pipeline must keep receiving uncompressed frames. */
 int  tb_metal_plane_supports_dpcm(void);
 
+/* Present without waiting for the display's refresh boundary.
+ *
+ * Worth up to a full refresh period of latency — ~8 ms on average at 60 Hz, and
+ * the largest single addressable term left in the end-to-end budget (capture
+ * delivery measured 0.05 ms, encode+send 9.2 ms, decode ~5.5 ms, and scanout is
+ * physics). The cost is tearing: a frame can land mid-scanout, so the panel shows
+ * part of two frames with a visible seam.
+ *
+ * Purely a matter of taste, which is why it is a user-facing toggle rather than a
+ * decision taken here. Sticky across plane teardown, since the plane is destroyed
+ * and rebuilt whenever the SDL status UI takes the window back. */
+void tb_metal_plane_set_vsync(int enabled);
+
 /* Show/hide the video plane. Hidden while the SDL status/connecting UI owns
  * the window, shown once frames arrive. */
 void tb_metal_plane_set_hidden(int hidden);

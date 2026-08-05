@@ -150,6 +150,18 @@ final class TBDisplaySenderStatusItemController: NSObject {
                             session?.trueToneEnabled = on
                         })
                 }
+                // Shown unconditionally: unlike Night Shift and True Tone, which
+                // are panel hardware a receiver may not have, this is a property
+                // of the receiver's own render path. An older receiver ignores
+                // the field, which is the same outcome as leaving it alone.
+                toggles.append(TBMenuToggleSpec(
+                    symbol: "arrow.triangle.2.circlepath",
+                    title: vsyncMenuLabel(),
+                    stateText: session.vsyncEnabled ? onWord() : offWord(),
+                    isOn: session.vsyncEnabled) { [weak session] on in
+                        session?.vsyncEnabled = on
+                    })
+
                 if !toggles.isEmpty {
                     let row = TBMenuToggleRowView(specs: toggles,
                                                   width: TBMenuMetrics.width,
@@ -316,6 +328,16 @@ final class TBDisplaySenderStatusItemController: NSObject {
         case .german: return "Aus"
         case .chinese: return "关"
         case .french: return "Désactivé"
+        }
+    }
+
+    /// Kept as "V-Sync" in the Latin-script languages: it is the term the setting
+    /// is universally known by, and translating it would make it harder to
+    /// recognise, not easier.
+    private func vsyncMenuLabel() -> String {
+        switch service.language {
+        case .chinese: return "垂直同步"
+        default: return "V-Sync"
         }
     }
 

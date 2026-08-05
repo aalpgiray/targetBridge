@@ -16,6 +16,7 @@
 #include "net.h"
 #include "decoder.h"
 #include "display.h"
+#include "tb_metal_plane.h"
 #include "proto.h"
 #include "tb_gesture_bridge.h"
 #include "tb_display_tweaks.h"
@@ -1377,6 +1378,10 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
             }
             if (extract_json_bool_field(payload, len, "\"trueTone\"", &tone)) {
                 tb_true_tone_set(tone);
+            }
+            int vsync = 0;
+            if (extract_json_bool_field(payload, len, "\"vsync\"", &vsync)) {
+                tb_metal_plane_set_vsync(vsync);
             }
         }
         break;
