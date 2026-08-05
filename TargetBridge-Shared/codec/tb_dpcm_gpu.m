@@ -269,7 +269,8 @@ static inline void put_u32(uint8_t *p, uint32_t v) {
 
 size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
                           const uint8_t *src, int stride, int w, int h,
-                          int ten_bit, const uint8_t **out_blob) {
+                          int ten_bit, size_t header_reserve,
+                          const uint8_t **out_blob) {
     if (!e || !src || !out_blob || w <= 0 || h <= 0 || stride < w * 4) return 0;
     /* Same pixel cap as the C codec, for the same reason: every bit offset the
      * kernels compute is a uint. tb_dpcm_max_size() enforces it too (returning
@@ -293,11 +294,17 @@ size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
     const size_t seed_plane_off    = width_plane_off + width_plane_bytes;
     const size_t payload_off       = seed_plane_off + seed_plane_bytes;
 
-    if (ensure_buffer(e, &e->blob, &e->blob_cap, tb_dpcm_max_size(w, h)) != 0) return 0;
+    /* Metal requires 4-byte-aligned buffer offsets, and every plane below is
+     * bound at an offset into this buffer — so the blob starts at a padded
+     * boundary and the caller's header sits at the END of the reserved run,
+     * immediately before it. That keeps the header contiguous with the payload
+     * without misaligning anything the GPU touches. */
+    const size_t blob_off = round4(header_reserve);
+    if (ensure_buffer(e, &e->blob, &e->blob_cap, blob_off + tb_dpcm_max_size(w, h)) != 0) return 0;
     if (ensure_buffer(e, &e->meta, &e->meta_cap, (size_t)tile_count * 8) != 0) return 0;
     if (ensure_buffer(e, &e->offs, &e->offs_cap, (size_t)tile_count * 4) != 0) return 0;
 
-    uint8_t *blob = (uint8_t *)e->blob.contents;
+    uint8_t *blob = (uint8_t *)e->blob.contents + blob_off;
 
     @autoreleasepool {
         /* Wrap the caller's pixels without copying when the allocation is page
@@ -337,7 +344,7 @@ size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
         [ce setComputePipelineState:e->analyze];
         [ce setBuffer:srcBuf  offset:0 atIndex:0];
         [ce setBuffer:e->meta offset:0 atIndex:1];
-        [ce setBuffer:e->blob offset:seed_plane_off atIndex:2];
+        [ce setBuffer:e->blob offset:blob_off + seed_plane_off atIndex:2];
         [ce setBytes:&P length:sizeof(P) atIndex:3];
         [ce dispatchThreadgroups:MTLSizeMake(tile_count, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
@@ -406,7 +413,7 @@ size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
         cb = [e->queue commandBuffer];
         id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
         [be fillBuffer:e->blob
-                 range:NSMakeRange(payload_off, round4(payload_bytes) + 4)
+                 range:NSMakeRange(blob_off + payload_off, round4(payload_bytes) + 4)
                  value:0];
         [be endEncoding];
 
@@ -415,8 +422,8 @@ size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
         [ce setBuffer:srcBuf  offset:0 atIndex:0];
         [ce setBuffer:e->meta offset:0 atIndex:1];
         [ce setBuffer:e->offs offset:0 atIndex:2];
-        [ce setBuffer:e->blob offset:payload_off atIndex:3];
-        [ce setBuffer:e->blob offset:payload_off atIndex:4];
+        [ce setBuffer:e->blob offset:blob_off + payload_off atIndex:3];
+        [ce setBuffer:e->blob offset:blob_off + payload_off atIndex:4];
         [ce setBytes:&P length:sizeof(P) atIndex:5];
         const NSUInteger threads = (NSUInteger)tile_count * 3;
         const NSUInteger tg = 256;
@@ -430,7 +437,9 @@ size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
             return 0;
         }
 
-        *out_blob = blob;
-        return total;
+        /* The reserved run ends where the blob begins, so the caller's header
+         * and the payload are one contiguous buffer. */
+        *out_blob = blob - header_reserve;
+        return header_reserve + total;
     }
 }

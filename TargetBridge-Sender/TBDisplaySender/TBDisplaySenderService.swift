@@ -1054,11 +1054,15 @@ private final class TBVideoPipeline: @unchecked Sendable {
                         TBLog.connection.error("dpcm: gpu encoder unavailable; sending uncompressed")
                     }
                 }
+                // The encoder leaves room for the packet header ahead of the
+                // blob, so the header is written in place and the packet is one
+                // copy rather than two. Two copies of a ~30 MB frame measured
+                // ~3 ms of the 10.1 ms this stage costs.
                 var blob: UnsafePointer<UInt8>? = nil
                 let written = dpcmGPU.map {
                     tb_dpcm_gpu_encode($0, base.assumingMemoryBound(to: UInt8.self),
                                        Int32(stride), Int32(width), Int32(height),
-                                       isTenBit ? 1 : 0, &blob)
+                                       isTenBit ? 1 : 0, TBMonitorProtocol.headerSize, &blob)
                 } ?? 0
                 if written > 0, let blob {
                     if !dpcmLogged {
@@ -1073,13 +1077,12 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     lastDamageH = 0
                     carriedDirty.removeAll(keepingCapacity: true)
 
-                    // Copied rather than wrapped: the encoder reuses its output
-                    // buffer on the next frame, and the send is asynchronous. At
-                    // ~30 MB this is around a millisecond, which is not worth the
-                    // buffer-lifetime bookkeeping that avoiding it would need.
-                    let pkt = TBMonitorProtocol.makePacket(
-                        type: .rawDPCM,
-                        payload: Data(bytes: blob, count: written))
+                    // Still one copy: the encoder reuses this buffer on the next
+                    // frame and the send is asynchronous, so the bytes have to be
+                    // handed over. Removing the last copy too would need a ring of
+                    // output buffers released by the send completion.
+                    let pkt = TBMonitorProtocol.framedPacket(
+                        type: .rawDPCM, base: blob, totalCount: written)
                     let process = (Self.hostNow() - frameEnteredAt) * 1000.0
                     if process >= 0, process < 500 {
                         latProcessSum += process

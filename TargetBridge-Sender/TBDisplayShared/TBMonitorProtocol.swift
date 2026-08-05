@@ -160,6 +160,30 @@ enum TBMonitorProtocol {
     /// forever, waiting for a packet that can never complete.
     static let maxPacketLength: UInt32 = 64 * 1024 * 1024
 
+    /// Bytes of framing every packet carries: a big-endian length, then the type.
+    static let headerSize = 5
+
+    /// Frame a payload whose producer already left `headerSize` bytes in front of
+    /// it, writing the header in place. `base` points at the reserved run and
+    /// `totalCount` spans header and payload together.
+    ///
+    /// Exists to avoid a second copy of a very large payload: `makePacket` has to
+    /// concatenate, which at ~30 MB a frame was measurable both in latency and in
+    /// memcpy bandwidth on the sender's CPU.
+    static func framedPacket(type: TBMonitorPacketType,
+                             base: UnsafePointer<UInt8>,
+                             totalCount: Int) -> Data {
+        let mutable = UnsafeMutablePointer(mutating: base)
+        let payloadCount = totalCount - headerSize
+        let framed = UInt32(1 + payloadCount)
+        mutable[0] = UInt8((framed >> 24) & 0xFF)
+        mutable[1] = UInt8((framed >> 16) & 0xFF)
+        mutable[2] = UInt8((framed >>  8) & 0xFF)
+        mutable[3] = UInt8( framed        & 0xFF)
+        mutable[4] = type.rawValue
+        return Data(bytes: base, count: totalCount)
+    }
+
     static func makePacket(type: TBMonitorPacketType, payload: Data) -> Data {
         var packet = Data()
         appendBE32(&packet, UInt32(1 + payload.count))

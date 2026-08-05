@@ -61,6 +61,13 @@ const char  *tb_dpcm_gpu_device_name(const tb_dpcm_gpu *e);
 /* Encode one packed 32-bit frame. `ten_bit` selects ARGB2101010LE over
  * BGRA8888.
  *
+ * `header_reserve` bytes are left free immediately BEFORE the blob, so a caller
+ * that has to prepend a packet header can write it in place and send one
+ * contiguous buffer. Measured worth doing: two copies of a ~30 MB frame is ~3 ms
+ * of the 10.1 ms this stage costs per frame, and the memcpy bandwidth was a
+ * visible share of the sender's CPU. `*out_blob` points at the start of the
+ * reserved region and the return value includes it.
+ *
  * Returns the encoded length and, via `out_blob`, a pointer to it. The blob is
  * owned by the encoder and stays valid until the next call — callers are
  * expected to hand it straight to the socket, which is why it is not copied.
@@ -72,7 +79,8 @@ const char  *tb_dpcm_gpu_device_name(const tb_dpcm_gpu *e);
  * is staged through a copy rather than refused. */
 size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
                           const uint8_t *src, int stride, int w, int h,
-                          int ten_bit, const uint8_t **out_blob);
+                          int ten_bit, size_t header_reserve,
+                          const uint8_t **out_blob);
 
 /* Whether the last encode could read `src` in place. Reported so the sender can
  * say so once rather than guessing about it. */
