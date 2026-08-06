@@ -69,6 +69,14 @@
 
 #define TB_CTRL_QUEUE_MAX 512
 
+/* Video packets the reader may hand over before the main thread has caught up.
+ * Three frames at four bands, which is the sender's own in-flight budget, so
+ * the two ends agree on how far ahead the wire is allowed to get. Each slot
+ * holds a reader's parser buffer — a band is a few MB, so this is tens of MB,
+ * not the 4.4 GB an earlier oversized ring cost. */
+#define TB_VIDEO_QUEUE 12
+#define TB_VIDEO_POOL  (TB_VIDEO_QUEUE + 4)
+
 /* A non-frame packet copied off a reader thread for the main thread to run
  * through on_packet() unchanged. */
 struct tb_ctrl_msg {
@@ -111,19 +119,36 @@ struct app {
      * the main thread's render. Packet handlers stay on the main thread (they
      * touch SDL and app state), so readers only parse and hand work across. */
     pthread_mutex_t net_lock;
-    pthread_cond_t   frame_taken;   /* signalled when the main thread consumes */
     int              threaded_rx;
 
-    /* Newest complete raw-frame packet wins; an unrendered older frame is
-     * dropped. That also repairs out-of-order arrival across two links, which
-     * is what made dual-cable judder at 4:4:4. */
-    /* Owned buffer handed over by a reader, plus where the frame sits inside
-     * it. No copy: the reader yields its whole parser buffer. */
-    uint8_t         *frame_buf;       /* owned allocation */
-    size_t           frame_cap;
-    const uint8_t   *frame_payload;   /* points into frame_buf */
-    size_t           frame_len;
-    uint8_t          frame_type;      /* RAW_FRAME or RAW_DAMAGE */
+    /* Video packets waiting for the main thread.
+     *
+     * This was ONE slot, which was right when a frame was one packet. Slicing
+     * made a frame four, and because a band is an increment that must not be
+     * overwritten, the reader waited up to 100 ms for the slot to clear. That
+     * wait is inside the read loop, and the reader is the only thing draining
+     * the socket — so on fullscreen video the mailbox saturated, the reader
+     * stopped reading, 2.5 MB piled up in the sender's send queue, its
+     * in-flight budget pinned at 15/12 and it dropped 206 frames in a window.
+     * The receiver sat 94% idle at 4 fps throughout, starved by its own reader,
+     * and only killing both ends recovered it.
+     *
+     * A queue instead, so the reader never stops draining. Twelve is three
+     * frames at four bands, matching the sender's in-flight budget: a burst is
+     * absorbed, and a genuinely overwhelmed receiver drops rather than wedges.
+     *
+     * Owned buffers handed over by a reader, plus where the packet sits inside
+     * each. No copy: the reader yields its whole parser buffer. */
+    struct tb_video_slot {
+        uint8_t       *buf;       /* owned allocation */
+        size_t         cap;
+        const uint8_t *payload;   /* points into buf */
+        size_t         len;
+        uint8_t        type;      /* RAW_FRAME, RAW_DAMAGE, RAW_DPCM[_SLICE] */
+    }                vq[TB_VIDEO_QUEUE];
+    int              vq_head;
+    int              vq_count;
+    uint64_t         vq_overflow;    /* increments dropped because it was full */
     uint32_t         connecting_since;/* when this client last had no video */
     uint32_t         dpcm_frame_id;   /* frame currently being assembled from slices */
     int              dpcm_seq_warned;
@@ -136,13 +161,15 @@ struct app {
     uint32_t         dpcm_frames_short;
     uint32_t         dpcm_bands_lost;
     uint32_t         dpcm_last_report;
-    int              frame_ready;
     uint64_t         frames_dropped;
 
     /* Recycled buffers handed back to readers so nothing allocates (or
-     * re-faults 59 MB) inside the frame loop. */
-    uint8_t         *pool_buf[6];
-    size_t           pool_cap[6];
+     * re-faults 59 MB) inside the frame loop. Sized against the video queue:
+     * every slot's buffer comes back here when the main thread is done with it,
+     * and a pool smaller than the queue would start freeing and reallocating
+     * multi-MB blocks in the steady state. */
+    uint8_t         *pool_buf[TB_VIDEO_POOL];
+    size_t           pool_cap[TB_VIDEO_POOL];
     int              pool_n;
 
     struct tb_ctrl_msg    *ctrl_q;
@@ -1188,10 +1215,19 @@ static void handle_raw_dpcm_slice(struct app *a, const uint8_t *p, size_t len) {
         const uint32_t now_s = SDL_GetTicks() / 1000;
         if (now_s != a->dpcm_last_report && a->dpcm_frames_total >= 30) {
             a->dpcm_last_report = now_s;
-            fprintf(stderr, "[slices] %u frames, %u incomplete (%.1f%%), %u bands lost\n",
+            /* queue depth and overflow say whether the reader is getting ahead
+             * of the renderer — the condition that used to wedge the session. */
+            pthread_mutex_lock(&a->net_lock);
+            const int qd = a->vq_count;
+            const uint64_t qo = a->vq_overflow;
+            a->vq_overflow = 0;
+            pthread_mutex_unlock(&a->net_lock);
+            fprintf(stderr,
+                    "[slices] %u frames, %u incomplete (%.1f%%), %u bands lost | queue %d/%d, %llu overflow\n",
                     a->dpcm_frames_total, a->dpcm_frames_short,
                     100.0 * a->dpcm_frames_short / a->dpcm_frames_total,
-                    a->dpcm_bands_lost);
+                    a->dpcm_bands_lost, qd, TB_VIDEO_QUEUE,
+                    (unsigned long long)qo);
             a->dpcm_frames_total = a->dpcm_frames_short = a->dpcm_bands_lost = 0;
         }
     }
@@ -2260,50 +2296,71 @@ static void *link_reader_main(void *ud) {
                     uint8_t *held = tb_parser_take_held(&r->parser, &held_cap);
                     if (held) {
                         pthread_mutex_lock(&a->net_lock);
-                        /* A full frame is a complete image, so it may safely
-                         * replace anything still pending. A damage packet is an
-                         * increment: discarding it loses those pixels for good,
-                         * so wait for the main thread instead of dropping it.
+                        /* Never block here. This thread is the only one draining
+                         * the socket, so anything it waits for it also stops
+                         * receiving — which is precisely how the old 100 ms wait
+                         * turned a busy moment into a wedged session.
                          *
-                         * A TBD2 BAND is an increment too, and was wrongly filed
-                         * with the whole frames when slicing was added. Each
-                         * arriving band overwrote the one before it whenever the
-                         * main thread was busy, so 4-40% of frames presented with
-                         * missing strips showing the previous frame — measured,
-                         * after three render-side theories that were all wrong.
-                         * Bounded, so a stalled renderer cannot wedge a reader —
-                         * on timeout we lose the update and the sender's ~1s
-                         * resync repairs it. */
-                        if (r->pending_type == TB_PKT_RAW_DAMAGE ||
-                            r->pending_type == TB_PKT_RAW_DPCM_SLICE) {
-                            struct timespec deadline;
-                            clock_gettime(CLOCK_REALTIME, &deadline);
-                            deadline.tv_nsec += 100 * 1000 * 1000;
-                            if (deadline.tv_nsec >= 1000000000) {
-                                deadline.tv_sec += 1;
-                                deadline.tv_nsec -= 1000000000;
-                            }
-                            while (a->frame_ready) {
-                                if (pthread_cond_timedwait(&a->frame_taken, &a->net_lock,
-                                                           &deadline) != 0) break;
+                         * The two packet kinds still mean different things:
+                         *
+                         * A whole frame is a complete image, so it supersedes
+                         * everything queued — including bands of a frame that
+                         * will now never be finished. Keeping at most one also
+                         * stops the queue adding latency on the unsliced path,
+                         * where newest-wins has always been correct.
+                         *
+                         * A band or a damage rect is an INCREMENT: discarding it
+                         * loses those pixels for good. Bands were briefly filed
+                         * with the whole frames when slicing was added and each
+                         * overwrote the last, presenting 4-40% of frames with
+                         * strips of the previous one. So they queue, and only
+                         * when the queue is genuinely full is the arriving one
+                         * dropped and counted — the sender's ~1s resync repairs
+                         * it, exactly as the old timeout path did, but without
+                         * stalling the socket to get there. */
+                        const int is_increment =
+                            (r->pending_type == TB_PKT_RAW_DAMAGE ||
+                             r->pending_type == TB_PKT_RAW_DPCM_SLICE);
+
+                        if (!is_increment) {
+                            while (a->vq_count > 0) {
+                                struct tb_video_slot *old =
+                                    &a->vq[(a->vq_head + a->vq_count - 1) % TB_VIDEO_QUEUE];
+                                if (a->pool_n < TB_VIDEO_POOL) {
+                                    a->pool_buf[a->pool_n] = old->buf;
+                                    a->pool_cap[a->pool_n] = old->cap;
+                                    a->pool_n++;
+                                } else {
+                                    free(old->buf);
+                                }
+                                old->buf = NULL;
+                                a->vq_count--;
+                                a->frames_dropped++;
                             }
                         }
-                        if (a->frame_buf) {
-                            if (a->frame_ready) a->frames_dropped++;
-                            if (a->pool_n < 6) {
-                                a->pool_buf[a->pool_n] = a->frame_buf;
-                                a->pool_cap[a->pool_n] = a->frame_cap;
+
+                        if (a->vq_count >= TB_VIDEO_QUEUE) {
+                            /* Full, and this one is an increment (a whole frame
+                             * just cleared the queue above). Give the buffer
+                             * back rather than leak it. */
+                            a->vq_overflow++;
+                            if (a->pool_n < TB_VIDEO_POOL) {
+                                a->pool_buf[a->pool_n] = held;
+                                a->pool_cap[a->pool_n] = held_cap;
                                 a->pool_n++;
                             } else {
-                                free(a->frame_buf);
+                                free(held);
                             }
+                        } else {
+                            struct tb_video_slot *slot =
+                                &a->vq[(a->vq_head + a->vq_count) % TB_VIDEO_QUEUE];
+                            slot->buf     = held;
+                            slot->cap     = held_cap;
+                            slot->payload = r->pending_payload;
+                            slot->len     = r->pending_len;
+                            slot->type    = r->pending_type;
+                            a->vq_count++;
                         }
-                        a->frame_buf     = held;
-                        a->frame_cap     = held_cap;
-                        a->frame_payload = r->pending_payload;
-                        a->frame_len     = r->pending_len;
-                        a->frame_type    = r->pending_type;
-                        a->frame_ready   = 1;
                         /* Take a recycled buffer back for the next frame. */
                         if (a->pool_n > 0) {
                             a->pool_n--;
@@ -2426,30 +2483,38 @@ static int pump_network(struct app *a) {
         worked = 1;
     }
 
-    uint8_t       *owned   = NULL;   /* buffer we take responsibility for */
-    size_t         owned_cap = 0;
-    const uint8_t *payload = NULL;
-    size_t         plen    = 0;
-    uint8_t        ptype   = TB_PKT_RAW_FRAME;
-
     pthread_mutex_lock(&a->net_lock);
     if (a->reader_recv_ms > a->last_recv_ms) a->last_recv_ms = a->reader_recv_ms;
-    if (a->frame_ready) {
-        owned     = a->frame_buf;
-        owned_cap = a->frame_cap;
-        payload   = a->frame_payload;
-        plen      = a->frame_len;
-        ptype     = a->frame_type;
-        a->frame_buf = NULL;
-        a->frame_cap = 0;
-        a->frame_payload = NULL;
-        a->frame_len = 0;
-        a->frame_ready = 0;
-        pthread_cond_signal(&a->frame_taken);
-    }
+    /* Snapshot the depth and drain exactly that many. Taking one per pass was
+     * the other half of the stall: a frame is four bands, so one-per-iteration
+     * capped the receiver at a quarter of the loop rate no matter how idle it
+     * was. Bounding to the snapshot rather than looping until empty keeps a
+     * flood from starving input and quit handling. */
+    int pending = a->vq_count;
     pthread_mutex_unlock(&a->net_lock);
 
-    if (owned) {
+    while (pending-- > 0) {
+        uint8_t       *owned = NULL;
+        size_t         owned_cap = 0;
+        const uint8_t *payload = NULL;
+        size_t         plen = 0;
+        uint8_t        ptype = TB_PKT_RAW_FRAME;
+
+        pthread_mutex_lock(&a->net_lock);
+        if (a->vq_count > 0) {
+            struct tb_video_slot *slot = &a->vq[a->vq_head];
+            owned     = slot->buf;
+            owned_cap = slot->cap;
+            payload   = slot->payload;
+            plen      = slot->len;
+            ptype     = slot->type;
+            slot->buf = NULL;
+            a->vq_head = (a->vq_head + 1) % TB_VIDEO_QUEUE;
+            a->vq_count--;
+        }
+        pthread_mutex_unlock(&a->net_lock);
+        if (!owned) break;
+
         /* Frames bypass on_packet, so mark the session live here — otherwise
          * the fullscreen gate never opens. */
         a->session_active = 1;
@@ -2462,7 +2527,7 @@ static int pump_network(struct app *a) {
         /* Return the buffer for a reader to reuse; only free if the pool is
          * full, so the steady state never allocates. */
         pthread_mutex_lock(&a->net_lock);
-        if (a->pool_n < 6) {
+        if (a->pool_n < TB_VIDEO_POOL) {
             a->pool_buf[a->pool_n] = owned;
             a->pool_cap[a->pool_n] = owned_cap;
             a->pool_n++;
@@ -2481,12 +2546,14 @@ static void drop_pending_network(struct app *a) {
         a->ctrl_head = (a->ctrl_head + 1) % TB_CTRL_QUEUE_MAX;
         a->ctrl_count--;
     }
-    a->frame_ready = 0;
-    a->frame_len = 0;
-    a->frame_payload = NULL;
-    free(a->frame_buf);
-    a->frame_buf = NULL;
-    a->frame_cap = 0;
+    while (a->vq_count > 0) {
+        struct tb_video_slot *slot = &a->vq[a->vq_head];
+        free(slot->buf);
+        slot->buf = NULL;
+        a->vq_head = (a->vq_head + 1) % TB_VIDEO_QUEUE;
+        a->vq_count--;
+    }
+    a->vq_head = 0;
     for (int i = 0; i < a->pool_n; ++i) { free(a->pool_buf[i]); a->pool_buf[i] = NULL; }
     a->pool_n = 0;
     pthread_mutex_unlock(&a->net_lock);
@@ -2607,7 +2674,6 @@ int main(int argc, char **argv) {
     a.client_fd = -1;
     a.client_fd2 = -1;
     pthread_mutex_init(&a.net_lock, NULL);
-    pthread_cond_init(&a.frame_taken, NULL);
     a.reader1 = (struct tb_link_reader *)calloc(1, sizeof(*a.reader1));
     a.reader2 = (struct tb_link_reader *)calloc(1, sizeof(*a.reader2));
     a.ctrl_q  = (struct tb_ctrl_msg *)calloc(TB_CTRL_QUEUE_MAX, sizeof(*a.ctrl_q));
