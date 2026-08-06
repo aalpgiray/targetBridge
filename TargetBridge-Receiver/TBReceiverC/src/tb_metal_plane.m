@@ -43,9 +43,21 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Enough in-flight upload buffers that the CPU can stage frame N+1 while the GPU
- * still reads frame N, without ever allocating inside the frame loop. */
+/* Drawables the layer may hand out. Three is plenty for presenting once a frame. */
 #define TB_METAL_RING 3
+
+/* Upload staging slots.
+ *
+ * Sized for SLICES, not frames. This was 3, from when a frame was a single
+ * upload — but a sliced frame takes one slot per band, so at 18 bands the
+ * thread doing the uploading blocked on slot recycling eighteen times a frame.
+ * That thread also services the window and the socket, so the receiver stopped
+ * responding while the GPU caught up: not a deadlock, just the main thread used
+ * as the throttle.
+ *
+ * A slice slot is a fraction of a frame (~1.7 MB at 18 bands against ~30 MB
+ * whole), so depth is cheap where it used to be expensive. */
+#define TB_UPLOAD_RING 32
 
 /* Frames in flight. One surface is not enough once a frame arrives as bands:
  * the next frame's first band starts decoding while the current frame is still
@@ -81,8 +93,8 @@ static struct {
     size_t                row_align;
     float                 dither;
 
-    id<MTLBuffer>         ring[TB_METAL_RING];
-    size_t                ring_cap[TB_METAL_RING];
+    id<MTLBuffer>         ring[TB_UPLOAD_RING];
+    size_t                ring_cap[TB_UPLOAD_RING];
     int                   ring_idx;
     dispatch_semaphore_t  inflight;
 
@@ -517,7 +529,7 @@ int tb_metal_plane_init(SDL_Window *win) {
     if (g.row_align == 0) g.row_align = 256;
 
     g.queue = [g.dev newCommandQueue];
-    g.inflight = dispatch_semaphore_create(TB_METAL_RING);
+    g.inflight = dispatch_semaphore_create(TB_UPLOAD_RING);
     g.frames_free = dispatch_semaphore_create(TB_FRAME_RING);
     g.frame_widx = 0;
     g.frame_open = 0;
@@ -538,14 +550,14 @@ void tb_metal_plane_shutdown(void) {
      * buffer (or the layer) when we release them. */
     if (g.inflight) {
         dispatch_semaphore_t sem = g.inflight;
-        for (int i = 0; i < TB_METAL_RING; ++i) {
+        for (int i = 0; i < TB_UPLOAD_RING; ++i) {
             dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
         }
         /* Hand the counts back before releasing. libdispatch raises SIGILL
          * ("semaphore deallocated while in use") if a semaphore is disposed
          * with a value below the one it was created with — draining it to 0
          * and then dropping the reference crashed on every teardown. */
-        for (int i = 0; i < TB_METAL_RING; ++i) {
+        for (int i = 0; i < TB_UPLOAD_RING; ++i) {
             dispatch_semaphore_signal(sem);
         }
         g.inflight = nil;
@@ -559,7 +571,7 @@ void tb_metal_plane_shutdown(void) {
         for (int i = 0; i < TB_FRAME_RING; ++i) dispatch_semaphore_signal(fs);
         g.frames_free = nil;
     }
-    for (int i = 0; i < TB_METAL_RING; ++i) { g.ring[i] = nil; g.ring_cap[i] = 0; }
+    for (int i = 0; i < TB_UPLOAD_RING; ++i) { g.ring[i] = nil; g.ring_cap[i] = 0; }
     for (int i = 0; i < TB_FRAME_RING; ++i) { g.frame[i] = nil; g.frame_cap[i] = 0; }
     g.frame_open = 0; g.frame_widx = 0;
     g.curTex = nil; g.cur_tex_scale = 0.f;
@@ -639,9 +651,20 @@ static void tb_geometry_set(int w, int h) {
 /* Take an upload slot. The caller must signal `inflight` if it does not go on to
  * submit a command buffer that signals it on completion. */
 static id<MTLBuffer> tb_upload_take(size_t bytes) {
-    dispatch_semaphore_wait(g.inflight, DISPATCH_TIME_FOREVER);
+    /* Bounded for the same reason the frame-surface wait is: this runs on the
+     * thread that services the window. Returning nil drops a band, which costs
+     * one stale strip for a frame; blocking costs the whole session. */
+    const dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC);
+    if (dispatch_semaphore_wait(g.inflight, deadline) != 0) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "[metal] upload ring exhausted; dropping bands\n");
+        }
+        return nil;
+    }
     int slot = g.ring_idx;
-    g.ring_idx = (g.ring_idx + 1) % TB_METAL_RING;
+    g.ring_idx = (g.ring_idx + 1) % TB_UPLOAD_RING;
     if (g.ring_cap[slot] < bytes) {
         g.ring[slot] = [g.dev newBufferWithLength:bytes options:MTLResourceStorageModeShared];
         g.ring_cap[slot] = g.ring[slot] ? bytes : 0;
