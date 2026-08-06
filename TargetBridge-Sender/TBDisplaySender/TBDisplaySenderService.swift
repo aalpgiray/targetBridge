@@ -1415,17 +1415,29 @@ private final class TBVideoPipeline: @unchecked Sendable {
         // 8-bit source cannot exceed 256 however it is converted afterwards; a
         // 10-bit one can reach 1024. Counting non-zero low bits cannot separate
         // real depth from bits a conversion invents.
+        // A bitmap, not a Set. The values are 10 bits, so the whole domain is
+        // 1024 flags = 16 words on the stack: no hashing, no allocation, no
+        // growth. The Set version did 48 x 2560 = 122,880 inserts across 48
+        // freshly grown Sets, on the CAPTURE thread, and that was the spike --
+        // `process` averaged 2.4 ms and topped 34, once per cadence window,
+        // which is exactly this probe's period. The spike bunched the next
+        // frame against the late one and cost ~4% of send cadence.
         var best = 0
         var bestRow = 0
         let rowStep = Swift.max(1, height / 48)
         var row = 0
         while row < height {
-            var seen = Set<UInt32>()
-            for x in 0..<Swift.min(width, 2560) {
-                let word = base.load(fromByteOffset: (row * rowWords + x) * 4, as: UInt32.self)
-                seen.insert((word >> 10) & 0x3FF)
+            var bits = [UInt64](repeating: 0, count: 16)
+            var distinct = 0
+            bits.withUnsafeMutableBufferPointer { b in
+                for x in 0..<Swift.min(width, 2560) {
+                    let word = base.load(fromByteOffset: (row * rowWords + x) * 4, as: UInt32.self)
+                    let v = Int((word >> 10) & 0x3FF)
+                    let mask: UInt64 = 1 << UInt64(v & 63)
+                    if b[v >> 6] & mask == 0 { b[v >> 6] |= mask; distinct += 1 }
+                }
             }
-            if seen.count > best { best = seen.count; bestRow = row }
+            if distinct > best { best = distinct; bestRow = row }
             row += rowStep
         }
         TBLog.connection.notice(

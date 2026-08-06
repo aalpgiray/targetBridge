@@ -82,6 +82,18 @@ struct tb_dpcm_gpu {
     dispatch_semaphore_t   slots;
     int                    next_job;
 
+    /* Wrapping the caller's pixels in an MTLBuffer is a VM mapping, and at 59 MB
+     * it is not free: submission averaged 2.8 ms but spiked past 30, which shows
+     * up as one frame going out a period late and the next immediately behind
+     * it -- the 2% of sends under 8 ms apart.
+     *
+     * ScreenCaptureKit recycles IOSurfaces from a small pool, so the same few
+     * base addresses repeat forever and the mapping is pure waste. Cache by
+     * (address, length); a handful of entries covers the pool, and anything
+     * else falls through to a fresh wrap. */
+    struct { const void *base; size_t len; id<MTLBuffer> buf; } src_cache[8];
+    int                    src_cache_n;
+
     /* Reused across frames; grown, never shrunk. */
     id<MTLBuffer> blob;        /* the whole encoded frame, shared */
     size_t        blob_cap;
@@ -289,6 +301,7 @@ void tb_dpcm_gpu_destroy(tb_dpcm_gpu *e) {
         e->jobs[i].blob = nil; e->jobs[i].meta = nil;
         e->jobs[i].offs = nil; e->jobs[i].src  = nil;
     }
+    for (int i = 0; i < 8; ++i) e->src_cache[i].buf = nil;
     e->plan_q = nil;
     e->slots = nil;
     e->blob = nil; e->meta = nil; e->offs = nil; e->staged = nil;
@@ -708,7 +721,9 @@ static void job_submit_pack(tb_dpcm_gpu *e, struct tb_dpcm_gpu_job *j) {
             /* Hand the frame over BEFORE releasing the slot, so the callee can
              * read the blob while it is still guaranteed not to be reused. */
             if (j->done) j->done(j->ctx, ok, j->bands, j->band_count);
-            j->src  = nil;          /* the GPU is finished with the pixels */
+            /* Not released: the wrapper is cached and shared across frames, and
+             * the caller owns the pixels either way. */
+            j->src  = nil;
             j->done = NULL;
             j->ctx  = NULL;
             dispatch_semaphore_signal(e->slots);
@@ -771,10 +786,34 @@ int tb_dpcm_gpu_encode_bands_async(tb_dpcm_gpu *e,
             dispatch_semaphore_signal(e->slots);
             return -1;
         }
-        j->src = [e->dev newBufferWithBytesNoCopy:(void *)src
-                                           length:(src_bytes + page - 1) / page * page
-                                          options:MTLResourceStorageModeShared
-                                      deallocator:nil];
+        const size_t mapped_len = (src_bytes + page - 1) / page * page;
+        j->src = nil;
+        for (int i = 0; i < e->src_cache_n; ++i) {
+            if (e->src_cache[i].base == src && e->src_cache[i].len == mapped_len) {
+                j->src = e->src_cache[i].buf;
+                break;
+            }
+        }
+        if (!j->src) {
+            j->src = [e->dev newBufferWithBytesNoCopy:(void *)src
+                                               length:mapped_len
+                                              options:MTLResourceStorageModeShared
+                                          deallocator:nil];
+            if (j->src) {
+                /* Evict oldest by wrapping; the pool is small and stable, so a
+                 * miss after warm-up means the pool itself changed. */
+                const int slot = (e->src_cache_n < 8) ? e->src_cache_n++ : 0;
+                if (slot == 0 && e->src_cache_n == 8) {
+                    for (int i = 0; i < 7; ++i) e->src_cache[i] = e->src_cache[i + 1];
+                    e->src_cache[7].base = src; e->src_cache[7].len = mapped_len;
+                    e->src_cache[7].buf = j->src;
+                } else {
+                    e->src_cache[slot].base = src;
+                    e->src_cache[slot].len  = mapped_len;
+                    e->src_cache[slot].buf  = j->src;
+                }
+            }
+        }
         if (!j->src) {
             dispatch_semaphore_signal(e->slots);
             return -1;
