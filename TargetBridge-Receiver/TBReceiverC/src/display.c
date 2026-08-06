@@ -1339,13 +1339,18 @@ int tb_disp_render_dpcm_slice(struct tb_display *d, const uint8_t *blob, size_t 
     double m0 = tb_now_ms();
     if (tb_metal_plane_render_dpcm_slice(blob, len, frame_w, frame_h, y0, is_last) != 0)
         return -1;
-    /* Only a presented frame counts as one: the intermediate bands are work, not
-     * frames, and counting them would inflate the rate by the slice count. */
-    if (is_last) {
-        tb_disp_set_connection_state(d, 1);
-        d->last_video_frame_time = SDL_GetTicks();
-        tb_frame_stats_add("dpcm", tb_now_ms() - m0, 0.0);
-    }
+    /* Every band counts as activity, not just the last. The main loop falls back
+     * to the status screen when video goes quiet, and that screen tears the plane
+     * down — which frees the surfaces holding the frame being assembled, so its
+     * last band never arrives, so the status screen renders again. That livelock
+     * cost thousands of plane create/destroy cycles a second and is invisible at
+     * one band per frame, where every band is also the last. */
+    tb_disp_set_connection_state(d, 1);
+    d->last_video_frame_time = SDL_GetTicks();
+
+    /* Only a presented frame counts as a FRAME, though: intermediate bands are
+     * work, and counting them would inflate the rate by the slice count. */
+    if (is_last) tb_frame_stats_add("dpcm", tb_now_ms() - m0, 0.0);
     return 0;
 }
 

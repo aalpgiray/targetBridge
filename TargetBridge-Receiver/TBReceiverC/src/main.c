@@ -1159,12 +1159,15 @@ static void handle_raw_dpcm_slice(struct app *a, const uint8_t *p, size_t len) {
         a->frames_dropped++;
         return;
     }
+    /* Set before the last-band gate: the main loop uses this to decide whether
+     * the stream is live, and a frame mid-assembly is very much live. */
+    a->have_video_frame = 1;
+
     if (!is_last) return;
 
     /* A DPCM frame leaves no CPU base image behind, so a damage packet arriving
      * after one has nothing to patch. */
     a->base_valid = 0;
-    a->have_video_frame = 1;
     tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
     a->frames++;
 }
