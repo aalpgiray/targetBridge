@@ -131,14 +131,20 @@ final class ReceiverBackedVirtualDisplaySession {
 
         let settings = CGVirtualDisplaySettings()
         settings.hiDPI = profile.hiDPI
-        // `defaults write com.targetbridge.sender TBTransferFn -int N` (0 = off).
-        // A virtual display is 8-bpc because it is SDR; a transfer function is
-        // what declares it HDR and promotes the framebuffer to 16-bpc, which is
-        // the only reason our 10-bit path currently carries 8 real bits. The
-        // enum's meanings are undocumented — this is a knob so the right value
-        // can be found by trying, and reverted with one command if a value
-        // stops the display coming up at all.
-        let tf = UInt32(max(0, UserDefaults.standard.integer(forKey: "TBTransferFn")))
+        // Transfer function 1, measured working 2026-08-06.
+        //
+        // A virtual display is 8-bpc because it is SDR — depth is not a property
+        // anywhere on the descriptor or settings. Declaring a transfer function
+        // is what makes macOS treat it as HDR and promote the framebuffer to
+        // 16-bpc, and only then does our l10r capture carry real bits instead of
+        // 8-bit values bit-replicated into 10. Before this the whole 10-bit path
+        // was faithfully transporting 8-bit data.
+        //
+        // The enum is undocumented (BetterDisplay is closed source; its "Enable
+        // HDR support" toggle does the same thing) so 1 was found by trying.
+        // `defaults write com.targetbridge.sender TBTransferFn -int 0` reverts to
+        // SDR if a display ever refuses the HDR mode.
+        let tf = UInt32(max(0, (UserDefaults.standard.object(forKey: "TBTransferFn") as? Int) ?? 1))
         let mode: CGVirtualDisplayMode?
         if tf != 0 {
             mode = CGVirtualDisplayMode(
