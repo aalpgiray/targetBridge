@@ -12,7 +12,10 @@ import os
 /// useless. Bytes arrive as raw UTF-8 with no line framing — a packet may split
 /// a line or carry several — so this appends them verbatim and lets the text
 /// reassemble itself.
-final class TBReceiverLogSink {
+/// `@unchecked Sendable` is accurate rather than a shortcut: every mutable
+/// field below is touched only inside `queue`, which is the serial queue this
+/// class exists to funnel writes through.
+final class TBReceiverLogSink: @unchecked Sendable {
     static let shared = TBReceiverLogSink()
 
     /// Everything here happens off the connection queue. Log volume is small
