@@ -35,6 +35,9 @@ final class TBDPCMFrameContext {
     /// pipeline do its once-per-session ratio log without this type knowing
     /// anything about logging.
     let finished: (Int, Bool) -> Void
+    /// Accumulated across the per-band callbacks. Only ever touched from the
+    /// encoder's serial queue, which delivers bands one at a time in order.
+    var bytesSent = 0
 
     init(sampleBuffer: CMSampleBuffer,
          pixelBuffer: CVPixelBuffer,
@@ -95,23 +98,15 @@ final class TBDPCMFrameContext {
 /// `bands` is valid only for the duration of this call; the encoder recycles the
 /// slot the moment it returns. `framedSlicePacket` copies into a Data, so that
 /// is respected by construction.
-let tbDPCMAsyncDone: tb_dpcm_gpu_done = { ctx, ok, bands, count in
+let tbDPCMAsyncDone: tb_dpcm_gpu_done = { ctx, ok, band, index, last in
     guard let ctx else { return }
-    // Balanced against the passRetained at submission. Taking it here is what
-    // releases the pixel buffer and unlocks it.
-    let frame = Unmanaged<TBDPCMFrameContext>.fromOpaque(ctx).takeRetainedValue()
+    // The retain is released on the LAST band only — that is when the encoder
+    // recycles the slot and stops reading the pixels.
+    let unmanaged = Unmanaged<TBDPCMFrameContext>.fromOpaque(ctx)
+    let frame = last != 0 ? unmanaged.takeRetainedValue() : unmanaged.takeUnretainedValue()
 
-    guard ok != 0, let bands else {
-        frame.finished(0, false)
-        return
-    }
-
-    var total = 0
-    for band in 0..<Int(count) {
-        let entry = bands[band]
-        guard let blob = entry.blob else { continue }
-        total += entry.len
-
+    if ok != 0, let entry = band?.pointee, let blob = entry.blob {
+        let i = Int(index)
         let packet: Data
         if frame.sliceCount > 1 {
             packet = TBMonitorProtocol.framedSlicePacket(
@@ -119,13 +114,17 @@ let tbDPCMAsyncDone: tb_dpcm_gpu_done = { ctx, ok, bands, count in
                 captureTimeNanos: frame.captureNanos,
                 frameID: frame.frameID,
                 frameW: UInt32(frame.width), frameH: UInt32(frame.height),
-                y0: UInt32(band * frame.rowsPerBand),
-                index: UInt16(band), count: UInt16(frame.sliceCount))
+                y0: UInt32(i * frame.rowsPerBand),
+                index: UInt16(i), count: UInt16(frame.sliceCount))
         } else {
             packet = TBMonitorProtocol.framedPacket(
                 type: .rawDPCM, base: blob, totalCount: entry.len)
         }
         frame.send(packet)
+        frame.bytesSent += entry.len
     }
-    frame.finished(total, true)
+
+    if last != 0 {
+        frame.finished(frame.bytesSent, ok != 0)
+    }
 }

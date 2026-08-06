@@ -356,13 +356,11 @@ static int enc_geom_of(int w, int band_h, size_t header_reserve, struct enc_geom
  *
  * Shared by the blocking and non-blocking paths so the two can never disagree
  * about the container. */
-static void plan_bands(uint8_t *blob_base, const uint8_t *meta_base, uint8_t *offs_base,
-                       const struct enc_geom *g, int band_count,
-                       int w, int band_h, int ten_bit, size_t header_reserve,
-                       size_t *payload_bytes, tb_dpcm_gpu_band *out,
-                       size_t *total_all) {
-    *total_all = 0;
-    for (int b = 0; b < band_count; ++b) {
+static void plan_band(uint8_t *blob_base, const uint8_t *meta_base, uint8_t *offs_base,
+                      const struct enc_geom *g, int b,
+                      int w, int band_h, int ten_bit, size_t header_reserve,
+                      size_t *payload_bytes, tb_dpcm_gpu_band *out) {
+    {
         uint8_t *blob = blob_base + g->band_span * (size_t)b + g->blob_off;
         const uint32_t *meta = (const uint32_t *)(meta_base + g->meta_span * (size_t)b);
         uint32_t *offs = (uint32_t *)(offs_base + g->offs_span * (size_t)b);
@@ -414,7 +412,6 @@ static void plan_bands(uint8_t *blob_base, const uint8_t *meta_base, uint8_t *of
          * and the payload are one contiguous buffer. */
         out[b].blob = blob - header_reserve;
         out[b].len  = header_reserve + total;
-        *total_all += header_reserve + total;
     }
 }
 
@@ -664,10 +661,18 @@ static int job_ensure(tb_dpcm_gpu *e, struct tb_dpcm_gpu_job *j,
     return 0;
 }
 
-/* Step 3, submitted once the host plan for this job is done. */
-static void job_submit_pack(tb_dpcm_gpu *e, struct tb_dpcm_gpu_job *j) {
+/* Step 3 for ONE band, delivered the moment it lands.
+ *
+ * One command buffer per band rather than one per frame. Four bands used to pack
+ * together and then burst onto the wire as four packets; now each leaves as it
+ * is ready, spread across the frame. The receiver's presentation cadence is
+ * sensitive to that spacing in a way the sender's own numbers are not — with the
+ * burst, `send(wall)` read a clean 100% while the receiver bunched frames into
+ * pairs. */
+static void job_submit_pack_band(tb_dpcm_gpu *e, struct tb_dpcm_gpu_job *j, int b) {
     @autoreleasepool {
         const struct enc_geom *g = &j->g;
+        const int last = (b + 1 == j->band_count);
         id<MTLCommandBuffer> cb = [e->queue commandBuffer];
 
         /* The payload is zeroed on the GPU because the packer merges into it,
@@ -675,12 +680,10 @@ static void job_submit_pack(tb_dpcm_gpu *e, struct tb_dpcm_gpu_job *j) {
          * Separate encoders in one command buffer run in order, which is the
          * dependency the fills need. */
         id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
-        for (int b = 0; b < j->band_count; ++b) {
-            [be fillBuffer:j->blob
-                     range:NSMakeRange(g->band_span * (size_t)b + g->blob_off + g->payload_off,
-                                       round4(j->payload_bytes[b]) + 4)
-                     value:0];
-        }
+        [be fillBuffer:j->blob
+                 range:NSMakeRange(g->band_span * (size_t)b + g->blob_off + g->payload_off,
+                                   round4(j->payload_bytes[b]) + 4)
+                 value:0];
         [be endEncoding];
 
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
@@ -688,33 +691,31 @@ static void job_submit_pack(tb_dpcm_gpu *e, struct tb_dpcm_gpu_job *j) {
         [ce setBytes:&j->P length:sizeof(j->P) atIndex:5];
         const NSUInteger threads = (NSUInteger)g->tile_count * 3;
         const NSUInteger tg = 256;
-        for (int b = 0; b < j->band_count; ++b) {
-            const size_t pay = g->band_span * (size_t)b + g->blob_off + g->payload_off;
-            [ce setBuffer:j->src  offset:j->band_bytes * (size_t)b atIndex:0];
-            [ce setBuffer:j->meta offset:g->meta_span  * (size_t)b atIndex:1];
-            [ce setBuffer:j->offs offset:g->offs_span  * (size_t)b atIndex:2];
-            [ce setBuffer:j->blob offset:pay atIndex:3];
-            [ce setBuffer:j->blob offset:pay atIndex:4];
-            [ce dispatchThreadgroups:MTLSizeMake((threads + tg - 1) / tg, 1, 1)
-               threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        }
+        const size_t pay = g->band_span * (size_t)b + g->blob_off + g->payload_off;
+        [ce setBuffer:j->src  offset:j->band_bytes * (size_t)b atIndex:0];
+        [ce setBuffer:j->meta offset:g->meta_span  * (size_t)b atIndex:1];
+        [ce setBuffer:j->offs offset:g->offs_span  * (size_t)b atIndex:2];
+        [ce setBuffer:j->blob offset:pay atIndex:3];
+        [ce setBuffer:j->blob offset:pay atIndex:4];
+        [ce dispatchThreadgroups:MTLSizeMake((threads + tg - 1) / tg, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [ce endEncoding];
 
         [cb addCompletedHandler:^(id<MTLCommandBuffer> done_cb) {
             const int ok = (done_cb.error == nil);
             if (!ok) {
-                fprintf(stderr, "[dpcm-gpu] pack: %s\n",
+                fprintf(stderr, "[dpcm-gpu] pack band %d: %s\n", b,
                         done_cb.error.localizedDescription.UTF8String);
             }
-            /* Hand the frame over BEFORE releasing the slot, so the callee can
+            /* Hand the band over BEFORE releasing the slot, so the callee can
              * read the blob while it is still guaranteed not to be reused. */
-            if (j->done) j->done(j->ctx, ok, j->bands, j->band_count);
-            /* Not released: the wrapper is cached and shared across frames, and
-             * the caller owns the pixels either way. */
-            j->src  = nil;
-            j->done = NULL;
-            j->ctx  = NULL;
-            dispatch_semaphore_signal(e->slots);
+            if (j->done) j->done(j->ctx, ok, &j->bands[b], b, last);
+            if (last) {
+                j->src  = nil;
+                j->done = NULL;
+                j->ctx  = NULL;
+                dispatch_semaphore_signal(e->slots);
+            }
         }];
         [cb commit];
     }
@@ -800,44 +801,52 @@ int tb_dpcm_gpu_encode_bands_async(tb_dpcm_gpu *e,
         }
         e->last_zero_copy = 1;
 
-        id<MTLCommandBuffer> cb = [e->queue commandBuffer];
-        id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-        [ce setComputePipelineState:e->analyze];
-        [ce setBytes:&j->P length:sizeof(j->P) atIndex:3];
+        /* One analyze buffer per band, each planning and packing its own as
+         * soon as it lands. Bands are independent -- every band's bit offsets
+         * start from zero -- so band 0 can be on the wire while band 3 is still
+         * being analysed. Batching them into one submission was right when the
+         * caller was blocked waiting; now that nobody waits, the only thing
+         * batching buys is a burst at the far end. */
         for (int b = 0; b < band_count; ++b) {
+            id<MTLCommandBuffer> cb = [e->queue commandBuffer];
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            [ce setComputePipelineState:e->analyze];
+            [ce setBytes:&j->P length:sizeof(j->P) atIndex:3];
             [ce setBuffer:j->src  offset:j->band_bytes  * (size_t)b atIndex:0];
             [ce setBuffer:j->meta offset:j->g.meta_span * (size_t)b atIndex:1];
             [ce setBuffer:j->blob offset:j->g.band_span * (size_t)b + j->g.blob_off + j->g.seed_plane_off
                   atIndex:2];
             [ce dispatchThreadgroups:MTLSizeMake(j->g.tile_count, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-        }
-        [ce endEncoding];
+            [ce endEncoding];
 
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> done_cb) {
-            if (done_cb.error) {
-                fprintf(stderr, "[dpcm-gpu] analyze: %s\n",
-                        done_cb.error.localizedDescription.UTF8String);
-                if (j->done) j->done(j->ctx, 0, NULL, 0);
-                j->src = nil; j->done = NULL; j->ctx = NULL;
-                dispatch_semaphore_signal(e->slots);
-                return;
-            }
-            /* Off Metal's callback thread and onto ours: the plan is ~1 ms of
-             * host work and holding a driver thread for it would throttle every
-             * other command buffer's completion. Serial, so frames stay in
-             * submission order. */
-            dispatch_async(e->plan_q, ^{
-                size_t total_all = 0;
-                plan_bands((uint8_t *)j->blob.contents,
-                           (const uint8_t *)j->meta.contents,
-                           (uint8_t *)j->offs.contents,
-                           &j->g, j->band_count, j->w, j->band_h, j->ten_bit,
-                           j->header_reserve, j->payload_bytes, j->bands, &total_all);
-                job_submit_pack(e, j);
-            });
-        }];
-        [cb commit];
+            const int last = (b + 1 == band_count);
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> done_cb) {
+                if (done_cb.error) {
+                    fprintf(stderr, "[dpcm-gpu] analyze band %d: %s\n", b,
+                            done_cb.error.localizedDescription.UTF8String);
+                    if (j->done) j->done(j->ctx, 0, NULL, b, last);
+                    if (last) {
+                        j->src = nil; j->done = NULL; j->ctx = NULL;
+                        dispatch_semaphore_signal(e->slots);
+                    }
+                    return;
+                }
+                /* Off Metal's callback thread and onto ours: the plan is host
+                 * work and holding a driver thread for it would throttle every
+                 * other command buffer's completion. Serial, so bands stay in
+                 * order. */
+                dispatch_async(e->plan_q, ^{
+                    plan_band((uint8_t *)j->blob.contents,
+                              (const uint8_t *)j->meta.contents,
+                              (uint8_t *)j->offs.contents,
+                              &j->g, b, j->w, j->band_h, j->ten_bit,
+                              j->header_reserve, j->payload_bytes, j->bands);
+                    job_submit_pack_band(e, j, b);
+                });
+            }];
+            [cb commit];
+        }
     }
     return 0;
 }

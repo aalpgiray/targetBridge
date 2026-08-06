@@ -134,12 +134,23 @@ size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
  * the sender's in-flight packet budget. */
 #define TB_DPCM_GPU_JOBS 3
 
-/* Called when a frame has finished encoding, on the encoder's own queue — NOT
- * the caller's. `bands` is valid only for the duration of the call: the slot is
- * recycled as soon as it returns, so send from inside it or copy.
- * `ok` is 0 if the encode failed, in which case `bands` is meaningless. */
+/* Called once per band AS IT FINISHES, in submission order, on the encoder's own
+ * queue — NOT the caller's.
+ *
+ * Per band rather than per frame so the wire sees a band the moment it is ready,
+ * instead of four packets bursting out together when the last one lands. That
+ * burst is visible at the far end: the receiver's presentation cadence is
+ * sensitive to emission spacing in a way the sender's own numbers are not.
+ *
+ * `band` is valid only for the duration of the call. `last` is non-zero on the
+ * final band, after which the job slot is recycled — so the caller must release
+ * any per-frame ownership exactly then, and not before.
+ *
+ * `ok` is 0 if that band's encode failed, in which case `band` is meaningless;
+ * `last` is still delivered so the caller can clean up. */
 typedef void (*tb_dpcm_gpu_done)(void *ctx, int ok,
-                                 const tb_dpcm_gpu_band *bands, int band_count);
+                                 const tb_dpcm_gpu_band *band,
+                                 int index, int last);
 
 /* Encode without blocking the calling thread.
  *

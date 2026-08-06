@@ -1224,6 +1224,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
                         }))
                     },
                     finished: { [weak self] written, ok in
+                        // The last band just went to the socket: this is when
+                        // the frame actually reached the wire.
+                        TBTelemetryReporter.noteEmit()
                         guard let self, ok, written > 0 else { return }
                         self.queue.async {
                             guard !self.dpcmLogged else { return }
@@ -1267,7 +1270,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
                         latProcessMax = max(latProcessMax, process)
                         latSamples += 1
                     }
-                    noteSend()
 
                     // Nothing incremental is in flight, so a later fall back to
                     // the uncompressed path must start from a full frame.
