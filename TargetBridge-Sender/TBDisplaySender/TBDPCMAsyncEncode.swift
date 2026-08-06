@@ -62,6 +62,28 @@ final class TBDPCMFrameContext {
     deinit {
         CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
     }
+
+    // KEEP THIS LOCK. Removing it is correct on paper and measurably worse.
+    //
+    // The reasoning for dropping it was sound: a CVPixelBuffer lock governs CPU
+    // access, the GPU reads the IOSurface directly, and retaining the sample
+    // buffer already keeps the surface alive. It removed the 3.6-11 ms `lock`
+    // stage and the sender's own numbers stayed perfect at 100%/100%.
+    //
+    // The RECEIVER went from presenting 1:240 (100%) to 1:190 (80%) with 8% of
+    // frames bunched into pairs, consistently, across every window.
+    //
+    // Because the lock was accidental backpressure. Held across the encode, the
+    // capture thread blocks on the NEXT frame's lock until an earlier encode
+    // finishes, which spaces submissions -- and so completions, and so packets.
+    // Without it the thread submits freely, encodes finish in bursts, and
+    // packets leave bunched. `send(wall)` cannot see this: it is sampled at
+    // submission, while the packets are actually emitted later from the
+    // completion callback.
+    //
+    // Losing 3.6 ms on a thread with 13 ms of headroom to gain even packet
+    // emission is a good trade. If this is revisited, replace it with DELIBERATE
+    // pacing rather than simply deleting it.
 }
 
 /// C callback for `tb_dpcm_gpu_encode_bands_async`.
