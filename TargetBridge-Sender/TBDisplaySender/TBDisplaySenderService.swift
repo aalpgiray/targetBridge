@@ -1322,7 +1322,14 @@ private final class TBVideoPipeline: @unchecked Sendable {
             let r = (word >> 20) & 0x3FF
             let g = (word >> 10) & 0x3FF
             let b = word & 0x3FF
-            if ((r | g | b) & 3) != 0 { deep += 1 }
+            // Non-zero low bits do NOT mean real depth. The standard 8->10
+            // widening is bit replication, v10 = (v8 << 2) | (v8 >> 6), which
+            // sets the low 2 bits on almost every sample — so the old test
+            // reported ~99% on padded 8-bit data and was worthless. What
+            // separates the two is whether the low bits are PREDICTABLE from
+            // the high 8: under replication they always are.
+            func isReplicated(_ v: UInt32) -> Bool { (v & 3) == (v >> 8) }
+            if !(isReplicated(r) && isReplicated(g) && isReplicated(b)) { deep += 1 }
             sampled += 1
             index += 997      // prime: spreads samples across rows and columns
         }
@@ -1352,7 +1359,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         guard sampled > 0 else { return }
         let pct = Double(deep) * 100.0 / Double(sampled)
         TBLog.connection.notice(
-            "10-bit probe: \(deep, privacy: .public)/\(sampled, privacy: .public) samples carry sub-8-bit detail (\(String(format: "%.2f", pct), privacy: .public)%) — 0% means the source is 8-bit padded into l10r"
+            "10-bit probe: \(deep, privacy: .public)/\(sampled, privacy: .public) samples carry REAL sub-8-bit detail (\(String(format: "%.2f", pct), privacy: .public)%) — near 0% means 8-bit bit-replicated into l10r, not true 10-bit"
         )
     }
 
