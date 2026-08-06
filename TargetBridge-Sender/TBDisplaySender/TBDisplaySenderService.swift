@@ -868,7 +868,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         TBLog.connection.info("cadence send(wall)   \(fmt(self.sendCadenceBin), privacy: .public)  drops \(self.cadenceDrops, privacy: .public)")
         if latSamples > 0 {
             let n = Double(latSamples)
-            TBLog.connection.info("latency delivery \(String(format: "%.1f", self.latDeliverySum / n), privacy: .public) ms avg / \(String(format: "%.1f", self.latDeliveryMax), privacy: .public) max | process \(String(format: "%.1f", self.latProcessSum / n), privacy: .public) ms avg / \(String(format: "%.1f", self.latProcessMax), privacy: .public) max")
+            TBLog.connection.info("latency delivery \(String(format: "%.1f", self.latDeliverySum / n), privacy: .public) ms avg / \(String(format: "%.1f", self.latDeliveryMax), privacy: .public) max | process \(String(format: "%.1f", self.latProcessSum / n), privacy: .public) ms avg / \(String(format: "%.1f", self.latProcessMax), privacy: .public) max | inflight \(self.pendingVideoPackets, privacy: .public)/\(self.preset.maxPendingVideoPackets * ((self.dpcmEnabled && self.dpcmSlicesEnabled) ? max(1, self.dpcmSliceCount) : 1), privacy: .public)")
         }
         latDeliverySum = 0; latDeliveryMax = 0
         latProcessSum = 0; latProcessMax = 0
