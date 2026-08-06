@@ -23,16 +23,39 @@ enum TBDamageRects {
     /// group table and its alignment padding, and each is a separate encode
     /// submission and a separate socket write.
     ///
-    /// 0.5 is a starting point, not a measured optimum. The honest way to tune
-    /// it is to log the damaged-area distribution during real use and find where
-    /// rect overhead crosses the saving — until that exists, this is a guess and
-    /// should be described as one.
-    static let wholeFrameAbove = 0.5
+    /// It scales with the rect count, because the overhead does.
+    ///
+    /// 0.5 was set reasoning about MANY rects, where each repeats a packet
+    /// header, a TBD2 header, a group table, alignment padding, a submission and
+    /// a socket write. Measured against real use at `maxRects = 1` that threw
+    /// away 220 frames out of 240 (`path skips: ... toomuch 220`) — because a
+    /// single bounding box over any two separated changes spans most of a 5K
+    /// screen.
+    ///
+    /// With ONE rect the extra cost over a whole frame is 32 bytes, so a rect
+    /// covering 77% still saves 23% of the wire for nothing. The threshold
+    /// therefore starts near 1 and tightens as rects multiply.
+    static var wholeFrameAbove: Double {
+        maxRects <= 1 ? 0.92 : 0.5
+    }
 
-    /// More rects than this and they are merged into their bounding box. Each
-    /// costs a submission, a completion and a write, and the in-flight budget is
-    /// counted in packets — which is exactly what stopped N=8 from working.
-    static let maxRects = 8
+    /// More rects than this and they are merged into their bounding box.
+    ///
+    /// **One, deliberately, for now.** Multiple rects per frame is the point of
+    /// the feature and it does not work yet: each rect becomes its own encoder
+    /// job, the ring has three slots sized for whole frames, and the sender's
+    /// in-flight budget still counts BANDS — so an 8-rect frame refused most of
+    /// its own regions and shipped partial frames at 2-4 fps.
+    ///
+    /// At one rect a frame costs exactly one job and one packet, which is what a
+    /// whole frame costs, so nothing in the accounting changes and the path is
+    /// safe to run. It still skips everything outside the damaged bounding box,
+    /// and `wholeFrameAbove` already gives up when that box grows large.
+    ///
+    /// Raising this needs the encoder generalised from "N equal bands" to "N
+    /// arbitrary regions" so a frame's rects share ONE submission, and the
+    /// in-flight budget taught to count regions. Until then it stays at one.
+    static let maxRects = 1
 
     struct Rect: Equatable {
         var x: Int, y: Int, w: Int, h: Int

@@ -469,6 +469,17 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// lost or mis-placed rect persists; a periodic full frame bounds how long
     /// any such error can survive.
     private var framesSinceDPCMKey = 0
+    /// Whether the receiver has a complete frame to patch into.
+    ///
+    /// Rects are incremental: anything never covered by one keeps whatever was
+    /// on the surface before, so the first frame of a session — and the first
+    /// after any geometry change — must be whole.
+    ///
+    /// This is deliberately NOT `needsKeyframe`. That flag belongs to the
+    /// uncompressed damage path and the DPCM path sets it true on every frame,
+    /// so gating rects on `!needsKeyframe` meant they could never run at all:
+    /// `path: 0 rect / 240 whole` with everything else negotiated correctly.
+    private var dpcmHasKeyframe = false
     /// Bands per frame. 18 or 20 measured best on this hardware: encode grows
     /// ~0.26 ms per slice (two GPU round trips each), so past ~20 it overtakes the
     /// wire and becomes the slowest stage, and the makespan turns back up.
@@ -539,6 +550,18 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// all, which means the spike is either somewhere unsampled or is not where
     /// the aggregate suggests. Splitting the number is cheaper than a fourth
     /// guess: whichever stage owns the maximum is the answer.
+    /// Frames sent as damage rects vs as whole frames, since the last report.
+    /// Without this the only evidence was a once-per-session log line describing
+    /// the FIRST frame, which is always a keyframe — so it said "whole frame"
+    /// regardless of what followed.
+    private var pathRectFrames = 0
+    private var pathWholeFrames = 0
+    private var pathRectFraction = 0.0
+    /// Why the rect path was skipped, counted per reason. Two guesses at this
+    /// were wrong, so it reports rather than infers.
+    private var skipWanted = 0, skipCap = 0, skipNoKey = 0
+    private var skipKeyAge = 0, skipNoDirty = 0, skipTooMuch = 0
+
     private var stageProbeMax = 0.0     // depth/alpha probe
     private var stageLockMax = 0.0      // CVPixelBufferLockBaseAddress
     private var stageCtxMax = 0.0       // frame context + closures
@@ -954,6 +977,18 @@ private final class TBVideoPipeline: @unchecked Sendable {
             * ((dpcmEnabled && dpcmSlicesEnabled) ? max(1, dpcmSliceCount) : 1)
 
         tbIdleFramesSeen = 0
+        if pathRectFrames > 0 || pathWholeFrames > 0 {
+            let total = pathRectFrames + pathWholeFrames
+            let avgPct = pathRectFrames > 0
+                ? 100.0 * pathRectFraction / Double(pathRectFrames) : 0
+            TBLog.connection.info("path: \(self.pathRectFrames, privacy: .public) rect / \(self.pathWholeFrames, privacy: .public) whole of \(total, privacy: .public), rect avg \(String(format: "%.1f", avgPct), privacy: .public)% of frame")
+        }
+        if pathWholeFrames > 0 {
+            TBLog.connection.info("path skips: wanted \(self.skipWanted, privacy: .public) cap \(self.skipCap, privacy: .public) nokey \(self.skipNoKey, privacy: .public) keyage \(self.skipKeyAge, privacy: .public) nodirty \(self.skipNoDirty, privacy: .public) toomuch \(self.skipTooMuch, privacy: .public)")
+        }
+        skipWanted = 0; skipCap = 0; skipNoKey = 0
+        skipKeyAge = 0; skipNoDirty = 0; skipTooMuch = 0
+        pathRectFrames = 0; pathWholeFrames = 0; pathRectFraction = 0
         stageProbeMax = 0; stageLockMax = 0; stageCtxMax = 0; stageSubmitMax = 0
 
         TBTelemetryReporter.report(capBins: capBins, sendBins: sendBins,
@@ -1198,12 +1233,17 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 // that. Falls through to bands when the answer is "everything",
                 // which is what fullscreen video always answers.
                 var damagePlan: TBDamageRects.Plan = .wholeFrame
-                if dpcmRectsWanted, dpcmRectsEnabled, !needsKeyframe,
-                   framesSinceDPCMKey < 60,
-                   let fresh = Self.dirtyRects(from: sampleBuffer, width: width, height: height) {
+                if !dpcmRectsWanted { skipWanted += 1 }
+                else if !dpcmRectsEnabled { skipCap += 1 }
+                else if !dpcmHasKeyframe { skipNoKey += 1 }
+                else if framesSinceDPCMKey >= 60 { skipKeyAge += 1 }
+                else if let fresh = Self.dirtyRects(from: sampleBuffer, width: width, height: height) {
                     damagePlan = TBDamageRects.plan(
                         dirty: fresh.map { TBDamageRects.Rect(x: $0.x, y: $0.y, w: $0.w, h: $0.h) },
                         frameW: width, frameH: height)
+                    if case .wholeFrame = damagePlan { skipTooMuch += 1 }
+                } else {
+                    skipNoDirty += 1
                 }
 
                 if case .rects(let rects) = damagePlan, !rects.isEmpty {
@@ -1257,6 +1297,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     }
 
                     if sentAny {
+                        pathRectFrames += 1
+                        pathRectFraction += Double(rects.reduce(0) { $0 + $1.w * $1.h })
+                            / Double(width * height)
                         let process = (Self.hostNow() - frameEnteredAt) * 1000.0
                         if process >= 0, process < 500 {
                             latProcessSum += process
@@ -1276,7 +1319,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
 
                 // Whole frame (as bands). Also the keyframe that bounds how long
                 // any mis-placed rect can persist.
+                pathWholeFrames += 1
                 framesSinceDPCMKey = 0
+                // The receiver now has a complete surface, so rects may patch it.
+                dpcmHasKeyframe = true
                 let wantSlices = dpcmSlicesEnabled ? max(1, dpcmSliceCount) : 1
                 let bandRows = height / wantSlices
                 let sliceCount = (wantSlices > 1 && bandRows % Int(TB_DPCM_TILE) == 0
@@ -3412,7 +3458,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         pipeline?.dpcmEnabled = receiverSupportsDPCM
         pipeline?.dpcmSlicesEnabled = receiverSupportsDPCMSlices
         pipeline?.dpcmRectsEnabled = receiverSupportsDPCMRects
-        TBLog.connection.info("receiver caps: dpcm=\(self.receiverSupportsDPCM, privacy: .public) float32Audio=\(self.receiverSupportsFloat32Audio, privacy: .public)")
+        TBLog.connection.info("receiver caps: dpcm=\(self.receiverSupportsDPCM, privacy: .public) slices=\(self.receiverSupportsDPCMSlices, privacy: .public) rects=\(self.receiverSupportsDPCMRects, privacy: .public) float32Audio=\(self.receiverSupportsFloat32Audio, privacy: .public)")
         // The shipped-log file is a rolling record across sessions, so mark
         // where this one starts; without it a reader cannot tell one run's
         // output from the next.
