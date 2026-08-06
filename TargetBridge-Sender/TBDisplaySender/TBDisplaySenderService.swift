@@ -1383,7 +1383,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// only reported until something depends on it.
     private func probeAlphaConstant(_ base: UnsafeMutableRawPointer, width: Int, height: Int, stride: Int) {
         if alphaProbeCountdown > 0 { alphaProbeCountdown -= 1; return }
-        alphaProbeCountdown = 300
+        alphaProbeCountdown = alphaProbeInterval
+        alphaProbeInterval = Swift.min(alphaProbeInterval * 2, 216_000)
 
         var sampled = 0
         var opaque = 0
@@ -1411,10 +1412,28 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// zero — which is directly measurable. Sampled on a prime stride so we
     /// cover the frame without walking all 14.7M pixels.
     private var tenBitProbeCountdown = 0
+    /// Frames to skip before the next depth probe, doubling each time.
+    ///
+    /// The probe touches ~143,000 scattered locations across a 59 MB buffer --
+    /// 20,000 at a 997-word stride plus 48 rows of 2560 -- and every one is a
+    /// cache and TLB miss. Measured at 12-38 ms ON THE CAPTURE THREAD, which was
+    /// the entire `process` spike: 2.7 ms average against a 40.7 ms maximum,
+    /// with the stage breakdown reading `probe 38.4 | lock 9.0 | ctx 0.0 |
+    /// submit 0.4`.
+    ///
+    /// It is pure diagnostics, and the answer cannot change during a session:
+    /// the framebuffer's depth is fixed when the display is created. Early
+    /// frames are worth probing (the first ones can carry a partially drawn
+    /// desktop and read low), so back off rather than probe once — the interval
+    /// doubles until it is effectively never, and a format change resets it.
+    private var tenBitProbeInterval = 180
+    private var alphaProbeInterval = 300
     private var alphaProbeCountdown = 0
     private func probeTenBitDepth(_ base: UnsafeMutableRawPointer, width: Int, height: Int, stride: Int) {
         if tenBitProbeCountdown > 0 { tenBitProbeCountdown -= 1; return }
-        tenBitProbeCountdown = 180   // roughly every 3s at 60fps
+        tenBitProbeCountdown = tenBitProbeInterval
+        // ~3s, then 6, 12, 24... capped where it stops mattering.
+        tenBitProbeInterval = Swift.min(tenBitProbeInterval * 2, 216_000)
 
         var sampled = 0
         var deep = 0
