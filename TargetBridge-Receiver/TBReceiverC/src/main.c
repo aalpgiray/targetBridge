@@ -1637,6 +1637,38 @@ static int send_all(int fd, const uint8_t *buf, size_t len) {
     return 0;
 }
 
+/* Every packet written to the client socket goes through here.
+ *
+ * There is more than one writer: the mic callback runs on AVFoundation's
+ * capture queue while the main loop sends profiles, input events and shipped
+ * log text. send_all() loops over partial writes, so without this lock two
+ * writers interleave mid-packet and the sender sees a length field spliced out
+ * of somebody else's payload. It reported exactly that —
+ * "corrupt inbound stream (invalid packet length 2199163323)" — and dropped the
+ * connection. The race was always there; it only became certain once log
+ * shipping gave the main loop something to send every frame. */
+static pthread_mutex_t g_send_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Caller must hold g_send_lock. */
+static int tb_send_packet_locked(struct app *a, uint8_t type,
+                                 const uint8_t *body, size_t len) {
+    uint8_t header[TB_HDR_BYTES];
+    write_be32(header, (uint32_t)(1 + len));
+    header[4] = type;
+    if (send_all(a->client_fd, header, sizeof(header)) < 0) return -1;
+    if (len > 0 && send_all(a->client_fd, body, len) < 0) return -1;
+    return 0;
+}
+
+static int tb_send_packet(struct app *a, uint8_t type,
+                          const uint8_t *body, size_t len) {
+    if (!a || a->client_fd < 0) return -1;
+    pthread_mutex_lock(&g_send_lock);
+    const int rc = tb_send_packet_locked(a, type, body, len);
+    pthread_mutex_unlock(&g_send_lock);
+    return rc;
+}
+
 static void tb_receiver_send_input_event(struct app *a,
                                          const char *kind,
                                          int has_dx, int dx,
@@ -1675,7 +1707,7 @@ static void tb_receiver_send_input_event(struct app *a,
                               has_key_code ? (unsigned int)key_code : 0,
                               a->input_control_mode);
     }
-    (void)send_all(a->client_fd, pkt, 5 + (size_t)len);
+    (void)tb_send_packet(a, TB_PKT_INPUT_EVENT, pkt + 5, (size_t)len);
 }
 
 static void tb_receiver_send_target_switch(struct app *a, int direction) {
@@ -2048,11 +2080,7 @@ static void tb_receiver_send_display_tweaks_if_changed(struct app *a) {
                        tone ? "true" : "false");
     if (len <= 0 || (size_t)len >= sizeof(json)) return;
 
-    uint8_t pkt[4 + 1 + sizeof(json)];
-    write_be32(pkt, (uint32_t)(1 + len));
-    pkt[4] = TB_PKT_DISPLAY_TWEAKS;
-    memcpy(pkt + 5, json, (size_t)len);
-    (void)send_all(a->client_fd, pkt, 5 + (size_t)len);
+    (void)tb_send_packet(a, TB_PKT_DISPLAY_TWEAKS, (const uint8_t *)json, (size_t)len);
 }
 
 
@@ -2069,11 +2097,7 @@ static void tb_mic_frame_cb(const uint8_t *pcm, size_t bytes, void *user_data) {
     const size_t kMax = 8192;
     while (bytes > 0) {
         const size_t chunk = bytes > kMax ? kMax : bytes;
-        uint8_t header[5];
-        write_be32(header, (uint32_t)(1 + chunk));
-        header[4] = TB_PKT_MIC_FRAME;
-        if (send_all(a->client_fd, header, sizeof(header)) < 0) return;
-        if (send_all(a->client_fd, pcm, chunk) < 0) return;
+        if (tb_send_packet(a, TB_PKT_MIC_FRAME, pcm, chunk) < 0) return;
         pcm += chunk;
         bytes -= chunk;
     }
@@ -2153,7 +2177,7 @@ static void send_receiver_info(struct app *a) {
     pkt[4] = TB_PKT_DISPLAY_PROFILE;
     memcpy(pkt + 5, json, (size_t)json_len);
 
-    if (send_all(a->client_fd, pkt, packet_len) == 0) {
+    if (tb_send_packet(a, TB_PKT_DISPLAY_PROFILE, pkt + 5, (size_t)json_len) == 0) {
         fprintf(stderr,
                 "[main] sent display profile: panel=%ux%u mode=%ux%u hidpi name=%s\n",
                 panel_w, panel_h, mode_w, mode_h, info.name);
@@ -2330,19 +2354,26 @@ static void link_reader_stop(struct tb_link_reader *r) {
 static void pump_log_shipping(struct app *a) {
     if (!a || a->client_fd < 0) return;
 
+    /* Take the lock BEFORE draining. Draining removes bytes from the ring, so
+     * discovering afterwards that the socket is busy would throw them away.
+     *
+     * trylock rather than lock: send_all() tolerates a stalled socket for two
+     * seconds, and the render loop must not block that long behind the mic
+     * thread for something as optional as a log line. Whatever is pending just
+     * waits in the ring for the next pass. */
+    if (pthread_mutex_trylock(&g_send_lock) != 0) return;
+
     uint8_t buf[8192];
     for (int chunk = 0; chunk < 4; ++chunk) {
         const size_t n = tb_logship_drain(buf, sizeof(buf));
-        if (n == 0) return;
-        uint8_t header[TB_HDR_BYTES];
-        write_be32(header, (uint32_t)(1 + n));
-        header[4] = TB_PKT_LOG;
+        if (n == 0) break;
         /* A failed send is not worth reporting: the report would go to stderr,
          * which is what just failed to send, and the session teardown that
          * follows will say so anyway. */
-        if (send_all(a->client_fd, header, sizeof(header)) < 0) return;
-        if (send_all(a->client_fd, buf, n) < 0) return;
+        if (tb_send_packet_locked(a, TB_PKT_LOG, buf, n) < 0) break;
     }
+
+    pthread_mutex_unlock(&g_send_lock);
 }
 
 /* Main thread: run queued control packets, then render at most one frame (the
