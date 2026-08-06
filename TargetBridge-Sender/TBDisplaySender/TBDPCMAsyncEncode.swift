@@ -1,3 +1,4 @@
+import CoreMedia
 import CoreVideo
 import Foundation
 import Network
@@ -9,6 +10,19 @@ import Network
 /// or ScreenCaptureKit recycles it under the GPU), and the packet header fields
 /// that were true at capture time rather than at completion time.
 final class TBDPCMFrameContext {
+    /// Retained for its LIFETIME, not for its contents.
+    ///
+    /// Holding the CVPixelBuffer alone keeps the memory valid, which is why
+    /// nothing crashed -- but in ScreenCaptureKit the SAMPLE buffer is what owns
+    /// the surface's place in the pool. Without this, SCK considers the surface
+    /// available and writes the next frame into it while the GPU is still
+    /// reading it for this one.
+    ///
+    /// The result was complete, in-order frames containing the wrong pixels: a
+    /// stale image alternating with live ones, seen as a flicker. Every delivery
+    /// counter stayed clean -- 0 incomplete, 0 bands lost, 0 drops -- because
+    /// delivery was never the problem. The bytes were simply the wrong bytes.
+    let sampleBuffer: CMSampleBuffer
     let pixelBuffer: CVPixelBuffer
     let captureNanos: UInt64
     let frameID: UInt32
@@ -22,7 +36,8 @@ final class TBDPCMFrameContext {
     /// anything about logging.
     let finished: (Int, Bool) -> Void
 
-    init(pixelBuffer: CVPixelBuffer,
+    init(sampleBuffer: CMSampleBuffer,
+         pixelBuffer: CVPixelBuffer,
          captureNanos: UInt64,
          frameID: UInt32,
          sliceCount: Int,
@@ -31,6 +46,7 @@ final class TBDPCMFrameContext {
          height: Int,
          send: @escaping (Data) -> Void,
          finished: @escaping (Int, Bool) -> Void) {
+        self.sampleBuffer = sampleBuffer
         self.pixelBuffer = pixelBuffer
         self.captureNanos = captureNanos
         self.frameID = frameID

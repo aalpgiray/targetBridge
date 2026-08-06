@@ -82,17 +82,6 @@ struct tb_dpcm_gpu {
     dispatch_semaphore_t   slots;
     int                    next_job;
 
-    /* Wrapping the caller's pixels in an MTLBuffer is a VM mapping, and at 59 MB
-     * it is not free: submission averaged 2.8 ms but spiked past 30, which shows
-     * up as one frame going out a period late and the next immediately behind
-     * it -- the 2% of sends under 8 ms apart.
-     *
-     * ScreenCaptureKit recycles IOSurfaces from a small pool, so the same few
-     * base addresses repeat forever and the mapping is pure waste. Cache by
-     * (address, length); a handful of entries covers the pool, and anything
-     * else falls through to a fresh wrap. */
-    struct { const void *base; size_t len; id<MTLBuffer> buf; } src_cache[8];
-    int                    src_cache_n;
 
     /* Reused across frames; grown, never shrunk. */
     id<MTLBuffer> blob;        /* the whole encoded frame, shared */
@@ -301,7 +290,6 @@ void tb_dpcm_gpu_destroy(tb_dpcm_gpu *e) {
         e->jobs[i].blob = nil; e->jobs[i].meta = nil;
         e->jobs[i].offs = nil; e->jobs[i].src  = nil;
     }
-    for (int i = 0; i < 8; ++i) e->src_cache[i].buf = nil;
     e->plan_q = nil;
     e->slots = nil;
     e->blob = nil; e->meta = nil; e->offs = nil; e->staged = nil;
@@ -786,34 +774,26 @@ int tb_dpcm_gpu_encode_bands_async(tb_dpcm_gpu *e,
             dispatch_semaphore_signal(e->slots);
             return -1;
         }
+        /* A fresh wrapper per frame, deliberately.
+         *
+         * These were cached by base address, on the reasoning that
+         * ScreenCaptureKit recycles IOSurfaces so the same few addresses repeat.
+         * That reasoning is sound and the cache was still wrong: with three
+         * frames in flight, two jobs handed the same address get the SAME
+         * MTLBuffer, so one job's pack pass can read pixels the next frame has
+         * already overwritten. It showed up as a stale frame alternating with
+         * live ones -- a flicker -- and none of the delivery counters could see
+         * it, because every band arrived intact and in order. The bytes were
+         * simply the wrong bytes.
+         *
+         * It was worth ~0.7 ms of a 2.4 ms average, inside measurement noise,
+         * and it was never the spike it was added to fix (that was the depth
+         * probe). Not worth a correctness risk. */
         const size_t mapped_len = (src_bytes + page - 1) / page * page;
-        j->src = nil;
-        for (int i = 0; i < e->src_cache_n; ++i) {
-            if (e->src_cache[i].base == src && e->src_cache[i].len == mapped_len) {
-                j->src = e->src_cache[i].buf;
-                break;
-            }
-        }
-        if (!j->src) {
-            j->src = [e->dev newBufferWithBytesNoCopy:(void *)src
-                                               length:mapped_len
-                                              options:MTLResourceStorageModeShared
-                                          deallocator:nil];
-            if (j->src) {
-                /* Evict oldest by wrapping; the pool is small and stable, so a
-                 * miss after warm-up means the pool itself changed. */
-                const int slot = (e->src_cache_n < 8) ? e->src_cache_n++ : 0;
-                if (slot == 0 && e->src_cache_n == 8) {
-                    for (int i = 0; i < 7; ++i) e->src_cache[i] = e->src_cache[i + 1];
-                    e->src_cache[7].base = src; e->src_cache[7].len = mapped_len;
-                    e->src_cache[7].buf = j->src;
-                } else {
-                    e->src_cache[slot].base = src;
-                    e->src_cache[slot].len  = mapped_len;
-                    e->src_cache[slot].buf  = j->src;
-                }
-            }
-        }
+        j->src = [e->dev newBufferWithBytesNoCopy:(void *)src
+                                           length:mapped_len
+                                          options:MTLResourceStorageModeShared
+                                      deallocator:nil];
         if (!j->src) {
             dispatch_semaphore_signal(e->slots);
             return -1;

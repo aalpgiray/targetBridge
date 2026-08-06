@@ -1185,6 +1185,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 // in tbDPCMAsyncDone.
                 let ctxStart = Self.hostNow()
                 let frameCtx = TBDPCMFrameContext(
+                    sampleBuffer: sampleBuffer,
                     pixelBuffer: pixelBuffer,
                     captureNanos: captureNanos,
                     frameID: dpcmFrameID,
