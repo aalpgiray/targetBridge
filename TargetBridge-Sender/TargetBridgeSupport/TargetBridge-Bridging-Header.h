@@ -40,6 +40,20 @@
 - (instancetype)initWithWidth:(NSUInteger)width
                        height:(NSUInteger)height
                   refreshRate:(double)refreshRate;
+/* Found by runtime introspection, not documentation. A virtual display is 8-bpc
+ * because it is SDR; declaring a transfer function is what makes macOS treat it
+ * as HDR and promote the framebuffer to 16-bpc, which is the only reason our
+ * 10-bit capture currently carries 8 bits of real data. BetterDisplay's "Enable
+ * HDR support" does exactly this — its help text says "16-bpc ... default is
+ * 8-bpc, SDR".
+ *
+ * The value is an unsigned enum whose meanings are undocumented; TBTransferFn
+ * exists so it can be found empirically. */
+- (instancetype)initWithWidth:(NSUInteger)width
+                       height:(NSUInteger)height
+                  refreshRate:(double)refreshRate
+             transferFunction:(unsigned int)transferFunction;
+@property (nonatomic) unsigned int transferFunction;
 @property (nonatomic, readonly) NSUInteger width;
 @property (nonatomic, readonly) NSUInteger height;
 @property (nonatomic, readonly) double     refreshRate;

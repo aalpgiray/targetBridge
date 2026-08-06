@@ -131,13 +131,31 @@ final class ReceiverBackedVirtualDisplaySession {
 
         let settings = CGVirtualDisplaySettings()
         settings.hiDPI = profile.hiDPI
-        guard let mode = CGVirtualDisplayMode(
-            width: UInt(resolvedMode.width),
-            height: UInt(resolvedMode.height),
-            refreshRate: preferredRefreshRate
-        ) else {
-            return false
+        // `defaults write com.targetbridge.sender TBTransferFn -int N` (0 = off).
+        // A virtual display is 8-bpc because it is SDR; a transfer function is
+        // what declares it HDR and promotes the framebuffer to 16-bpc, which is
+        // the only reason our 10-bit path currently carries 8 real bits. The
+        // enum's meanings are undocumented — this is a knob so the right value
+        // can be found by trying, and reverted with one command if a value
+        // stops the display coming up at all.
+        let tf = UInt32(max(0, UserDefaults.standard.integer(forKey: "TBTransferFn")))
+        let mode: CGVirtualDisplayMode?
+        if tf != 0 {
+            mode = CGVirtualDisplayMode(
+                width: UInt(resolvedMode.width),
+                height: UInt(resolvedMode.height),
+                refreshRate: preferredRefreshRate,
+                transferFunction: tf
+            )
+        } else {
+            mode = CGVirtualDisplayMode(
+                width: UInt(resolvedMode.width),
+                height: UInt(resolvedMode.height),
+                refreshRate: preferredRefreshRate
+            )
         }
+        guard let mode else { return false }
+        TBLog.connection.notice("virtual display transferFunction=\(tf, privacy: .public)")
         settings.modes = [mode]
 
         guard display.apply(settings), display.displayID != kCGNullDirectDisplay else {
