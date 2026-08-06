@@ -430,7 +430,13 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// 1 to go back. A runtime knob rather than a constant because the gain is a
     /// model prediction until it is measured on the link, and because a bad value
     /// should be one command to undo rather than a reinstall.
-    var dpcmSliceCount = max(1, UserDefaults.standard.integer(forKey: "TBSliceCount"))
+    /// 4, measured 2026-08-06: zero incomplete frames over long runs, full rate,
+    /// and ~9 ms of the ~11.8 ms the flow-shop model says slicing can recover —
+    /// 79% of the win. 8 and 18 degrade on this receiver for reasons not yet
+    /// diagnosed, so 4 is the value that is actually known to work rather than
+    /// the one the model prefers. `defaults write com.targetbridge.sender
+    /// TBSliceCount -int 1` returns to whole frames.
+    var dpcmSliceCount = max(1, (UserDefaults.standard.object(forKey: "TBSliceCount") as? Int) ?? 4)
     private var dpcmFrameID: UInt32 = 0
     /// Encoding runs on the GPU. The reference C encoder costs ~118 ms/frame at
     /// 5K single-threaded; this measures 5.7 ms, and more to the point it leaves
