@@ -1198,6 +1198,61 @@ static inline uint32_t be32(const uint8_t *p) {
  * because the blob's own validation covers the blob, not the placement: a band
  * claiming the wrong y0 would be written to the wrong rows and still look like a
  * picture. */
+/* TB_PKT_RAW_DPCM_RECT — one tile-aligned rectangle. See proto.h.
+ *
+ * Deliberately a near-copy of the band handler rather than a shared one with
+ * flags: the two differ only in header layout and the presence of x0, and the
+ * band path is load-bearing enough that threading a mode through it is the more
+ * dangerous edit. */
+static void handle_raw_dpcm_rect(struct app *a, const uint8_t *p, size_t len) {
+    if (len < TB_DPCM_RECT_HEADER) { a->frames_dropped++; return; }
+
+    const uint32_t frame_id = be32(p + 8);
+    const uint32_t frame_w  = be32(p + 12);
+    const uint32_t frame_h  = be32(p + 16);
+    const uint32_t x0       = be32(p + 20);
+    const uint32_t y0       = be32(p + 24);
+    const uint16_t index    = (uint16_t)((p[28] << 8) | p[29]);
+    const uint16_t count    = (uint16_t)((p[30] << 8) | p[31]);
+
+    if (count == 0 || index >= count) { a->frames_dropped++; return; }
+    if (frame_w == 0 || frame_h == 0 || frame_w > 16384 || frame_h > 16384) { a->frames_dropped++; return; }
+    if (x0 >= frame_w || y0 >= frame_h) { a->frames_dropped++; return; }
+    /* Both offsets must land on the tile grid or the shader writes a region
+     * shifted against the tiles it decoded. */
+    if ((x0 % 8u) || (y0 % 8u)) { a->frames_dropped++; return; }
+
+    if (frame_id != a->dpcm_frame_id) {
+        if (index != 0 && !a->dpcm_seq_warned) {
+            a->dpcm_seq_warned = 1;
+            fprintf(stderr, "[dpcm] frame %u started at rect %u of %u\n", frame_id, index, count);
+        }
+        a->dpcm_frame_id = frame_id;
+    }
+
+    const int is_last = (index + 1 == count);
+    if (tb_disp_render_dpcm_slice(a->disp, p + TB_DPCM_RECT_HEADER,
+                                  len - TB_DPCM_RECT_HEADER,
+                                  (int)frame_w, (int)frame_h,
+                                  (int)x0, (int)y0, is_last) != 0) {
+        a->frames_dropped++;
+    } else if (index < 32) {
+        a->dpcm_got_mask |= (1u << index);
+    }
+
+    if (is_last) {
+        const uint32_t want = (count >= 32) ? 0xFFFFFFFFu : ((1u << count) - 1u);
+        a->dpcm_frames_total++;
+        if ((a->dpcm_got_mask & want) != want) {
+            a->dpcm_frames_short++;
+            for (int b = 0; b < count && b < 32; ++b)
+                if (!(a->dpcm_got_mask & (1u << b))) a->dpcm_bands_lost++;
+        }
+        a->dpcm_got_mask = 0;
+    }
+    a->have_video_frame = 1;
+}
+
 static void handle_raw_dpcm_slice(struct app *a, const uint8_t *p, size_t len) {
     if (len < TB_DPCM_SLICE_HEADER) { a->frames_dropped++; return; }
 
@@ -2225,7 +2280,7 @@ static void send_receiver_info(struct app *a) {
         "{\"receiverName\":\"%s\",\"panelWidth\":%u,\"panelHeight\":%u,"
         "\"modeWidth\":%u,\"modeHeight\":%u,\"refreshRate\":60,"
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
-        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsFloat32Audio\":true,\"supportsDPCM\":%s,\"supportsDPCMSlices\":%s,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s,"
+        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsFloat32Audio\":true,\"supportsDPCM\":%s,\"supportsDPCMSlices\":%s,\"supportsDPCMRects\":%s,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s,"
         "\"supportsNightShift\":%s,\"supportsTrueTone\":%s}",
         escaped_name,
         panel_w,
@@ -2236,6 +2291,9 @@ static void send_receiver_info(struct app *a) {
         capture_h,
         tb_dec_supports_hevc_hwdecode() ? "true" : "false",
         tb_disp_supports_dpcm() ? "true" : "false",
+        tb_disp_supports_dpcm() ? "true" : "false",
+        /* Rects need exactly what slices need — the same GPU decoder placing a
+         * region at an offset — so they ride on the same capability. */
         tb_disp_supports_dpcm() ? "true" : "false",
         tb_receiver_input_monitoring_trusted() ? "true" : "false",
         tb_receiver_accessibility_trusted() ? "true" : "false",
@@ -2270,7 +2328,8 @@ static void reader_on_packet(uint8_t type, const uint8_t *payload, size_t len, v
     struct app *a = r->app;
 
     if (type == TB_PKT_RAW_FRAME || type == TB_PKT_RAW_DAMAGE ||
-        type == TB_PKT_RAW_DPCM || type == TB_PKT_RAW_DPCM_SLICE) {
+        type == TB_PKT_RAW_DPCM || type == TB_PKT_RAW_DPCM_SLICE ||
+        type == TB_PKT_RAW_DPCM_RECT) {
         /* Keep this packet without copying it: ask the parser to yield its
          * buffer. The `payload` pointer stays valid inside that buffer, which
          * the reader loop collects and publishes right after commit returns. */
@@ -2352,7 +2411,8 @@ static void *link_reader_main(void *ud) {
                          * stalling the socket to get there. */
                         const int is_increment =
                             (r->pending_type == TB_PKT_RAW_DAMAGE ||
-                             r->pending_type == TB_PKT_RAW_DPCM_SLICE);
+                             r->pending_type == TB_PKT_RAW_DPCM_SLICE ||
+                             r->pending_type == TB_PKT_RAW_DPCM_RECT);
 
                         if (!is_increment) {
                             while (a->vq_count > 0) {
@@ -2602,6 +2662,7 @@ static int pump_network(struct app *a) {
         if (ptype == TB_PKT_RAW_DAMAGE)   handle_raw_damage(a, payload, plen);
         else if (ptype == TB_PKT_RAW_DPCM) handle_raw_dpcm(a, payload, plen);
         else if (ptype == TB_PKT_RAW_DPCM_SLICE) handle_raw_dpcm_slice(a, payload, plen);
+        else if (ptype == TB_PKT_RAW_DPCM_RECT)  handle_raw_dpcm_rect(a, payload, plen);
         else                              handle_raw_frame(a, payload, plen);
         worked = 1;
 
