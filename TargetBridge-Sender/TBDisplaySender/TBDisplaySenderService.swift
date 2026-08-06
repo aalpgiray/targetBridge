@@ -436,7 +436,16 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// diagnosed, so 4 is the value that is actually known to work rather than
     /// the one the model prefers. `defaults write com.targetbridge.sender
     /// TBSliceCount -int 1` returns to whole frames.
-    var dpcmSliceCount = max(1, (UserDefaults.standard.object(forKey: "TBSliceCount") as? Int) ?? 4)
+    /// Back to 1 on 2026-08-06. N=4 measures clean — zero incomplete frames over
+    /// long runs — and is worth ~9 ms, but in real use it still shows visible
+    /// glitches and the frame rate degrades until the sender is restarted, and
+    /// neither is understood yet. `process` also goes from 9.2 ms to 15-17,
+    /// leaving almost nothing spare in a 16.7 ms budget.
+    ///
+    /// A latency win that costs usability is not a win. N=4 comes back when the
+    /// async encode has bought the headroom back and the degradation is
+    /// diagnosed. `TBSliceCount -int 4` to try it.
+    var dpcmSliceCount = max(1, (UserDefaults.standard.object(forKey: "TBSliceCount") as? Int) ?? 1)
     private var dpcmFrameID: UInt32 = 0
     /// Encoding runs on the GPU. The reference C encoder costs ~118 ms/frame at
     /// 5K single-threaded; this measures 5.7 ms, and more to the point it leaves
