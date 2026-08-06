@@ -56,6 +56,10 @@ struct tb_dpcm_gpu_params {
     uint32_t widthOff, seedOff, payOff;
     uint32_t bits;      /* 8 or 10; channel c sits at bit c*bits */
     uint32_t alpha;     /* opaque alpha, pre-shifted for this depth */
+    /* First row of the destination this blob belongs to. A slice is simply a
+     * shorter frame written further down the surface, which is why slicing needed
+     * no new codec: the tiles were already independent. Zero for a whole frame. */
+    uint32_t rowOffset;
 };
 
 static struct {
@@ -289,7 +293,7 @@ static NSString *tb_shader_source(void) {
     "struct DpcmParams {\n"
     "  uint width, height, tilesX, tilesY, tileCount, outStridePx;\n"
     "  uint widthOff, seedOff, payOff;\n"
-    "  uint bits, alpha;\n"
+    "  uint bits, alpha, rowOffset;\n"
     "};\n"
     "static inline uint tb_width_get(device const uchar *plane, uint idx) {\n"
     "  uchar b = plane[idx >> 1];\n"
@@ -381,7 +385,7 @@ static NSString *tb_shader_source(void) {
     "                         int((sraw >> (1u * P.bits)) & mask),\n"
     "                         int((sraw >> (2u * P.bits)) & mask));\n"
     "  const uint3 v = uint3(seed + acc) & mask;\n"
-    "  out[(tyi * 8u + y) * P.outStridePx + (txi * 8u + x)] =\n"
+    "  out[(P.rowOffset + tyi * 8u + y) * P.outStridePx + (txi * 8u + x)] =\n"
     "      P.alpha | v.x | (v.y << P.bits) | (v.z << (2u * P.bits));\n"
     "}\n";
 }
@@ -730,6 +734,15 @@ static int tb_frame_ensure(void) {
 }
 
 int tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len) {
+    /* A whole frame is the single-slice case: one band, at row 0, presented
+     * immediately. Kept as one code path so the sliced path is the tested one
+     * even when the sender is not slicing. */
+    return tb_metal_plane_render_dpcm_slice(blob, len, 0, 0, 0, 1);
+}
+
+int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
+                                     int frame_w, int frame_h, int y0,
+                                     int is_last) {
     if (!g.ready || !g.dpcmPipe || !blob) return -1;
 
     /* Validate before anything touches the GPU. This is also what lets the
@@ -742,8 +755,15 @@ int tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len) {
         return -1;
     }
 
+    /* A slice describes a band of a larger surface; a whole frame describes
+     * itself. Passing 0 for the frame size means "this blob is the frame". */
+    if (frame_w <= 0 || frame_h <= 0) { frame_w = in.width; frame_h = in.height; }
+    if (in.width != frame_w) return -1;                       /* bands are full width */
+    if (y0 < 0 || (int64_t)y0 + in.height > frame_h) return -1;
+    if (y0 % TB_DPCM_TILE) return -1;                         /* must land on a tile row */
+
     @autoreleasepool {
-        tb_geometry_set(in.width, in.height);
+        tb_geometry_set(frame_w, frame_h);
         if (tb_frame_ensure() != 0) return -1;
 
         id<MTLBuffer> up = tb_upload_take(len);
@@ -762,7 +782,8 @@ int tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len) {
             (uint32_t)in.width_plane_off, (uint32_t)in.seed_plane_off,
             (uint32_t)in.payload_off,
             in.ten_bit ? 10u : 8u,
-            in.ten_bit ? (3u << 30) : (0xFFu << 24)
+            in.ten_bit ? (3u << 30) : (0xFFu << 24),
+            (uint32_t)y0
         };
 
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
@@ -775,6 +796,24 @@ int tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len) {
         [ce dispatchThreadgroups:MTLSizeMake(in.tile_count, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         [ce endEncoding];
+
+        /* Only the last slice presents. Earlier ones commit their decode and
+         * return, so the GPU works on band k while band k+1 is still arriving —
+         * which is the entire point of slicing. Metal's default hazard tracking
+         * orders those decodes against the present that samples the same buffer,
+         * so no explicit synchronisation is needed between them.
+         *
+         * The inflight count is taken per upload and released by the presenting
+         * command buffer, so a non-presenting slice must hand its own back. */
+        if (!is_last) {
+            dispatch_semaphore_t sem = g.inflight;
+            [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
+                (void)done;
+                dispatch_semaphore_signal(sem);
+            }];
+            [cb commit];
+            return 0;
+        }
 
         /* The blob says which depth it carries, so the texture view matches it.
          * At 8 bits the shader dithers into the 10-bit drawable — what macOS
