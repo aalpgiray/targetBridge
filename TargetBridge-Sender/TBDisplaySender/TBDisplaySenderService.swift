@@ -510,6 +510,20 @@ private final class TBVideoPipeline: @unchecked Sendable {
     ///   process  = callback entry to the send call, i.e. encode plus the copies.
     ///              Bounds what pipelining the encoder or removing a copy could
     ///              possibly win, before building either.
+    /// Worst time seen in each stage of the capture callback since the last
+    /// report.
+    ///
+    /// `process` spiked to ~30 ms against a 2.4 ms average and three separate
+    /// theories for it were wrong -- the Data copy, the MTLBuffer wrap, the
+    /// 10-bit probe. Sampling found none of our code on the capture queue at
+    /// all, which means the spike is either somewhere unsampled or is not where
+    /// the aggregate suggests. Splitting the number is cheaper than a fourth
+    /// guess: whichever stage owns the maximum is the answer.
+    private var stageProbeMax = 0.0     // depth/alpha probe
+    private var stageLockMax = 0.0      // CVPixelBufferLockBaseAddress
+    private var stageCtxMax = 0.0       // frame context + closures
+    private var stageSubmitMax = 0.0    // encoder submission
+
     private var latDeliverySum = 0.0, latDeliveryMax = 0.0
     private var latProcessSum = 0.0, latProcessMax = 0.0
     private var latSamples = 0
@@ -904,6 +918,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
         tbIdleFramesSeen = 0
         TBLog.connection.info("cadence capture(pts) \(fmt(self.capCadenceBin), privacy: .public)  idle \(idle, privacy: .public)")
         TBLog.connection.info("cadence send(wall)   \(fmt(self.sendCadenceBin), privacy: .public)  drops \(self.cadenceDrops, privacy: .public)")
+        if latProcessMax > 0 {
+            TBLog.connection.info("stage worst ms: probe \(String(format: "%.1f", self.stageProbeMax), privacy: .public) | lock \(String(format: "%.1f", self.stageLockMax), privacy: .public) | ctx \(String(format: "%.1f", self.stageCtxMax), privacy: .public) | submit \(String(format: "%.1f", self.stageSubmitMax), privacy: .public)")
+        }
+        stageProbeMax = 0; stageLockMax = 0; stageCtxMax = 0; stageSubmitMax = 0
         if latSamples > 0 {
             let n = Double(latSamples)
             TBLog.connection.info("latency delivery \(String(format: "%.1f", self.latDeliverySum / n), privacy: .public) ms avg / \(String(format: "%.1f", self.latDeliveryMax), privacy: .public) max | process \(String(format: "%.1f", self.latProcessSum / n), privacy: .public) ms avg / \(String(format: "%.1f", self.latProcessMax), privacy: .public) max | inflight \(self.pendingVideoPackets, privacy: .public)/\(self.preset.maxPendingVideoPackets * ((self.dpcmEnabled && self.dpcmSlicesEnabled) ? max(1, self.dpcmSliceCount) : 1), privacy: .public)")
@@ -968,7 +986,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
             return
         }
 
+        let lockStart = Self.hostNow()
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        stageLockMax = max(stageLockMax, (Self.hostNow() - lockStart) * 1000.0)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
         // Send the session ack on the first frame, mirroring the encoded path.
@@ -1087,11 +1107,13 @@ private final class TBVideoPipeline: @unchecked Sendable {
             let height = CVPixelBufferGetHeight(pixelBuffer)
             let stride = CVPixelBufferGetBytesPerRow(pixelBuffer)
             let size = stride * height
+            let probeStart = Self.hostNow()
             if isTenBit {
                 probeTenBitDepth(base, width: width, height: height, stride: stride)
             } else {
                 probeAlphaConstant(base, width: width, height: height, stride: stride)
             }
+            stageProbeMax = max(stageProbeMax, (Self.hostNow() - probeStart) * 1000.0)
             let fmt: UInt8 = isTenBit ? 3 : 2
 
             // Lossless tile-DPCM, when the receiver can decode it on its GPU.
@@ -1161,6 +1183,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 // callback fires; ScreenCaptureKit would otherwise recycle it
                 // mid-encode. `passRetained` is balanced by the `takeRetained`
                 // in tbDPCMAsyncDone.
+                let ctxStart = Self.hostNow()
                 let frameCtx = TBDPCMFrameContext(
                     pixelBuffer: pixelBuffer,
                     captureNanos: captureNanos,
@@ -1189,11 +1212,14 @@ private final class TBVideoPipeline: @unchecked Sendable {
                         }
                     })
 
+                stageCtxMax = max(stageCtxMax, (Self.hostNow() - ctxStart) * 1000.0)
+
                 // The retain is handed to C, so it must be balanced on BOTH
                 // paths: the callback takes it on success, and we take it back
                 // here on refusal. Leaking it would strand a LOCKED pixel
                 // buffer, and ScreenCaptureKit's pool is small enough that a
                 // few of those stop capture entirely.
+                let submitStart = Self.hostNow()
                 var submitted: Int32 = -1
                 if let enc = dpcmGPU {
                     let opaque = Unmanaged.passRetained(frameCtx).toOpaque()
@@ -1208,6 +1234,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
                         Unmanaged<TBDPCMFrameContext>.fromOpaque(opaque).release()
                     }
                 }
+
+                stageSubmitMax = max(stageSubmitMax, (Self.hostNow() - submitStart) * 1000.0)
 
                 if submitted == 0 {
                     // `process` now measures submission, which is the part that
