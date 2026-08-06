@@ -480,6 +480,28 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// so gating rects on `!needsKeyframe` meant they could never run at all:
     /// `path: 0 rect / 240 whole` with everything else negotiated correctly.
     private var dpcmHasKeyframe = false
+
+    /// Cap on frames actually sent, independent of how fast we capture.
+    ///
+    /// Pairs with running the VIRTUAL display faster than the receiver's panel.
+    /// Sending 120 to a 60 Hz panel failed: the iMac decodes about 70 fps of 5K,
+    /// so its queue pinned and 8-20% of frames arrived with missing bands.
+    ///
+    /// But the win was never in DISPLAYING more frames. At 120 the compositor
+    /// samples the content every 8.3 ms instead of 16.7, so a mouse move is
+    /// picked up about 4 ms sooner on average — and that is latency you feel
+    /// rather than a number in a histogram. Capture at 120, send 60, and the
+    /// receiver's load is exactly what it is today.
+    ///
+    ///   defaults write com.targetbridge.sender TBVirtualRefresh -float 120
+    ///   defaults write com.targetbridge.sender TBMaxSendFPS -int 60
+    ///
+    /// 0 (the default) sends everything captured, which is today's behaviour.
+    private let maxSendFPS = UserDefaults.standard.integer(forKey: "TBMaxSendFPS")
+    private var lastSendHostTime = 0.0
+    /// Frames skipped by the cap. Kept apart from `cadenceDrops`, which means
+    /// "the link could not keep up" — these are deliberate and healthy.
+    private var oversampleSkips = 0
     /// Bands per frame. 18 or 20 measured best on this hardware: encode grows
     /// ~0.26 ms per slice (two GPU round trips each), so past ~20 it overtakes the
     /// wire and becomes the slowest stage, and the makespan turns back up.
@@ -983,6 +1005,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 ? 100.0 * pathRectFraction / Double(pathRectFrames) : 0
             TBLog.connection.info("path: \(self.pathRectFrames, privacy: .public) rect / \(self.pathWholeFrames, privacy: .public) whole of \(total, privacy: .public), rect avg \(String(format: "%.1f", avgPct), privacy: .public)% of frame")
         }
+        if oversampleSkips > 0 {
+            TBLog.connection.info("oversample: \(self.oversampleSkips, privacy: .public) frames skipped by the send cap")
+        }
+        oversampleSkips = 0
         if pathWholeFrames > 0 {
             TBLog.connection.info("path skips: wanted \(self.skipWanted, privacy: .public) cap \(self.skipCap, privacy: .public) nokey \(self.skipNoKey, privacy: .public) keyage \(self.skipKeyAge, privacy: .public) nodirty \(self.skipNoDirty, privacy: .public) toomuch \(self.skipTooMuch, privacy: .public)")
         }
@@ -1021,6 +1047,24 @@ private final class TBVideoPipeline: @unchecked Sendable {
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
         noteCapture(sampleBuffer)
+
+        // Deliberate decimation, before any work is done on this frame.
+        //
+        // Placed after noteCapture so the capture cadence still reports what the
+        // compositor produced — that is the number that tells us the
+        // oversampling is actually happening.
+        if maxSendFPS > 0 {
+            let now = Self.hostNow()
+            // 0.95 of the period: capture jitter must not make us skip a slot
+            // and halve the output rate.
+            let minGap = 0.95 / Double(maxSendFPS)
+            if now - lastSendHostTime < minGap {
+                oversampleSkips += 1
+                return
+            }
+            lastSendHostTime = now
+        }
+
         let frameEnteredAt = Self.hostNow()
         let planar = CVPixelBufferGetPlaneCount(pixelBuffer) >= 2
 
