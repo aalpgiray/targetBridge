@@ -546,28 +546,55 @@ void tb_metal_plane_shutdown(void) {
     if (!g.ready) return;
     g.shown = 0;
     g.frame_w = g.frame_h = 0;
+
+    /* A frame caught mid-assembly holds a surface slot that only its LAST band
+     * releases, and that band is never going to arrive. Hand it back before the
+     * drain below, which would otherwise wait for it forever — teardown runs on
+     * the thread servicing the window, so that wait froze the whole receiver the
+     * moment a stream paused partway through a frame. Invisible at one band per
+     * frame, where every frame is also its own last band. */
+    if (g.frame_open && g.frames_free) {
+        dispatch_semaphore_signal(g.frames_free);
+        g.frame_open = 0;
+    }
+
     /* Drain: reclaim every ring slot so no command buffer is still reading a
      * buffer (or the layer) when we release them. */
     if (g.inflight) {
         dispatch_semaphore_t sem = g.inflight;
+        /* Bounded. Metal retains the resources a command buffer references, so
+         * proceeding after a timeout releases our references and nothing more —
+         * the drain is tidiness, not a safety requirement. A teardown that hangs
+         * is far worse than one that gives up early. */
+        int got = 0;
         for (int i = 0; i < TB_UPLOAD_RING; ++i) {
-            dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+            if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
+                                                           500 * NSEC_PER_MSEC)) != 0) break;
+            ++got;
         }
-        /* Hand the counts back before releasing. libdispatch raises SIGILL
-         * ("semaphore deallocated while in use") if a semaphore is disposed
-         * with a value below the one it was created with — draining it to 0
-         * and then dropping the reference crashed on every teardown. */
-        for (int i = 0; i < TB_UPLOAD_RING; ++i) {
-            dispatch_semaphore_signal(sem);
-        }
+        if (got < TB_UPLOAD_RING)
+            fprintf(stderr, "[metal] teardown: %d upload slots never returned\n",
+                    TB_UPLOAD_RING - got);
+        /* Signal the FULL count, not just what was taken. libdispatch raises
+         * SIGILL ("semaphore deallocated while in use") when a semaphore is
+         * disposed below its creation value, and any slot still held by an
+         * in-flight command buffer is never coming back to us. Over-signalling
+         * is harmless; under-signalling crashes, which is how this crashed on
+         * every teardown once before. */
+        for (int i = 0; i < TB_UPLOAD_RING; ++i) dispatch_semaphore_signal(sem);
         g.inflight = nil;
     }
     if (g.frames_free) {
-        /* Same discipline as `inflight`: drain to prove nothing is in flight,
-         * then hand the counts back, because libdispatch raises SIGILL if a
-         * semaphore is disposed below the value it was created with. */
         dispatch_semaphore_t fs = g.frames_free;
-        for (int i = 0; i < TB_FRAME_RING; ++i) dispatch_semaphore_wait(fs, DISPATCH_TIME_FOREVER);
+        int got = 0;
+        for (int i = 0; i < TB_FRAME_RING; ++i) {
+            if (dispatch_semaphore_wait(fs, dispatch_time(DISPATCH_TIME_NOW,
+                                                          500 * NSEC_PER_MSEC)) != 0) break;
+            ++got;
+        }
+        if (got < TB_FRAME_RING)
+            fprintf(stderr, "[metal] teardown: %d frame surfaces never returned\n",
+                    TB_FRAME_RING - got);
         for (int i = 0; i < TB_FRAME_RING; ++i) dispatch_semaphore_signal(fs);
         g.frames_free = nil;
     }
