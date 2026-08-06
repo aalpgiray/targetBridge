@@ -47,6 +47,13 @@
  * still reads frame N, without ever allocating inside the frame loop. */
 #define TB_METAL_RING 3
 
+/* Frames in flight. One surface is not enough once a frame arrives as bands:
+ * the next frame's first band starts decoding while the current frame is still
+ * being presented, and with a single buffer the screen shows bands from two
+ * frames at once. Three is what the source spec called for and what the cost
+ * justifies — 59 MB each against 4 GB of VRAM. */
+#define TB_FRAME_RING 3
+
 /* Mirrors DpcmParams in the shader. */
 struct tb_dpcm_gpu_params {
     uint32_t width, height;
@@ -79,12 +86,25 @@ static struct {
     int                   ring_idx;
     dispatch_semaphore_t  inflight;
 
-    /* Destination for decoded TBD1 frames, in VRAM. 4 bytes per pixel, rows
-     * padded so a texture can be viewed over it. */
-    id<MTLBuffer>         frame;
-    size_t                frame_cap;
+    /* Destinations for decoded frames, in VRAM. 4 bytes per pixel, rows padded
+     * so a texture can be viewed over them. */
+    id<MTLBuffer>         frame[TB_FRAME_RING];
+    size_t                frame_cap[TB_FRAME_RING];
+    int                   frame_widx;      /* being decoded into */
+    int                   frame_open;      /* a frame holds a ring slot */
+    dispatch_semaphore_t  frames_free;
     size_t                frame_bpr;
     int                   frame_w, frame_h;
+
+    /* Orders a frame's band decodes before the present that reads them.
+     *
+     * Not left to hazard tracking: the present samples the surface through a
+     * texture VIEW over the buffer, and a buffer and a texture aliasing it are
+     * distinct resources, so a write-then-read dependency between them is not
+     * something to assume the driver inserts. With one band per frame the two
+     * were adjacent and it never showed; with eighteen it showed immediately. */
+    id<MTLEvent>          decodeEvent;
+    uint64_t              decodeValue;
 
     id<MTLTexture>        curTex;
     int                   cur_tex_w, cur_tex_h;
@@ -507,6 +527,11 @@ int tb_metal_plane_init(SDL_Window *win) {
 
     g.queue = [g.dev newCommandQueue];
     g.inflight = dispatch_semaphore_create(TB_METAL_RING);
+    g.frames_free = dispatch_semaphore_create(TB_FRAME_RING);
+    g.decodeEvent = [g.dev newEvent];
+    g.decodeValue = 0;
+    g.frame_widx = 0;
+    g.frame_open = 0;
     g.ring_idx = 0;
     g.ready = 1;
     g.shown = 1;
@@ -536,8 +561,19 @@ void tb_metal_plane_shutdown(void) {
         }
         g.inflight = nil;
     }
+    if (g.frames_free) {
+        /* Same discipline as `inflight`: drain to prove nothing is in flight,
+         * then hand the counts back, because libdispatch raises SIGILL if a
+         * semaphore is disposed below the value it was created with. */
+        dispatch_semaphore_t fs = g.frames_free;
+        for (int i = 0; i < TB_FRAME_RING; ++i) dispatch_semaphore_wait(fs, DISPATCH_TIME_FOREVER);
+        for (int i = 0; i < TB_FRAME_RING; ++i) dispatch_semaphore_signal(fs);
+        g.frames_free = nil;
+    }
     for (int i = 0; i < TB_METAL_RING; ++i) { g.ring[i] = nil; g.ring_cap[i] = 0; }
-    g.frame = nil; g.frame_cap = 0;
+    for (int i = 0; i < TB_FRAME_RING; ++i) { g.frame[i] = nil; g.frame_cap[i] = 0; }
+    g.frame_open = 0; g.frame_widx = 0;
+    g.decodeEvent = nil;
     g.curTex = nil; g.cur_tex_scale = 0.f;
     g.pipe = nil; g.cursorPipe = nil; g.dpcmPipe = nil;
     g.queue = nil;
@@ -723,14 +759,15 @@ int tb_metal_plane_render_packed(const uint8_t *px, int stride, int w, int h,
     }
 }
 
-/* Size the VRAM destination for a decoded frame. Returns 0 on success. */
+/* Size the VRAM destination currently being written. Returns 0 on success. */
 static int tb_frame_ensure(void) {
+    const int i = g.frame_widx;
     const size_t need = g.frame_bpr * (size_t)g.frame_h;
-    if (g.frame_cap < need) {
-        g.frame = [g.dev newBufferWithLength:need options:MTLResourceStorageModePrivate];
-        g.frame_cap = g.frame ? need : 0;
+    if (g.frame_cap[i] < need) {
+        g.frame[i] = [g.dev newBufferWithLength:need options:MTLResourceStorageModePrivate];
+        g.frame_cap[i] = g.frame[i] ? need : 0;
     }
-    return g.frame ? 0 : -1;
+    return g.frame[i] ? 0 : -1;
 }
 
 int tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len) {
@@ -764,7 +801,19 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
 
     @autoreleasepool {
         tb_geometry_set(frame_w, frame_h);
-        if (tb_frame_ensure() != 0) return -1;
+
+        /* Claim a ring slot for this frame. Held until the frame presents, so
+         * the next frame's bands cannot land in a surface still on screen. */
+        if (!g.frame_open) {
+            dispatch_semaphore_wait(g.frames_free, DISPATCH_TIME_FOREVER);
+            g.frame_open = 1;
+        }
+        if (tb_frame_ensure() != 0) {
+            dispatch_semaphore_signal(g.frames_free);
+            g.frame_open = 0;
+            return -1;
+        }
+        id<MTLBuffer> dst = g.frame[g.frame_widx];
 
         id<MTLBuffer> up = tb_upload_take(len);
         if (!up) return -1;
@@ -791,35 +840,60 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
         [ce setComputePipelineState:g.dpcmPipe];
         [ce setBuffer:up offset:0 atIndex:0];
         [ce setBuffer:up offset:in.group_table_off atIndex:1];
-        [ce setBuffer:g.frame offset:0 atIndex:2];
+        [ce setBuffer:dst offset:0 atIndex:2];
         [ce setBytes:&P length:sizeof(P) atIndex:3];
         [ce dispatchThreadgroups:MTLSizeMake(in.tile_count, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         [ce endEncoding];
 
-        /* Only the last slice presents. Earlier ones commit their decode and
-         * return, so the GPU works on band k while band k+1 is still arriving —
-         * which is the entire point of slicing. Metal's default hazard tracking
-         * orders those decodes against the present that samples the same buffer,
-         * so no explicit synchronisation is needed between them.
-         *
-         * The inflight count is taken per upload and released by the presenting
-         * command buffer, so a non-presenting slice must hand its own back. */
-        if (!is_last) {
-            dispatch_semaphore_t sem = g.inflight;
-            [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
-                (void)done;
-                dispatch_semaphore_signal(sem);
-            }];
-            [cb commit];
-            return 0;
-        }
+        /* Every band signals the ordering event; the present waits for the last
+         * one. The upload slot is released here — it is only needed until the
+         * decode that reads it finishes. */
+        const uint64_t stamp = ++g.decodeValue;
+        [cb encodeSignalEvent:g.decodeEvent value:stamp];
+        dispatch_semaphore_t sem = g.inflight;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
+            (void)done;
+            dispatch_semaphore_signal(sem);
+        }];
+        [cb commit];
+
+        /* Bands other than the last are pure work: the GPU decodes band k while
+         * band k+1 is still arriving, which is the whole point of slicing. */
+        if (!is_last) return 0;
+
+        /* Present in its own command buffer, gated on the last band's decode.
+         * The wait is explicit rather than left to hazard tracking because the
+         * render pass reads this surface through a texture VIEW, and a buffer
+         * and a texture aliasing it are separate resources. */
+        id<MTLCommandBuffer> pcb = [g.queue commandBuffer];
+        [pcb encodeWaitForEvent:g.decodeEvent value:stamp];
+
+        const int presented_idx = g.frame_widx;
+        g.frame_widx = (g.frame_widx + 1) % TB_FRAME_RING;
+        g.frame_open = 0;
+
+        dispatch_semaphore_t frames = g.frames_free;
+        [pcb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
+            (void)done;
+            dispatch_semaphore_signal(frames);
+        }];
+
+        /* tb_present takes an inflight count of its own, so balance it here. */
+        dispatch_semaphore_wait(g.inflight, DISPATCH_TIME_FOREVER);
 
         /* The blob says which depth it carries, so the texture view matches it.
          * At 8 bits the shader dithers into the 10-bit drawable — what macOS
          * does with 8-bit content everywhere else. At 10 bits the dither is
          * still applied but has almost nothing left to spread, because the
          * samples already resolve the drawable. */
-        return tb_present(cb, g.frame, MTLStorageModePrivate, in.ten_bit);
+        const int rc = tb_present(pcb, g.frame[presented_idx], MTLStorageModePrivate, in.ten_bit);
+        if (rc != 0) {
+            /* tb_present bails without committing when no drawable is free, so
+             * the completion handler above will never run and the ring slot
+             * would be lost — three of those and the next frame blocks forever. */
+            dispatch_semaphore_signal(frames);
+        }
+        return rc;
     }
 }
