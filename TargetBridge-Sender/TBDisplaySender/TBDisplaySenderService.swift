@@ -893,9 +893,18 @@ private final class TBVideoPipeline: @unchecked Sendable {
         let useSecondary = (secondaryConnection != nil) && (rawFrameCounter & 1 == 1)
         rawFrameCounter &+= 1
         let targetConnection = useSecondary ? (secondaryConnection ?? connection) : connection
+        // The threshold means "roughly this many FRAMES of work in flight", and
+        // the counter used to agree because a frame was one packet. Slicing
+        // changed the unit without changing the number: at 18 bands a single
+        // frame emits 18 packets, so from the fourth band on the gate was
+        // permanently tripped and nearly every later frame was dropped before it
+        // was even encoded. Scale the budget by the band count so the intent —
+        // three frames, not three packets — survives.
+        let packetsPerFrame = (dpcmEnabled && dpcmSlicesEnabled) ? max(1, dpcmSliceCount) : 1
+        let inFlightBudget = preset.maxPendingVideoPackets * packetsPerFrame
         let backedUp = useSecondary
-            ? pendingVideoPacketsSecondary >= preset.maxPendingVideoPackets
-            : pendingVideoPackets >= preset.maxPendingVideoPackets
+            ? pendingVideoPacketsSecondary >= inFlightBudget
+            : pendingVideoPackets >= inFlightBudget
         if backedUp {
             // A skipped frame's damage would otherwise be lost for good, since
             // the receiver cannot know it missed an update. Carry the rects
