@@ -123,6 +123,7 @@ struct app {
     const uint8_t   *frame_payload;   /* points into frame_buf */
     size_t           frame_len;
     uint8_t          frame_type;      /* RAW_FRAME or RAW_DAMAGE */
+    uint32_t         connecting_since;/* when this client last had no video */
     uint32_t         dpcm_frame_id;   /* frame currently being assembled from slices */
     int              dpcm_seq_warned;
     /* Which bands of the current frame actually decoded. A frame presents on its
@@ -2641,6 +2642,7 @@ int main(int argc, char **argv) {
                 a.client_fd = c;
                 a.have_video_frame = 0;
                 a.session_active = 0;
+                a.connecting_since = SDL_GetTicks();
                 a.audio_input_is_s16 = 1;   // re-learned from the next hello
                 a.reported_night_shift = -1;   /* force one report per session */
                 a.reported_true_tone = -1;
@@ -2754,7 +2756,22 @@ int main(int argc, char **argv) {
              * stay on the windowed waiting screen, don't flash fullscreen. */
             tb_disp_render_status(a.disp, a.display_host, a.status_text, a.sender_text, a.panel_text, a.mode_text, a.language_text, a.permissions_text);
         } else if (!a.have_video_frame) {
-            tb_disp_render_connecting(a.disp);
+            /* "Connecting..." is only honest while a first frame is plausibly on
+             * its way. When the sender stops streaming it keeps the control
+             * connection open, so client_fd and session_active both stay set and
+             * this screen used to persist forever — the receiver looked stuck
+             * when it was simply idle and perfectly ready to accept a new
+             * session. After a few seconds, say so. */
+            if (t - a.connecting_since > 4000) {
+                tb_disp_render_status(a.disp, a.display_host, a.status_text, a.sender_text,
+                                      a.panel_text, a.mode_text, a.language_text,
+                                      a.permissions_text);
+            } else {
+                tb_disp_render_connecting(a.disp);
+            }
+        } else {
+            /* Frames are arriving; the next quiet spell starts its clock now. */
+            a.connecting_since = t;
         }
 
         if (strcmp(a.input_control_mode, "receiverMaster") == 0 && a.client_fd >= 0) {
