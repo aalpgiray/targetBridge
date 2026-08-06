@@ -2232,10 +2232,18 @@ static void *link_reader_main(void *ud) {
                          * replace anything still pending. A damage packet is an
                          * increment: discarding it loses those pixels for good,
                          * so wait for the main thread instead of dropping it.
+                         *
+                         * A TBD2 BAND is an increment too, and was wrongly filed
+                         * with the whole frames when slicing was added. Each
+                         * arriving band overwrote the one before it whenever the
+                         * main thread was busy, so 4-40% of frames presented with
+                         * missing strips showing the previous frame — measured,
+                         * after three render-side theories that were all wrong.
                          * Bounded, so a stalled renderer cannot wedge a reader —
                          * on timeout we lose the update and the sender's ~1s
                          * resync repairs it. */
-                        if (r->pending_type == TB_PKT_RAW_DAMAGE) {
+                        if (r->pending_type == TB_PKT_RAW_DAMAGE ||
+                            r->pending_type == TB_PKT_RAW_DPCM_SLICE) {
                             struct timespec deadline;
                             clock_gettime(CLOCK_REALTIME, &deadline);
                             deadline.tv_nsec += 100 * 1000 * 1000;
