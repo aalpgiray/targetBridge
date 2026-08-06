@@ -449,6 +449,26 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// worth sending to a receiver that can overlap them; one that cannot keeps
     /// getting whole frames.
     var dpcmSlicesEnabled = false
+    /// Whether the receiver can place a region by column as well as row. Set
+    /// from its display profile before start().
+    var dpcmRectsEnabled = false
+    /// Send only the changed rectangles instead of whole frames.
+    ///
+    /// OFF by default. Damage is the largest remaining win on desktop content --
+    /// a typical frame plans to about 2% of the pixels, roughly 47x less to
+    /// encode and send, and it deletes most of the host-side plan work, which is
+    /// O(tiles). But unlike everything else measured here, a mistake shows up as
+    /// VISUAL ARTEFACTS on a link whose counters all read healthy: a stale patch
+    /// that nothing corrects until the next keyframe. Two such bugs were already
+    /// caught by the policy's own coverage test before any of this ran.
+    ///
+    /// So it ships behind a switch until it has been watched on real content:
+    ///   defaults write com.targetbridge.sender TBDamageRects -bool true
+    var dpcmRectsWanted = UserDefaults.standard.bool(forKey: "TBDamageRects")
+    /// Frames since the last whole frame. A rect stream is incremental, so a
+    /// lost or mis-placed rect persists; a periodic full frame bounds how long
+    /// any such error can survive.
+    private var framesSinceDPCMKey = 0
     /// Bands per frame. 18 or 20 measured best on this hardware: encode grows
     /// ~0.26 ms per slice (two GPU round trips each), so past ~20 it overtakes the
     /// wire and becomes the slowest stage, and the makespan turns back up.
@@ -1174,6 +1194,89 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 // Bands must be whole 8-row tiles, so the count has to divide the
                 // frame that way; anything else falls back to one band rather
                 // than silently sending a geometry the receiver will reject.
+                // Damage first: if only part of the screen changed, send only
+                // that. Falls through to bands when the answer is "everything",
+                // which is what fullscreen video always answers.
+                var damagePlan: TBDamageRects.Plan = .wholeFrame
+                if dpcmRectsWanted, dpcmRectsEnabled, !needsKeyframe,
+                   framesSinceDPCMKey < 60,
+                   let fresh = Self.dirtyRects(from: sampleBuffer, width: width, height: height) {
+                    damagePlan = TBDamageRects.plan(
+                        dirty: fresh.map { TBDamageRects.Rect(x: $0.x, y: $0.y, w: $0.w, h: $0.h) },
+                        frameW: width, frameH: height)
+                }
+
+                if case .rects(let rects) = damagePlan, !rects.isEmpty {
+                    dpcmFrameID &+= 1
+                    framesSinceDPCMKey += 1
+                    let captureNanos = UInt64(max(0, CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds) * 1_000_000_000)
+                    let reserve = TBMonitorProtocol.headerSize + TBMonitorProtocol.rectHeaderSize
+                    var sentAny = false
+
+                    for (i, r) in rects.enumerated() {
+                        // The encoder already handles a rect: same stride, a base
+                        // pointer at the rect's origin. No codec change was
+                        // needed for this, verified against the reference.
+                        let ctx = TBDPCMFrameContext(
+                            sampleBuffer: sampleBuffer,
+                            pixelBuffer: pixelBuffer,
+                            captureNanos: captureNanos,
+                            frameID: dpcmFrameID,
+                            sliceCount: 1,
+                            rowsPerBand: r.h,
+                            width: width,
+                            height: height,
+                            rect: (x: r.x, y: r.y, index: i, count: rects.count),
+                            send: { [weak self] packet in
+                                guard let self else { return }
+                                self.pendingVideoPackets += 1
+                                targetConnection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
+                                    guard let self else { return }
+                                    self.queue.async {
+                                        self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+                                    }
+                                }))
+                            },
+                            finished: { _, _ in
+                                if i + 1 == rects.count { TBTelemetryReporter.noteEmit() }
+                            })
+
+                        let origin = base.assumingMemoryBound(to: UInt8.self)
+                            .advanced(by: r.y * stride + r.x * 4)
+                        let opaque = Unmanaged.passRetained(ctx).toOpaque()
+                        let rc = dpcmGPU.map { enc in
+                            tb_dpcm_gpu_encode_bands_async(
+                                enc, origin, Int32(stride), Int32(r.w), Int32(r.h),
+                                1, isTenBit ? 1 : 0, reserve, tbDPCMAsyncDone, opaque)
+                        } ?? -1
+                        if rc != 0 {
+                            Unmanaged<TBDPCMFrameContext>.fromOpaque(opaque).release()
+                        } else {
+                            sentAny = true
+                        }
+                    }
+
+                    if sentAny {
+                        let process = (Self.hostNow() - frameEnteredAt) * 1000.0
+                        if process >= 0, process < 500 {
+                            latProcessSum += process
+                            latProcessMax = max(latProcessMax, process)
+                            latSamples += 1
+                        }
+                        lock.lock()
+                        _sentFrames += 1
+                        _rawFormatIsBGRA = true
+                        _rawFormatIsTenBit = isTenBit
+                        lock.unlock()
+                        return
+                    }
+                    // Every rect was refused; fall through to a whole frame
+                    // rather than show a frame's worth of nothing.
+                }
+
+                // Whole frame (as bands). Also the keyframe that bounds how long
+                // any mis-placed rect can persist.
+                framesSinceDPCMKey = 0
                 let wantSlices = dpcmSlicesEnabled ? max(1, dpcmSliceCount) : 1
                 let bandRows = height / wantSlices
                 let sliceCount = (wantSlices > 1 && bandRows % Int(TB_DPCM_TILE) == 0
@@ -2026,6 +2129,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var receiverSupportsFloat32Audio = false
     private var receiverSupportsDPCM = false
     private var receiverSupportsDPCMSlices = false
+    private var receiverSupportsDPCMRects = false
     private var activeProfile: TBMonitorDisplayProfile?
     private var activeCodecType: CMVideoCodecType?
     private var activeCodecName: String?
@@ -3304,8 +3408,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // covers a profile that turns up on an already-running pipeline.
         receiverSupportsDPCM = profile.supportsDPCM ?? false
         receiverSupportsDPCMSlices = profile.supportsDPCMSlices ?? false
+        receiverSupportsDPCMRects = profile.supportsDPCMRects ?? false
         pipeline?.dpcmEnabled = receiverSupportsDPCM
         pipeline?.dpcmSlicesEnabled = receiverSupportsDPCMSlices
+        pipeline?.dpcmRectsEnabled = receiverSupportsDPCMRects
         TBLog.connection.info("receiver caps: dpcm=\(self.receiverSupportsDPCM, privacy: .public) float32Audio=\(self.receiverSupportsFloat32Audio, privacy: .public)")
         // The shipped-log file is a rolling record across sessions, so mark
         // where this one starts; without it a reader cannot tell one run's
@@ -3432,6 +3538,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             pipeline.damageEnabled = damageRects
             pipeline.dpcmEnabled = receiverSupportsDPCM
             pipeline.dpcmSlicesEnabled = receiverSupportsDPCMSlices
+            pipeline.dpcmRectsEnabled = receiverSupportsDPCMRects
             guard pipeline.start() else { return false }
             startAudioDeviceCaptureIfNeeded()
             self.pipeline = pipeline

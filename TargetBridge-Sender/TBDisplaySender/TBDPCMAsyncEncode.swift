@@ -30,6 +30,10 @@ final class TBDPCMFrameContext {
     let rowsPerBand: Int
     let width: Int
     let height: Int
+    /// Set when this context carries a damage RECT rather than a band or whole
+    /// frame: where to place it and which of the frame's rects it is. The last
+    /// one presents, exactly as the last band does.
+    let rect: (x: Int, y: Int, index: Int, count: Int)?
     let send: (Data) -> Void
     /// Called with the total encoded size, on the encoder's queue. Lets the
     /// pipeline do its once-per-session ratio log without this type knowing
@@ -47,6 +51,7 @@ final class TBDPCMFrameContext {
          rowsPerBand: Int,
          width: Int,
          height: Int,
+         rect: (x: Int, y: Int, index: Int, count: Int)? = nil,
          send: @escaping (Data) -> Void,
          finished: @escaping (Int, Bool) -> Void) {
         self.sampleBuffer = sampleBuffer
@@ -57,6 +62,7 @@ final class TBDPCMFrameContext {
         self.rowsPerBand = rowsPerBand
         self.width = width
         self.height = height
+        self.rect = rect
         self.send = send
         self.finished = finished
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
@@ -108,7 +114,15 @@ let tbDPCMAsyncDone: tb_dpcm_gpu_done = { ctx, ok, band, index, last in
     if ok != 0, let entry = band?.pointee, let blob = entry.blob {
         let i = Int(index)
         let packet: Data
-        if frame.sliceCount > 1 {
+        if let r = frame.rect {
+            packet = TBMonitorProtocol.framedRectPacket(
+                base: blob, totalCount: entry.len,
+                captureTimeNanos: frame.captureNanos,
+                frameID: frame.frameID,
+                frameW: UInt32(frame.width), frameH: UInt32(frame.height),
+                x0: UInt32(r.x), y0: UInt32(r.y),
+                index: UInt16(r.index), count: UInt16(r.count))
+        } else if frame.sliceCount > 1 {
             packet = TBMonitorProtocol.framedSlicePacket(
                 base: blob, totalCount: entry.len,
                 captureTimeNanos: frame.captureNanos,
