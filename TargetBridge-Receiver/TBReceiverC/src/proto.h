@@ -118,6 +118,13 @@
  * stream so the receiver's mic appears as an input on the sender Mac. */
 #define TB_PKT_MIC_FRAME        0x39
 #define TB_PKT_TEST_DATA        0x40
+/* The receiver's stderr, flowing receiver -> sender: raw UTF-8 text, no JSON
+ * wrapper and no line framing — a packet is whatever bytes were pending, which
+ * may split a line or carry several. The sender appends them to a file so both
+ * sides' logs can be read from one machine. Diagnostic only: a sender that does
+ * not know this type ignores it, and a receiver whose sender never asks simply
+ * keeps writing to its own console. */
+#define TB_PKT_LOG              0x41
 
 #define TB_HDR_BYTES        5   /* 4 length + 1 type */
 

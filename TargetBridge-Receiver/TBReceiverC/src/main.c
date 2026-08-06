@@ -22,6 +22,7 @@
 #include "tb_display_tweaks.h"
 #include "tb_mic_capture.h"
 #include "tb_i18n.h"
+#include "tb_logship.h"
 
 #include <SDL.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -2320,10 +2321,36 @@ static void link_reader_stop(struct tb_link_reader *r) {
     r->active = 0;
 }
 
+/* Ship whatever stderr has produced since the last pass.
+ *
+ * On the main thread on purpose: the mic callback is already an off-thread
+ * writer to this fd, and a second one would let two partial packets interleave
+ * on the same socket. Bounded per call so a burst of logging cannot displace
+ * the frame this loop exists to render — the rest waits for the next pass. */
+static void pump_log_shipping(struct app *a) {
+    if (!a || a->client_fd < 0) return;
+
+    uint8_t buf[8192];
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        const size_t n = tb_logship_drain(buf, sizeof(buf));
+        if (n == 0) return;
+        uint8_t header[TB_HDR_BYTES];
+        write_be32(header, (uint32_t)(1 + n));
+        header[4] = TB_PKT_LOG;
+        /* A failed send is not worth reporting: the report would go to stderr,
+         * which is what just failed to send, and the session teardown that
+         * follows will say so anyway. */
+        if (send_all(a->client_fd, header, sizeof(header)) < 0) return;
+        if (send_all(a->client_fd, buf, n) < 0) return;
+    }
+}
+
 /* Main thread: run queued control packets, then render at most one frame (the
  * newest). Returns non-zero if any work was done. */
 static int pump_network(struct app *a) {
     int worked = 0;
+
+    pump_log_shipping(a);
 
     for (;;) {
         struct tb_ctrl_msg msg;
@@ -2491,6 +2518,11 @@ int main(int argc, char **argv) {
     signal(SIGINT,  on_sigint);
     signal(SIGTERM, on_sigint);
     signal(SIGPIPE, SIG_IGN);
+
+    /* Before anything worth logging happens. SIGPIPE is already ignored above,
+     * which matters here: the reader thread writes to a pipe and this process
+     * writes to a socket, and neither should be able to kill the receiver. */
+    (void)tb_logship_start();
 
     char tb_ip[64] = {0};
     char net_ip[64] = {0};

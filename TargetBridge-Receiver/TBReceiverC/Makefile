@@ -40,7 +40,7 @@ ifeq ($(UNAME_S),Darwin)
 LDFLAGS  += -framework ApplicationServices -framework AppKit -framework CoreFoundation -framework CoreGraphics -framework CoreText -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework CoreServices -framework CoreAudio -framework AVFoundation -framework Metal -framework QuartzCore
 endif
 
-C_SRC = src/main.c src/net.c src/decoder.c src/display.c src/tb_i18n.c
+C_SRC = src/main.c src/net.c src/decoder.c src/display.c src/tb_i18n.c src/tb_logship.c
 OBJC_SRC = src/tb_gesture_bridge.m src/tb_display_tweaks.m src/tb_mic_capture.m src/tb_metal_plane.m
 OBJ = $(C_SRC:.c=.o) $(OBJC_SRC:.m=.o) $(CODEC_OBJ)
 BIN = tbreceiver

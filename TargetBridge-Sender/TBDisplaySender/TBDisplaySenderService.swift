@@ -2762,6 +2762,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 // stream; already 48 kHz stereo Int16, so nothing to convert.
                 if micForwarder == nil { micForwarder = TBMicForwarder() }
                 micForwarder?.forward(payload)
+            case .receiverLog:
+                TBReceiverLogSink.shared.append(payload)
             case .displayTweaks:
                 // Receiver reporting its real state (it may have been changed on
                 // that Mac directly). Adopt it without sending anything back —
@@ -3144,6 +3146,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         pipeline?.dpcmEnabled = receiverSupportsDPCM
         pipeline?.dpcmSlicesEnabled = receiverSupportsDPCMSlices
         TBLog.connection.info("receiver caps: dpcm=\(self.receiverSupportsDPCM, privacy: .public) float32Audio=\(self.receiverSupportsFloat32Audio, privacy: .public)")
+        // The shipped-log file is a rolling record across sessions, so mark
+        // where this one starts; without it a reader cannot tell one run's
+        // output from the next.
+        TBReceiverLogSink.shared.noteSessionStart("session with \(profile.receiverName)")
         receiverSupportsNightShift = profile.supportsNightShift ?? false
         receiverSupportsTrueTone = profile.supportsTrueTone ?? false
         receiverPanelText = TBDisplaySenderL10n.receiverSummary(profile, language: language)

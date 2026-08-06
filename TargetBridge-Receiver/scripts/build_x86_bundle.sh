@@ -129,6 +129,7 @@ CFLAGS=(
 # project more than once.
 SOURCES=(
     "$SRC/main.c" "$SRC/net.c" "$SRC/decoder.c" "$SRC/display.c" "$SRC/tb_i18n.c"
+    "$SRC/tb_logship.c"
     "$CODEC/tb_dpcm.c"
     "$SRC/tb_gesture_bridge.m" "$SRC/tb_display_tweaks.m"
     "$SRC/tb_mic_capture.m" "$SRC/tb_metal_plane.m"

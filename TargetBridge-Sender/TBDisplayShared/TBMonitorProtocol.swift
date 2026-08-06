@@ -46,6 +46,14 @@ enum TBMonitorPacketType: UInt8 {
     /// Receiver's microphone, receiver -> sender: raw 48 kHz stereo Int16.
     case micFrame = 0x39
     case testData = 0x40
+    /// The receiver's stderr, raw UTF-8, no framing beyond the packet itself.
+    ///
+    /// The receiver runs on the other Mac, so every measurement used to mean
+    /// asking whoever sits there to copy a log out of a terminal. That is slow
+    /// enough to discourage measuring, and this project has repeatedly lost
+    /// hours to theories a single log would have killed in a minute. The sender
+    /// appends these to a file so both sides can be read from one machine.
+    case receiverLog = 0x41
 }
 
 struct TBMonitorHelloReceiver: Codable {
