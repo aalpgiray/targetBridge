@@ -914,34 +914,60 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
          * band. An MTLEvent was tried here and is exactly wrong: events
          * synchronise ACROSS queues, and waiting on one within a single queue
          * deadlocks, which is what it did. */
-        if (!is_last) {
-            dispatch_semaphore_t sem = g.inflight;
-            [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
-                (void)done;
-                dispatch_semaphore_signal(sem);
-            }];
-            [cb commit];
-            return 0;
-        }
+        dispatch_semaphore_t sem = g.inflight;
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
+            (void)done;
+            dispatch_semaphore_signal(sem);
+        }];
+        [cb commit];
 
-        /* The last band shares its command buffer with the present, so the two
-         * cannot be separated by anything. */
+        if (!is_last) return 0;
+
+        /* Wait for this frame's decodes before presenting.
+         *
+         * At one band per frame the decode and the present shared a command
+         * buffer and were ordered by construction — which is why N=1 never
+         * glitched. At N>1 the earlier bands are in separate command buffers,
+         * and commit order on a queue is NOT sufficient: Metal may overlap their
+         * execution, so the render pass can sample the surface while a band is
+         * still writing it. That produced visible glitches at every slice count
+         * above one.
+         *
+         * An MTLEvent is the wrong instrument here (it synchronises across
+         * queues, and waiting on one within a queue deadlocks — it did). Blocking
+         * on the last band's completion is coarse but correct, and cheap in the
+         * place that matters: bands 0..n-2 have already overlapped the wire,
+         * which is where the pipelining win actually comes from. Only the final
+         * band's decode is paid for serially. */
+        [cb waitUntilCompleted];
+
         const int presented_idx = g.frame_widx;
         g.frame_widx = (g.frame_widx + 1) % TB_FRAME_RING;
         g.frame_open = 0;
 
         dispatch_semaphore_t frames = g.frames_free;
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
-            (void)done;
-            dispatch_semaphore_signal(frames);
-        }];
 
         /* The blob says which depth it carries, so the texture view matches it.
          * At 8 bits the shader dithers into the 10-bit drawable — what macOS
          * does with 8-bit content everywhere else. At 10 bits the dither is
          * still applied but has almost nothing left to spread, because the
          * samples already resolve the drawable. */
-        const int rc = tb_present(cb, g.frame[presented_idx], MTLStorageModePrivate, in.ten_bit);
+        id<MTLCommandBuffer> pcb = [g.queue commandBuffer];
+        /* Releases the ring slot once the frame has actually been presented. */
+        [pcb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
+            (void)done;
+            dispatch_semaphore_signal(frames);
+        }];
+
+        /* tb_present releases an inflight count on completion, so take one —
+         * bounded, like every other wait on this thread. */
+        if (dispatch_semaphore_wait(g.inflight,
+                                    dispatch_time(DISPATCH_TIME_NOW,
+                                                  100 * NSEC_PER_MSEC)) != 0) {
+            dispatch_semaphore_signal(frames);
+            return -1;
+        }
+        const int rc = tb_present(pcb, g.frame[presented_idx], MTLStorageModePrivate, in.ten_bit);
         if (rc != 0) {
             /* tb_present returns without committing when no drawable is free, so
              * the handler above never runs and the ring slot would be lost —
