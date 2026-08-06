@@ -74,7 +74,32 @@ final class ReceiverBackedVirtualDisplaySession {
         receiverKey: String
     ) -> Bool {
         destroy()
-        let preferredRefreshRate = refreshRate ?? profile.refreshRate
+        // Experiment: run the VIRTUAL display faster than the receiver's panel.
+        //
+        // The panel is 60 Hz and cannot show more, so the extra frames are
+        // discarded — but that is the point. At 120 the compositor produces
+        // every 8.3 ms, so whichever frame the receiver draws at a given
+        // scanout is at most 8.3 ms old instead of 16.7, and a frame that
+        // misses its slot has a fresher replacement right behind it rather than
+        // a whole period of nothing. Oversampling to cut latency and phase
+        // error, not to raise the displayed rate.
+        //
+        // It costs double: ~7.7 Gbps of wire at the measured 8 MB/frame against
+        // a ~15 Gbps link, and twice the encode and decode. Worth measuring
+        // rather than assuming, hence a runtime knob:
+        //   defaults write com.targetbridge.sender TBVirtualRefresh -float 120
+        // Anything <= 0 (the default) keeps the receiver's own rate.
+        //
+        // CGVirtualDisplay may simply refuse a mode it does not like, which
+        // shows up as the display coming back at its old rate — check the log
+        // line below rather than assuming it took.
+        let refreshOverride = UserDefaults.standard.double(forKey: "TBVirtualRefresh")
+        let preferredRefreshRate = refreshOverride > 0
+            ? refreshOverride
+            : (refreshRate ?? profile.refreshRate)
+        if refreshOverride > 0 {
+            TBLog.connection.info("virtual display: refresh override \(refreshOverride, privacy: .public) Hz (panel reports \(profile.refreshRate, privacy: .public))")
+        }
 
         // The receiver hard-codes mode 2560x1440 + hiDPI, i.e. a 5120x2880 backing
         // store, regardless of which capture preset the sender is running. Any preset
