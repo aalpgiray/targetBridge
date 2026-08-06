@@ -125,6 +125,15 @@ struct app {
     uint8_t          frame_type;      /* RAW_FRAME or RAW_DAMAGE */
     uint32_t         dpcm_frame_id;   /* frame currently being assembled from slices */
     int              dpcm_seq_warned;
+    /* Which bands of the current frame actually decoded. A frame presents on its
+     * last band whether or not the others arrived, and a missing band leaves the
+     * previous frame's pixels in that strip — which looks exactly like a glitch,
+     * so it has to be measured rather than assumed. */
+    uint32_t         dpcm_got_mask;
+    uint32_t         dpcm_frames_total;
+    uint32_t         dpcm_frames_short;
+    uint32_t         dpcm_bands_lost;
+    uint32_t         dpcm_last_report;
     int              frame_ready;
     uint64_t         frames_dropped;
 
@@ -1157,7 +1166,32 @@ static void handle_raw_dpcm_slice(struct app *a, const uint8_t *p, size_t len) {
                                   len - TB_DPCM_SLICE_HEADER,
                                   (int)frame_w, (int)frame_h, (int)y0, is_last) != 0) {
         a->frames_dropped++;
-        return;
+        /* Fall through: the frame still presents on its last band, so a lost
+         * band must be counted, not silently forgotten. */
+    } else if (index < 32) {
+        a->dpcm_got_mask |= (1u << index);
+    }
+
+    if (is_last) {
+        const uint32_t want = (count >= 32) ? 0xFFFFFFFFu : ((1u << count) - 1u);
+        const uint32_t got  = a->dpcm_got_mask;
+        a->dpcm_frames_total++;
+        if ((got & want) != want) {
+            a->dpcm_frames_short++;
+            for (int b = 0; b < count && b < 32; ++b)
+                if (!(got & (1u << b))) a->dpcm_bands_lost++;
+        }
+        a->dpcm_got_mask = 0;
+
+        const uint32_t now_s = SDL_GetTicks() / 1000;
+        if (now_s != a->dpcm_last_report && a->dpcm_frames_total >= 30) {
+            a->dpcm_last_report = now_s;
+            fprintf(stderr, "[slices] %u frames, %u incomplete (%.1f%%), %u bands lost\n",
+                    a->dpcm_frames_total, a->dpcm_frames_short,
+                    100.0 * a->dpcm_frames_short / a->dpcm_frames_total,
+                    a->dpcm_bands_lost);
+            a->dpcm_frames_total = a->dpcm_frames_short = a->dpcm_bands_lost = 0;
+        }
     }
     /* Set before the last-band gate: the main loop uses this to decide whether
      * the stream is live, and a frame mid-assembly is very much live. */
