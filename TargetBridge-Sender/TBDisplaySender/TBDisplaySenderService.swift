@@ -418,6 +418,20 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// inside a 60 Hz period, and the receiver decodes into VRAM where there is
     /// no CPU-side image for a rectangle to patch.
     var dpcmEnabled = false
+    /// Whether the receiver can place bands at a row offset. Slices are only
+    /// worth sending to a receiver that can overlap them; one that cannot keeps
+    /// getting whole frames.
+    var dpcmSlicesEnabled = false
+    /// Bands per frame. 18 or 20 measured best on this hardware: encode grows
+    /// ~0.26 ms per slice (two GPU round trips each), so past ~20 it overtakes the
+    /// wire and becomes the slowest stage, and the makespan turns back up.
+    /// Must divide the frame into whole 8-row tiles.
+    /// `defaults write com.targetbridge.sender TBSliceCount -int 18` to try it,
+    /// 1 to go back. A runtime knob rather than a constant because the gain is a
+    /// model prediction until it is measured on the link, and because a bad value
+    /// should be one command to undo rather than a reinstall.
+    var dpcmSliceCount = max(1, UserDefaults.standard.integer(forKey: "TBSliceCount"))
+    private var dpcmFrameID: UInt32 = 0
     /// Encoding runs on the GPU. The reference C encoder costs ~118 ms/frame at
     /// 5K single-threaded; this measures 5.7 ms, and more to the point it leaves
     /// the CPU to whoever is using the machine, which is the whole reason the
@@ -1058,18 +1072,78 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 // blob, so the header is written in place and the packet is one
                 // copy rather than two. Two copies of a ~30 MB frame measured
                 // ~3 ms of the 10.1 ms this stage costs.
-                var blob: UnsafePointer<UInt8>? = nil
-                let written = dpcmGPU.map {
-                    tb_dpcm_gpu_encode($0, base.assumingMemoryBound(to: UInt8.self),
-                                       Int32(stride), Int32(width), Int32(height),
-                                       isTenBit ? 1 : 0, TBMonitorProtocol.headerSize, &blob)
-                } ?? 0
-                if written > 0, let blob {
+                // Slice the frame into bands so the receiver can decode band k
+                // while band k+1 is still on the wire. N=1 is the whole-frame
+                // case and behaves exactly as before.
+                //
+                // Bands must be whole 8-row tiles, so the count has to divide the
+                // frame that way; anything else falls back to one band rather
+                // than silently sending a geometry the receiver will reject.
+                let wantSlices = dpcmSlicesEnabled ? max(1, dpcmSliceCount) : 1
+                let bandRows = height / wantSlices
+                let sliceCount = (wantSlices > 1 && bandRows % Int(TB_DPCM_TILE) == 0
+                                  && bandRows * wantSlices == height) ? wantSlices : 1
+                let rowsPerBand = height / sliceCount
+                let reserve = TBMonitorProtocol.headerSize
+                    + (sliceCount > 1 ? TBMonitorProtocol.sliceHeaderSize : 0)
+
+                dpcmFrameID &+= 1
+                let captureNanos = UInt64(max(0, CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds) * 1_000_000_000)
+
+                var encodedAny = false
+                var totalWritten = 0
+                for band in 0..<sliceCount {
+                    let y0 = band * rowsPerBand
+                    var blob: UnsafePointer<UInt8>? = nil
+                    let written = dpcmGPU.map {
+                        tb_dpcm_gpu_encode($0,
+                                           base.assumingMemoryBound(to: UInt8.self)
+                                               .advanced(by: y0 * stride),
+                                           Int32(stride), Int32(width), Int32(rowsPerBand),
+                                           isTenBit ? 1 : 0, reserve, &blob)
+                    } ?? 0
+                    guard written > 0, let blob else { break }
+                    encodedAny = true
+                    totalWritten += written
+
+                    let pkt: Data
+                    if sliceCount > 1 {
+                        pkt = TBMonitorProtocol.framedSlicePacket(
+                            base: blob, totalCount: written,
+                            captureTimeNanos: captureNanos,
+                            frameID: dpcmFrameID,
+                            frameW: UInt32(width), frameH: UInt32(height),
+                            y0: UInt32(y0),
+                            index: UInt16(band), count: UInt16(sliceCount))
+                    } else {
+                        pkt = TBMonitorProtocol.framedPacket(
+                            type: .rawDPCM, base: blob, totalCount: written)
+                    }
+
+                    pendingVideoPackets += 1
+                    targetConnection.send(content: pkt, completion: .contentProcessed({ [weak self] _ in
+                        guard let self else { return }
+                        self.queue.async {
+                            self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+                        }
+                    }))
+                }
+
+                if encodedAny {
+                    let written = totalWritten
                     if !dpcmLogged {
                         dpcmLogged = true
                         let raw = stride * height
-                        TBLog.connection.info("dpcm: \(width, privacy: .public)x\(height, privacy: .public) \(isTenBit ? 10 : 8, privacy: .public)-bit \(raw / 1_000_000, privacy: .public) MB -> \(written / 1_000_000, privacy: .public) MB (\(String(format: "%.2fx", Double(raw) / Double(written)), privacy: .public)) \(tb_dpcm_gpu_last_was_zero_copy(self.dpcmGPU!) != 0 ? "zero-copy" : "staged", privacy: .public)")
+                        TBLog.connection.info("dpcm: \(width, privacy: .public)x\(height, privacy: .public) \(isTenBit ? 10 : 8, privacy: .public)-bit \(raw / 1_000_000, privacy: .public) MB -> \(written / 1_000_000, privacy: .public) MB (\(String(format: "%.2fx", Double(raw) / Double(written)), privacy: .public)) \(sliceCount, privacy: .public) slice(s) \(tb_dpcm_gpu_last_was_zero_copy(self.dpcmGPU!) != 0 ? "zero-copy" : "staged", privacy: .public)")
                     }
+                    let process = (Self.hostNow() - frameEnteredAt) * 1000.0
+                    if process >= 0, process < 500 {
+                        latProcessSum += process
+                        latProcessMax = max(latProcessMax, process)
+                        latSamples += 1
+                    }
+                    noteSend()
+
                     // Nothing incremental is in flight, so a later fall back to
                     // the uncompressed path must start from a full frame.
                     needsKeyframe = true
@@ -1077,30 +1151,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     lastDamageH = 0
                     carriedDirty.removeAll(keepingCapacity: true)
 
-                    // Still one copy: the encoder reuses this buffer on the next
-                    // frame and the send is asynchronous, so the bytes have to be
-                    // handed over. Removing the last copy too would need a ring of
-                    // output buffers released by the send completion.
-                    let pkt = TBMonitorProtocol.framedPacket(
-                        type: .rawDPCM, base: blob, totalCount: written)
-                    let process = (Self.hostNow() - frameEnteredAt) * 1000.0
-                    if process >= 0, process < 500 {
-                        latProcessSum += process
-                        latProcessMax = max(latProcessMax, process)
-                        latSamples += 1
-                    }
-                    pendingVideoPackets += 1
-                    noteSend()
-                    targetConnection.send(content: pkt, completion: .contentProcessed({ [weak self] _ in
-                        guard let self else { return }
-                        self.queue.async {
-                            self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
-                        }
-                    }))
                     lock.lock()
                     _sentFrames += 1
                     _rawFormatIsBGRA = true
-                    _rawFormatIsTenBit = false
+                    _rawFormatIsTenBit = isTenBit
                     lock.unlock()
                     return
                 }
@@ -1797,6 +1851,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// older format instead of noise.
     private var receiverSupportsFloat32Audio = false
     private var receiverSupportsDPCM = false
+    private var receiverSupportsDPCMSlices = false
     private var activeProfile: TBMonitorDisplayProfile?
     private var activeCodecType: CMVideoCodecType?
     private var activeCodecName: String?
@@ -3047,7 +3102,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // value is stored and applied at construction; the optional assignment
         // covers a profile that turns up on an already-running pipeline.
         receiverSupportsDPCM = profile.supportsDPCM ?? false
+        receiverSupportsDPCMSlices = profile.supportsDPCMSlices ?? false
         pipeline?.dpcmEnabled = receiverSupportsDPCM
+        pipeline?.dpcmSlicesEnabled = receiverSupportsDPCMSlices
         TBLog.connection.info("receiver caps: dpcm=\(self.receiverSupportsDPCM, privacy: .public) float32Audio=\(self.receiverSupportsFloat32Audio, privacy: .public)")
         receiverSupportsNightShift = profile.supportsNightShift ?? false
         receiverSupportsTrueTone = profile.supportsTrueTone ?? false
@@ -3169,6 +3226,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             )
             pipeline.damageEnabled = damageRects
             pipeline.dpcmEnabled = receiverSupportsDPCM
+            pipeline.dpcmSlicesEnabled = receiverSupportsDPCMSlices
             guard pipeline.start() else { return false }
             startAudioDeviceCaptureIfNeeded()
             self.pipeline = pipeline

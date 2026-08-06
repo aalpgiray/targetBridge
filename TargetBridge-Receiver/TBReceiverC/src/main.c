@@ -123,6 +123,8 @@ struct app {
     const uint8_t   *frame_payload;   /* points into frame_buf */
     size_t           frame_len;
     uint8_t          frame_type;      /* RAW_FRAME or RAW_DAMAGE */
+    uint32_t         dpcm_frame_id;   /* frame currently being assembled from slices */
+    int              dpcm_seq_warned;
     int              frame_ready;
     uint64_t         frames_dropped;
 
@@ -1113,6 +1115,60 @@ static void handle_raw_dpcm(struct app *a, const uint8_t *payload, size_t len) {
     a->frames++;
 }
 
+/* The protocol is big-endian on the wire; main.c had only a writer. */
+static inline uint32_t be32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+         | ((uint32_t)p[2] <<  8) | (uint32_t)p[3];
+}
+
+/* TB_PKT_RAW_DPCM_SLICE — one band of a frame. See proto.h for the header.
+ *
+ * Bands are decoded as they arrive and only the last presents, so the GPU works
+ * on band k while band k+1 is still on the wire. Every field is checked here
+ * because the blob's own validation covers the blob, not the placement: a band
+ * claiming the wrong y0 would be written to the wrong rows and still look like a
+ * picture. */
+static void handle_raw_dpcm_slice(struct app *a, const uint8_t *p, size_t len) {
+    if (len < TB_DPCM_SLICE_HEADER) { a->frames_dropped++; return; }
+
+    const uint32_t frame_id = be32(p + 8);
+    const uint32_t frame_w  = be32(p + 12);
+    const uint32_t frame_h  = be32(p + 16);
+    const uint32_t y0       = be32(p + 20);
+    const uint16_t index    = (uint16_t)((p[24] << 8) | p[25]);
+    const uint16_t count    = (uint16_t)((p[26] << 8) | p[27]);
+
+    if (count == 0 || index >= count) { a->frames_dropped++; return; }
+    if (frame_w == 0 || frame_h == 0 || frame_w > 16384 || frame_h > 16384) { a->frames_dropped++; return; }
+    if (y0 >= frame_h) { a->frames_dropped++; return; }
+
+    /* TCP delivers in order, so out-of-sequence means a genuine break — a
+     * reconnect, or a sender bug. Log once rather than per frame. */
+    if (frame_id != a->dpcm_frame_id) {
+        if (index != 0 && !a->dpcm_seq_warned) {
+            a->dpcm_seq_warned = 1;
+            fprintf(stderr, "[dpcm] frame %u started at slice %u of %u\n", frame_id, index, count);
+        }
+        a->dpcm_frame_id = frame_id;
+    }
+
+    const int is_last = (index + 1 == count);
+    if (tb_disp_render_dpcm_slice(a->disp, p + TB_DPCM_SLICE_HEADER,
+                                  len - TB_DPCM_SLICE_HEADER,
+                                  (int)frame_w, (int)frame_h, (int)y0, is_last) != 0) {
+        a->frames_dropped++;
+        return;
+    }
+    if (!is_last) return;
+
+    /* A DPCM frame leaves no CPU base image behind, so a damage packet arriving
+     * after one has nothing to patch. */
+    a->base_valid = 0;
+    a->have_video_frame = 1;
+    tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
+    a->frames++;
+}
+
 /* TB_PKT_RAW_DAMAGE — patch changed rectangles into the base image, then
  * render it. Every bounds check matters here: the payload is attacker-shaped
  * data and a bad rect would write outside the frame buffer. */
@@ -1343,6 +1399,9 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         break;
     case TB_PKT_RAW_DPCM:
         handle_raw_dpcm(a, payload, len);
+        break;
+    case TB_PKT_RAW_DPCM_SLICE:
+        handle_raw_dpcm_slice(a, payload, len);
         break;
     case TB_PKT_CURSOR:
         {
@@ -2029,7 +2088,7 @@ static void send_receiver_info(struct app *a) {
         "{\"receiverName\":\"%s\",\"panelWidth\":%u,\"panelHeight\":%u,"
         "\"modeWidth\":%u,\"modeHeight\":%u,\"refreshRate\":60,"
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
-        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsFloat32Audio\":true,\"supportsDPCM\":%s,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s,"
+        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsFloat32Audio\":true,\"supportsDPCM\":%s,\"supportsDPCMSlices\":%s,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s,"
         "\"supportsNightShift\":%s,\"supportsTrueTone\":%s}",
         escaped_name,
         panel_w,
@@ -2039,6 +2098,7 @@ static void send_receiver_info(struct app *a) {
         capture_w,
         capture_h,
         tb_dec_supports_hevc_hwdecode() ? "true" : "false",
+        tb_disp_supports_dpcm() ? "true" : "false",
         tb_disp_supports_dpcm() ? "true" : "false",
         tb_receiver_input_monitoring_trusted() ? "true" : "false",
         tb_receiver_accessibility_trusted() ? "true" : "false",
@@ -2073,7 +2133,7 @@ static void reader_on_packet(uint8_t type, const uint8_t *payload, size_t len, v
     struct app *a = r->app;
 
     if (type == TB_PKT_RAW_FRAME || type == TB_PKT_RAW_DAMAGE ||
-        type == TB_PKT_RAW_DPCM) {
+        type == TB_PKT_RAW_DPCM || type == TB_PKT_RAW_DPCM_SLICE) {
         /* Keep this packet without copying it: ask the parser to yield its
          * buffer. The `payload` pointer stays valid inside that buffer, which
          * the reader loop collects and publishes right after commit returns. */
@@ -2262,6 +2322,7 @@ static int pump_network(struct app *a) {
         a->session_active = 1;
         if (ptype == TB_PKT_RAW_DAMAGE)   handle_raw_damage(a, payload, plen);
         else if (ptype == TB_PKT_RAW_DPCM) handle_raw_dpcm(a, payload, plen);
+        else if (ptype == TB_PKT_RAW_DPCM_SLICE) handle_raw_dpcm_slice(a, payload, plen);
         else                              handle_raw_frame(a, payload, plen);
         worked = 1;
 

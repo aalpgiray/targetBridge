@@ -74,6 +74,33 @@
  * afford (measured 166 ms single-threaded on the target iMac, against 6.5 ms on
  * its GPU). A silent peer is an old peer and keeps getting TB_PKT_RAW_FRAME. */
 #define TB_PKT_RAW_DPCM         0x25
+/* One horizontal BAND of a TBD2 frame. Payload is a 28-byte header, big-endian
+ * like the rest of the protocol, followed by a TBD2 blob covering rows
+ * [y0, y0+height) of the frame:
+ *
+ *   [8] capture_time  sender host clock, nanoseconds, at frame acquisition
+ *   [4] frame_id      monotonic; a change means a new frame started
+ *   [4] frame_w       full surface width  (bands are always full width)
+ *   [4] frame_h       full surface height
+ *   [4] y0            first row of this band, a multiple of the 8-row tile
+ *   [2] slice_index
+ *   [2] slice_count
+ *
+ * Slicing exists so the stages stop running end to end: band k decodes while
+ * band k+1 is still crossing the wire. Measured, that roughly halves frame
+ * latency — 23.6 ms to ~12 at 8-bit — because the wire is the slowest stage and
+ * everything else can hide behind it.
+ *
+ * It costs nothing in bytes. Tiles were already independent 8x8 units with
+ * byte-aligned group bases, so a band is just a shorter frame: measured
+ * byte-for-byte identical to a whole-frame encode at every slice count tried,
+ * both depths, and the reassembled pixels are bit-identical.
+ *
+ * Sent only to a receiver advertising "supportsDPCMSlices". A receiver that
+ * understands 0x25 but not this keeps getting whole frames. */
+#define TB_PKT_RAW_DPCM_SLICE   0x26
+#define TB_DPCM_SLICE_HEADER    28
+
 #define TB_PKT_HEARTBEAT        0x30
 #define TB_PKT_TEARDOWN         0x31
 #define TB_PKT_CURSOR           0x32
