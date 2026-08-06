@@ -10,6 +10,19 @@ import Network
 @preconcurrency import ScreenCaptureKit
 import VideoToolbox
 
+/// Idle capture frames seen since the last cadence report.
+///
+/// ScreenCaptureKit ticks even when nothing was composited, marking the frame
+/// `.idle` with pixels identical to the last. Reported alongside the capture
+/// cadence so a gap in that histogram can be attributed: frames we filtered, or
+/// refreshes where the compositor produced nothing at all. The two want
+/// different fixes and are indistinguishable from the histogram alone.
+///
+/// Single writer (the capture callback queue) and a single reader on the same
+/// queue, so a plain var is honest here rather than lucky.
+nonisolated(unsafe) var tbIdleFramesSeen = 0
+
+
 enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     case standard1440p
     case smooth1440p60
@@ -873,7 +886,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 .map { "\($0.offset):\($0.element) (\(Int(100.0 * Double($0.element) / Double(total)))%)" }
                 .joined(separator: "  ")
         }
-        TBLog.connection.info("cadence capture(pts) \(fmt(self.capCadenceBin), privacy: .public)")
+        let idle = tbIdleFramesSeen
+        tbIdleFramesSeen = 0
+        TBLog.connection.info("cadence capture(pts) \(fmt(self.capCadenceBin), privacy: .public)  idle \(idle, privacy: .public)")
         TBLog.connection.info("cadence send(wall)   \(fmt(self.sendCadenceBin), privacy: .public)  drops \(self.cadenceDrops, privacy: .public)")
         if latSamples > 0 {
             let n = Double(latSamples)
@@ -1959,6 +1974,25 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         var onAudio: ((CMSampleBuffer) -> Void)?
         var onError: ((Error) -> Void)?
 
+        /// Send an unchanged frame anyway, so the wire runs at a constant rate.
+        ///
+        /// ScreenCaptureKit still ticks when nothing was composited, marking the
+        /// frame `.idle`; its pixels are identical to the last one. Skipping
+        /// those is why the frame rate falls on a static screen.
+        ///
+        /// Off by default because it buys no picture: the receiver would present
+        /// the same image again and nothing about it is visible. It also cannot
+        /// help judder, which is about when CONTENT changes, not how often we
+        /// transmit. What it costs is constant — roughly 3.8 Gbps and a full GPU
+        /// encode every refresh, on a laptop, forever.
+        ///
+        /// It exists because a constant rate is how a real monitor avoids ever
+        /// deciding what to drop, and that is worth being able to measure rather
+        /// than argue about. `defaults write com.targetbridge.sender
+        /// TBAlwaysSend60 -bool true`, and `-bool false` to revert.
+        private static let sendIdleFrames =
+            UserDefaults.standard.bool(forKey: "TBAlwaysSend60")
+
         private static func shouldProcessFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
             guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false)
                 as? [[SCStreamFrameInfo: Any]],
@@ -1971,7 +2005,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             switch status {
             case .complete, .started:
                 return true
-            case .idle, .blank, .suspended, .stopped:
+            case .idle:
+                // Identical pixels. Carried only when the constant-rate
+                // experiment is on; `.blank` and the stopped states stay
+                // filtered either way, since those are not a picture at all.
+                tbIdleFramesSeen += 1
+                return sendIdleFrames
+            case .blank, .suspended, .stopped:
                 return false
             @unknown default:
                 return true
