@@ -82,6 +82,53 @@ size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
                           int ten_bit, size_t header_reserve,
                           const uint8_t **out_blob);
 
+/* One encoded band, as returned by tb_dpcm_gpu_encode_bands(). Same ownership
+ * rule as the single-frame call: the memory belongs to the encoder and stays
+ * valid only until the next encode. */
+typedef struct {
+    const uint8_t *blob;   /* start of the reserved header run */
+    size_t         len;    /* header_reserve + encoded bytes */
+} tb_dpcm_gpu_band;
+
+/* Encode `band_count` equal horizontal bands of `band_h` rows each, in TWO GPU
+ * round trips for the whole frame instead of two per band.
+ *
+ * WHY THIS EXISTS
+ *
+ * tb_dpcm_gpu_encode() blocks twice — once after analyze, once after pack —
+ * because step 2 runs on the host between them. Calling it once per band made
+ * that 2N blocking waits, and the cost is not the GPU work (which is identical)
+ * but the wait itself: each one is a kernel round trip whose latency depends on
+ * what else is queued on the device. The sender shares the GPU with WindowServer
+ * and with whatever the user is watching, so an unlucky wait can be tens of
+ * milliseconds — and with eight chances per frame instead of two, the TAIL
+ * compounds even though the mean barely moves.
+ *
+ * Measured at 4 bands on a 5K frame: `process` (capture callback entry to send)
+ * averaged 15 ms against a 16.7 ms budget, and spiked to 48 ms while a video was
+ * playing, against 26-30 ms on ordinary desktop content. Those spikes are what
+ * bunches two frames onto the wire together and shifts a 25 fps video's 2,3,2,3
+ * pulldown into visible judder.
+ *
+ * Every band shares one geometry — same width, same height, same tile grid — so
+ * the per-band regions of every buffer are a fixed stride apart and the whole
+ * frame is one dispatch loop inside one command buffer.
+ *
+ * `src` points at the FULL frame, not at a band; each band reads from its own
+ * row offset. That also restores zero-copy for every band: the caller used to
+ * advance the pointer per band, and only a band whose byte offset happened to
+ * land on a page boundary could be wrapped without a copy.
+ *
+ * `out` must have room for `band_count` entries. Returns the total encoded
+ * length across all bands, or 0 on failure, in which case `out` is untouched.
+ * `band_count` is capped at TB_DPCM_GPU_MAX_BANDS. */
+#define TB_DPCM_GPU_MAX_BANDS 64
+
+size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
+                                const uint8_t *src, int stride, int w, int band_h,
+                                int band_count, int ten_bit, size_t header_reserve,
+                                tb_dpcm_gpu_band *out);
+
 /* Whether the last encode could read `src` in place. Reported so the sender can
  * say so once rather than guessing about it. */
 int tb_dpcm_gpu_last_was_zero_copy(const tb_dpcm_gpu *e);

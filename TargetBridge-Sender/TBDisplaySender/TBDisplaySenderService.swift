@@ -1114,21 +1114,28 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 dpcmFrameID &+= 1
                 let captureNanos = UInt64(max(0, CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds) * 1_000_000_000)
 
-                var encodedAny = false
-                var totalWritten = 0
-                for band in 0..<sliceCount {
+                // Every band is encoded in ONE pair of GPU submissions rather
+                // than a pair each. The GPU work is identical; what goes away is
+                // the blocking wait per band, and with it the tail that made
+                // `process` spike to 48 ms on video content — see the comment on
+                // tb_dpcm_gpu_encode_bands().
+                var bands = [tb_dpcm_gpu_band](repeating: tb_dpcm_gpu_band(),
+                                               count: sliceCount)
+                let totalWritten = dpcmGPU.map { enc in
+                    bands.withUnsafeMutableBufferPointer { bp in
+                        tb_dpcm_gpu_encode_bands(enc,
+                                                 base.assumingMemoryBound(to: UInt8.self),
+                                                 Int32(stride), Int32(width),
+                                                 Int32(rowsPerBand), Int32(sliceCount),
+                                                 isTenBit ? 1 : 0, reserve, bp.baseAddress)
+                    }
+                } ?? 0
+
+                let encodedAny = totalWritten > 0
+                for band in 0..<sliceCount where encodedAny {
                     let y0 = band * rowsPerBand
-                    var blob: UnsafePointer<UInt8>? = nil
-                    let written = dpcmGPU.map {
-                        tb_dpcm_gpu_encode($0,
-                                           base.assumingMemoryBound(to: UInt8.self)
-                                               .advanced(by: y0 * stride),
-                                           Int32(stride), Int32(width), Int32(rowsPerBand),
-                                           isTenBit ? 1 : 0, reserve, &blob)
-                    } ?? 0
-                    guard written > 0, let blob else { break }
-                    encodedAny = true
-                    totalWritten += written
+                    guard let blob = bands[band].blob else { continue }
+                    let written = bands[band].len
 
                     let pkt: Data
                     if sliceCount > 1 {

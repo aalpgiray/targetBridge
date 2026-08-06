@@ -267,23 +267,30 @@ static inline void put_u32(uint8_t *p, uint32_t v) {
 
 /* --------------------------------------------------------------------- encode */
 
-size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
-                          const uint8_t *src, int stride, int w, int h,
-                          int ten_bit, size_t header_reserve,
-                          const uint8_t **out_blob) {
-    if (!e || !src || !out_blob || w <= 0 || h <= 0 || stride < w * 4) return 0;
+size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
+                                const uint8_t *src, int stride, int w, int band_h,
+                                int band_count, int ten_bit, size_t header_reserve,
+                                tb_dpcm_gpu_band *out) {
+    if (!e || !src || !out || w <= 0 || band_h <= 0 || stride < w * 4) return 0;
+    if (band_count < 1 || band_count > TB_DPCM_GPU_MAX_BANDS) return 0;
     /* Same pixel cap as the C codec, for the same reason: every bit offset the
      * kernels compute is a uint. tb_dpcm_max_size() enforces it too (returning
      * 0 makes ensure_buffer fail), but checking here keeps the failure mode a
-     * clean refusal instead of a zero-sized allocation. */
-    if ((uint64_t)w * (uint64_t)h > ((uint64_t)1 << 27)) return 0;
+     * clean refusal instead of a zero-sized allocation. Both the band and the
+     * whole frame have to fit — the band because its offsets are what the
+     * kernels compute, the frame because it is what gets wrapped. */
+    if ((uint64_t)w * (uint64_t)band_h > ((uint64_t)1 << 27)) return 0;
+    if ((uint64_t)w * (uint64_t)band_h * (uint64_t)band_count > ((uint64_t)1 << 27)) return 0;
     /* The shaders index the source as 32-bit words, so a row must be a whole
      * number of them. Every CVPixelBuffer stride is, but an arbitrary caller's
      * might not be. */
     if (stride % 4 != 0) return 0;
 
+    /* Every band has the same width and the same height, so one geometry serves
+     * all of them and each band's region of each buffer is a fixed stride away
+     * from the last. That is the whole reason this can be one dispatch loop. */
     const int tiles_x = (w + TB_DPCM_TILE - 1) / TB_DPCM_TILE;
-    const int tiles_y = (h + TB_DPCM_TILE - 1) / TB_DPCM_TILE;
+    const int tiles_y = (band_h + TB_DPCM_TILE - 1) / TB_DPCM_TILE;
     const uint32_t tile_count  = (uint32_t)tiles_x * (uint32_t)tiles_y;
     const uint32_t group_count = (tile_count + TB_DPCM_GROUP - 1) / TB_DPCM_GROUP;
 
@@ -298,20 +305,32 @@ size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
      * bound at an offset into this buffer — so the blob starts at a padded
      * boundary and the caller's header sits at the END of the reserved run,
      * immediately before it. That keeps the header contiguous with the payload
-     * without misaligning anything the GPU touches. */
+     * without misaligning anything the GPU touches. Bands are spaced by a
+     * rounded span for the same reason. */
     const size_t blob_off = round4(header_reserve);
-    if (ensure_buffer(e, &e->blob, &e->blob_cap, blob_off + tb_dpcm_max_size(w, h)) != 0) return 0;
-    if (ensure_buffer(e, &e->meta, &e->meta_cap, (size_t)tile_count * 8) != 0) return 0;
-    if (ensure_buffer(e, &e->offs, &e->offs_cap, (size_t)tile_count * 4) != 0) return 0;
+    const size_t band_max = tb_dpcm_max_size(w, band_h);
+    if (band_max == 0) return 0;
+    const size_t band_span = round4(blob_off + band_max);
+    const size_t meta_span = (size_t)tile_count * 8;
+    const size_t offs_span = (size_t)tile_count * 4;
 
-    uint8_t *blob = (uint8_t *)e->blob.contents + blob_off;
+    if (ensure_buffer(e, &e->blob, &e->blob_cap, band_span * (size_t)band_count) != 0) return 0;
+    if (ensure_buffer(e, &e->meta, &e->meta_cap, meta_span * (size_t)band_count) != 0) return 0;
+    if (ensure_buffer(e, &e->offs, &e->offs_cap, offs_span * (size_t)band_count) != 0) return 0;
+
+    size_t payload_bytes[TB_DPCM_GPU_MAX_BANDS];
+    size_t total_all = 0;
 
     @autoreleasepool {
         /* Wrap the caller's pixels without copying when the allocation is page
-         * aligned, which IOSurface-backed capture buffers are. The fallback
-         * exists so an odd caller degrades instead of failing. */
+         * aligned, which IOSurface-backed capture buffers are. The whole frame
+         * is wrapped once and each band reads from its own offset — wrapping a
+         * band's advanced pointer instead only avoided the copy when that band's
+         * byte offset happened to land on a page boundary. The fallback exists
+         * so an odd caller degrades instead of failing. */
         const size_t page = (size_t)getpagesize();
-        const size_t src_bytes = (size_t)stride * (size_t)h;
+        const size_t band_bytes = (size_t)stride * (size_t)band_h;
+        const size_t src_bytes  = band_bytes * (size_t)band_count;
         id<MTLBuffer> srcBuf = nil;
         if (((uintptr_t)src % page) == 0) {
             srcBuf = [e->dev newBufferWithBytesNoCopy:(void *)src
@@ -329,7 +348,7 @@ size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
         }
 
         struct enc_params P = {
-            (uint32_t)w, (uint32_t)h,
+            (uint32_t)w, (uint32_t)band_h,
             (uint32_t)tiles_x, (uint32_t)tiles_y,
             tile_count,
             (uint32_t)(stride / 4),
@@ -338,16 +357,22 @@ size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
             ten_bit ? 0x200u : 0x80u
         };
 
-        /* ---- step 1: analyze ---- */
+        /* ---- step 1: analyze, every band in one submission ----
+         * The default (serial) dispatch type is kept deliberately. A single
+         * band already fills the device — 57600 threadgroups at 5K/4 — so
+         * letting bands overlap would buy almost nothing, and the win here is
+         * the round trip, not intra-GPU concurrency. */
         id<MTLCommandBuffer> cb = [e->queue commandBuffer];
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
         [ce setComputePipelineState:e->analyze];
-        [ce setBuffer:srcBuf  offset:0 atIndex:0];
-        [ce setBuffer:e->meta offset:0 atIndex:1];
-        [ce setBuffer:e->blob offset:blob_off + seed_plane_off atIndex:2];
         [ce setBytes:&P length:sizeof(P) atIndex:3];
-        [ce dispatchThreadgroups:MTLSizeMake(tile_count, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        for (int b = 0; b < band_count; ++b) {
+            [ce setBuffer:srcBuf  offset:band_bytes * (size_t)b atIndex:0];
+            [ce setBuffer:e->meta offset:meta_span  * (size_t)b atIndex:1];
+            [ce setBuffer:e->blob offset:band_span  * (size_t)b + blob_off + seed_plane_off atIndex:2];
+            [ce dispatchThreadgroups:MTLSizeMake(tile_count, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        }
         [ce endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
@@ -360,75 +385,96 @@ size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
          * O(tiles), so 1/64th of the per-pixel work, and the host has to write
          * the header and learn the final length regardless. Group starts are
          * rounded up to a byte, which is what lets step 3 write groups
-         * concurrently. */
-        const uint32_t *meta = (const uint32_t *)e->meta.contents;
-        uint32_t *offs = (uint32_t *)e->offs.contents;
-        /* Up to the SEED plane only. The analyze kernel has already written the
-         * seeds into the blob, and clearing as far as payload_off would erase
-         * them — which it did, and showed up as every byte from seed_plane_off
-         * onwards differing from the reference. The width plane does need
-         * clearing because nibbles are OR-ed into it; the header and group table
-         * are written whole. */
-        memset(blob, 0, seed_plane_off);
+         * concurrently.
+         *
+         * This is the remaining sync point: it sits between two GPU passes, so
+         * the encoder has to stop here. Moving it onto the device would make the
+         * frame a single submission. */
+        for (int b = 0; b < band_count; ++b) {
+            uint8_t *blob = (uint8_t *)e->blob.contents + band_span * (size_t)b + blob_off;
+            const uint32_t *meta = (const uint32_t *)((uint8_t *)e->meta.contents + meta_span * (size_t)b);
+            uint32_t *offs = (uint32_t *)((uint8_t *)e->offs.contents + offs_span * (size_t)b);
 
-        size_t bitpos = 0;
-        uint8_t *wp = blob + width_plane_off;
-        for (uint32_t t = 0; t < tile_count; ++t) {
-            if (t % TB_DPCM_GROUP == 0) {
-                bitpos = (bitpos + 7u) & ~(size_t)7u;
-                put_u32(blob + group_table_off + (size_t)(t / TB_DPCM_GROUP) * 4,
-                        (uint32_t)bitpos);
-            }
-            offs[t] = (uint32_t)bitpos;
+            /* Up to the SEED plane only. The analyze kernel has already written
+             * the seeds into the blob, and clearing as far as payload_off would
+             * erase them — which it did, and showed up as every byte from
+             * seed_plane_off onwards differing from the reference. The width
+             * plane does need clearing because nibbles are OR-ed into it; the
+             * header and group table are written whole. */
+            memset(blob, 0, seed_plane_off);
 
-            const uint32_t packed = meta[t * 2 + 0];
-            for (int c = 0; c < 3; ++c) {
-                const uint32_t idx = t * 3u + (uint32_t)c;
-                const int n = (int)((packed >> (8 * c)) & 0xFFu);
-                if (idx & 1u) wp[idx >> 1] |= (uint8_t)((n & 0xF) << 4);
-                else          wp[idx >> 1] |= (uint8_t)( n & 0xF);
+            size_t bitpos = 0;
+            uint8_t *wp = blob + width_plane_off;
+            for (uint32_t t = 0; t < tile_count; ++t) {
+                if (t % TB_DPCM_GROUP == 0) {
+                    bitpos = (bitpos + 7u) & ~(size_t)7u;
+                    put_u32(blob + group_table_off + (size_t)(t / TB_DPCM_GROUP) * 4,
+                            (uint32_t)bitpos);
+                }
+                offs[t] = (uint32_t)bitpos;
+
+                const uint32_t packed = meta[t * 2 + 0];
+                for (int c = 0; c < 3; ++c) {
+                    const uint32_t idx = t * 3u + (uint32_t)c;
+                    const int n = (int)((packed >> (8 * c)) & 0xFFu);
+                    if (idx & 1u) wp[idx >> 1] |= (uint8_t)((n & 0xF) << 4);
+                    else          wp[idx >> 1] |= (uint8_t)( n & 0xF);
+                }
+                bitpos += meta[t * 2 + 1];
             }
-            bitpos += meta[t * 2 + 1];
+            payload_bytes[b] = (bitpos + 7) / 8;
+            const size_t total = payload_off + payload_bytes[b];
+
+            put_u32(blob +  0, TB_DPCM_MAGIC);
+            put_u32(blob +  4, (uint32_t)w);
+            put_u32(blob +  8, (uint32_t)band_h);
+            blob[12] = 3;
+            blob[13] = TB_DPCM_CHANNELS;
+            blob[14] = (uint8_t)(TB_DPCM_FLAG_ALPHA_OMITTED |
+                                 (ten_bit ? TB_DPCM_FLAG_TEN_BIT : 0u));
+            blob[15] = 0;
+            put_u32(blob + 16, group_count);
+            put_u32(blob + 20, (uint32_t)width_plane_bytes);
+            put_u32(blob + 24, (uint32_t)seed_plane_bytes);
+            put_u32(blob + 28, (uint32_t)payload_bytes[b]);
+
+            /* The reserved run ends where the blob begins, so the caller's
+             * header and the payload are one contiguous buffer. */
+            out[b].blob = blob - header_reserve;
+            out[b].len  = header_reserve + total;
+            total_all  += header_reserve + total;
         }
-        const size_t payload_bits  = bitpos;
-        const size_t payload_bytes = (payload_bits + 7) / 8;
-        const size_t total = payload_off + payload_bytes;
 
-        put_u32(blob +  0, TB_DPCM_MAGIC);
-        put_u32(blob +  4, (uint32_t)w);
-        put_u32(blob +  8, (uint32_t)h);
-        blob[12] = 3;
-        blob[13] = TB_DPCM_CHANNELS;
-        blob[14] = (uint8_t)(TB_DPCM_FLAG_ALPHA_OMITTED |
-                             (ten_bit ? TB_DPCM_FLAG_TEN_BIT : 0u));
-        blob[15] = 0;
-        put_u32(blob + 16, group_count);
-        put_u32(blob + 20, (uint32_t)width_plane_bytes);
-        put_u32(blob + 24, (uint32_t)seed_plane_bytes);
-        put_u32(blob + 28, (uint32_t)payload_bytes);
-
-        /* ---- step 3: pack ----
+        /* ---- step 3: pack, every band in one submission ----
          * The payload is zeroed on the GPU because the packer merges into it, and
-         * a 32 MB memset on the host would cost more than the whole encode. */
+         * a 32 MB memset on the host would cost more than the whole encode. All
+         * the fills go in one blit encoder ahead of the packs: separate encoders
+         * in a command buffer run in order, which is the dependency we need. */
         cb = [e->queue commandBuffer];
         id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
-        [be fillBuffer:e->blob
-                 range:NSMakeRange(blob_off + payload_off, round4(payload_bytes) + 4)
-                 value:0];
+        for (int b = 0; b < band_count; ++b) {
+            [be fillBuffer:e->blob
+                     range:NSMakeRange(band_span * (size_t)b + blob_off + payload_off,
+                                       round4(payload_bytes[b]) + 4)
+                     value:0];
+        }
         [be endEncoding];
 
         ce = [cb computeCommandEncoder];
         [ce setComputePipelineState:e->pack];
-        [ce setBuffer:srcBuf  offset:0 atIndex:0];
-        [ce setBuffer:e->meta offset:0 atIndex:1];
-        [ce setBuffer:e->offs offset:0 atIndex:2];
-        [ce setBuffer:e->blob offset:blob_off + payload_off atIndex:3];
-        [ce setBuffer:e->blob offset:blob_off + payload_off atIndex:4];
         [ce setBytes:&P length:sizeof(P) atIndex:5];
         const NSUInteger threads = (NSUInteger)tile_count * 3;
         const NSUInteger tg = 256;
-        [ce dispatchThreadgroups:MTLSizeMake((threads + tg - 1) / tg, 1, 1)
-           threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        for (int b = 0; b < band_count; ++b) {
+            const size_t pay = band_span * (size_t)b + blob_off + payload_off;
+            [ce setBuffer:srcBuf  offset:band_bytes * (size_t)b atIndex:0];
+            [ce setBuffer:e->meta offset:meta_span  * (size_t)b atIndex:1];
+            [ce setBuffer:e->offs offset:offs_span  * (size_t)b atIndex:2];
+            [ce setBuffer:e->blob offset:pay atIndex:3];
+            [ce setBuffer:e->blob offset:pay atIndex:4];
+            [ce dispatchThreadgroups:MTLSizeMake((threads + tg - 1) / tg, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        }
         [ce endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
@@ -436,10 +482,19 @@ size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
             fprintf(stderr, "[dpcm-gpu] pack: %s\n", cb.error.localizedDescription.UTF8String);
             return 0;
         }
-
-        /* The reserved run ends where the blob begins, so the caller's header
-         * and the payload are one contiguous buffer. */
-        *out_blob = blob - header_reserve;
-        return header_reserve + total;
     }
+    return total_all;
+}
+
+size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
+                          const uint8_t *src, int stride, int w, int h,
+                          int ten_bit, size_t header_reserve,
+                          const uint8_t **out_blob) {
+    if (!out_blob) return 0;
+    tb_dpcm_gpu_band band = { NULL, 0 };
+    const size_t n = tb_dpcm_gpu_encode_bands(e, src, stride, w, h, 1,
+                                              ten_bit, header_reserve, &band);
+    if (n == 0 || !band.blob) return 0;
+    *out_blob = band.blob;
+    return band.len;
 }
