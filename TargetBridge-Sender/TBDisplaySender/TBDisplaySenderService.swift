@@ -907,25 +907,45 @@ private final class TBVideoPipeline: @unchecked Sendable {
         lastCapturePTS = pts
 
         guard capCadenceCount >= 240 else { return }
-        func fmt(_ bins: [Int]) -> String {
-            let total = max(1, bins.reduce(0, +))
-            return bins.enumerated()
-                .filter { $0.element > 0 }
-                .map { "\($0.offset):\($0.element) (\(Int(100.0 * Double($0.element) / Double(total)))%)" }
-                .joined(separator: "  ")
-        }
+
+        // Snapshot, reset, and format somewhere else.
+        //
+        // This block used to run on the capture thread: four os_log calls and
+        // two histograms built with enumerated/filter/map/joined, which is a lot
+        // of allocation. It fired once per 240 frames and produced exactly one
+        // 2-period gap per 240 frames -- the last 1% of `send(wall)`, and the
+        // one thing `process` could never show, because the report happens after
+        // the measurement it reports.
+        //
+        // Diagnostics must not perturb what they measure. Copying eight ints and
+        // a few doubles is cheap; formatting them is not.
+        let capBins = capCadenceBin
+        let sendBins = sendCadenceBin
+        let drops = cadenceDrops
         let idle = tbIdleFramesSeen
+        let sProbe = stageProbeMax, sLock = stageLockMax
+        let sCtx = stageCtxMax, sSubmit = stageSubmitMax
+        let hadProcess = latProcessMax > 0
+        let dSum = latDeliverySum, dMax = latDeliveryMax
+        let pSum = latProcessSum, pMax = latProcessMax
+        let samples = latSamples
+        let inflight = pendingVideoPackets
+        let budget = preset.maxPendingVideoPackets
+            * ((dpcmEnabled && dpcmSlicesEnabled) ? max(1, dpcmSliceCount) : 1)
+
         tbIdleFramesSeen = 0
-        TBLog.connection.info("cadence capture(pts) \(fmt(self.capCadenceBin), privacy: .public)  idle \(idle, privacy: .public)")
-        TBLog.connection.info("cadence send(wall)   \(fmt(self.sendCadenceBin), privacy: .public)  drops \(self.cadenceDrops, privacy: .public)")
-        if latProcessMax > 0 {
-            TBLog.connection.info("stage worst ms: probe \(String(format: "%.1f", self.stageProbeMax), privacy: .public) | lock \(String(format: "%.1f", self.stageLockMax), privacy: .public) | ctx \(String(format: "%.1f", self.stageCtxMax), privacy: .public) | submit \(String(format: "%.1f", self.stageSubmitMax), privacy: .public)")
-        }
         stageProbeMax = 0; stageLockMax = 0; stageCtxMax = 0; stageSubmitMax = 0
-        if latSamples > 0 {
-            let n = Double(latSamples)
-            TBLog.connection.info("latency delivery \(String(format: "%.1f", self.latDeliverySum / n), privacy: .public) ms avg / \(String(format: "%.1f", self.latDeliveryMax), privacy: .public) max | process \(String(format: "%.1f", self.latProcessSum / n), privacy: .public) ms avg / \(String(format: "%.1f", self.latProcessMax), privacy: .public) max | inflight \(self.pendingVideoPackets, privacy: .public)/\(self.preset.maxPendingVideoPackets * ((self.dpcmEnabled && self.dpcmSlicesEnabled) ? max(1, self.dpcmSliceCount) : 1), privacy: .public)")
-        }
+
+        TBTelemetryReporter.report(capBins: capBins, sendBins: sendBins,
+                                   drops: drops, idle: idle,
+                                   probe: sProbe, lock: sLock,
+                                   ctx: sCtx, submit: sSubmit,
+                                   hadProcess: hadProcess,
+                                   deliverySum: dSum, deliveryMax: dMax,
+                                   processSum: pSum, processMax: pMax,
+                                   samples: samples,
+                                   inflight: inflight, budget: budget)
+
         latDeliverySum = 0; latDeliveryMax = 0
         latProcessSum = 0; latProcessMax = 0
         latSamples = 0
