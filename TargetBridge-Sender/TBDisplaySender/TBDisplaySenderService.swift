@@ -1143,59 +1143,75 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 dpcmFrameID &+= 1
                 let captureNanos = UInt64(max(0, CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds) * 1_000_000_000)
 
-                // Every band is encoded in ONE pair of GPU submissions rather
-                // than a pair each. The GPU work is identical; what goes away is
-                // the blocking wait per band, and with it the tail that made
-                // `process` spike to 48 ms on video content — see the comment on
-                // tb_dpcm_gpu_encode_bands().
-                var bands = [tb_dpcm_gpu_band](repeating: tb_dpcm_gpu_band(),
-                                               count: sliceCount)
-                let totalWritten = dpcmGPU.map { enc in
-                    bands.withUnsafeMutableBufferPointer { bp in
-                        tb_dpcm_gpu_encode_bands(enc,
-                                                 base.assumingMemoryBound(to: UInt8.self),
-                                                 Int32(stride), Int32(width),
-                                                 Int32(rowsPerBand), Int32(sliceCount),
-                                                 isTenBit ? 1 : 0, reserve, bp.baseAddress)
-                    }
-                } ?? 0
-
-                let encodedAny = totalWritten > 0
-                for band in 0..<sliceCount where encodedAny {
-                    let y0 = band * rowsPerBand
-                    guard let blob = bands[band].blob else { continue }
-                    let written = bands[band].len
-
-                    let pkt: Data
-                    if sliceCount > 1 {
-                        pkt = TBMonitorProtocol.framedSlicePacket(
-                            base: blob, totalCount: written,
-                            captureTimeNanos: captureNanos,
-                            frameID: dpcmFrameID,
-                            frameW: UInt32(width), frameH: UInt32(height),
-                            y0: UInt32(y0),
-                            index: UInt16(band), count: UInt16(sliceCount))
-                    } else {
-                        pkt = TBMonitorProtocol.framedPacket(
-                            type: .rawDPCM, base: blob, totalCount: written)
-                    }
-
-                    pendingVideoPackets += 1
-                    targetConnection.send(content: pkt, completion: .contentProcessed({ [weak self] _ in
+                // Encode WITHOUT blocking this thread.
+                //
+                // This is ScreenCaptureKit's capture queue: the one thread that
+                // must keep pace with the display. Waiting on the GPU here cost
+                // 13-15 ms of a 16.7 ms period -- not for our own work, but for
+                // a device shared with WindowServer -- so any spike pushed a
+                // frame into the next period and two went out together. Capture
+                // measured a clean 100% while `send` sat at 85-90%, with 7% of
+                // packets leaving within 8 ms of the one before.
+                //
+                // Batching the bands into two submissions bought only ~1 ms,
+                // because the cost was never the NUMBER of waits.
+                //
+                // The GPU reads these pixels after this returns, so the frame
+                // context holds the pixel buffer locked and referenced until the
+                // callback fires; ScreenCaptureKit would otherwise recycle it
+                // mid-encode. `passRetained` is balanced by the `takeRetained`
+                // in tbDPCMAsyncDone.
+                let frameCtx = TBDPCMFrameContext(
+                    pixelBuffer: pixelBuffer,
+                    captureNanos: captureNanos,
+                    frameID: dpcmFrameID,
+                    sliceCount: sliceCount,
+                    rowsPerBand: rowsPerBand,
+                    width: width,
+                    height: height,
+                    send: { [weak self] packet in
                         guard let self else { return }
+                        self.pendingVideoPackets += 1
+                        targetConnection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
+                            guard let self else { return }
+                            self.queue.async {
+                                self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+                            }
+                        }))
+                    },
+                    finished: { [weak self] written, ok in
+                        guard let self, ok, written > 0 else { return }
                         self.queue.async {
-                            self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
+                            guard !self.dpcmLogged else { return }
+                            self.dpcmLogged = true
+                            let raw = stride * height
+                            TBLog.connection.info("dpcm: \(width, privacy: .public)x\(height, privacy: .public) \(isTenBit ? 10 : 8, privacy: .public)-bit \(raw / 1_000_000, privacy: .public) MB -> \(written / 1_000_000, privacy: .public) MB (\(String(format: "%.2fx", Double(raw) / Double(written)), privacy: .public)) \(sliceCount, privacy: .public) slice(s) async")
                         }
-                    }))
+                    })
+
+                // The retain is handed to C, so it must be balanced on BOTH
+                // paths: the callback takes it on success, and we take it back
+                // here on refusal. Leaking it would strand a LOCKED pixel
+                // buffer, and ScreenCaptureKit's pool is small enough that a
+                // few of those stop capture entirely.
+                var submitted: Int32 = -1
+                if let enc = dpcmGPU {
+                    let opaque = Unmanaged.passRetained(frameCtx).toOpaque()
+                    submitted = tb_dpcm_gpu_encode_bands_async(
+                        enc,
+                        base.assumingMemoryBound(to: UInt8.self),
+                        Int32(stride), Int32(width),
+                        Int32(rowsPerBand), Int32(sliceCount),
+                        isTenBit ? 1 : 0, reserve,
+                        tbDPCMAsyncDone, opaque)
+                    if submitted != 0 {
+                        Unmanaged<TBDPCMFrameContext>.fromOpaque(opaque).release()
+                    }
                 }
 
-                if encodedAny {
-                    let written = totalWritten
-                    if !dpcmLogged {
-                        dpcmLogged = true
-                        let raw = stride * height
-                        TBLog.connection.info("dpcm: \(width, privacy: .public)x\(height, privacy: .public) \(isTenBit ? 10 : 8, privacy: .public)-bit \(raw / 1_000_000, privacy: .public) MB -> \(written / 1_000_000, privacy: .public) MB (\(String(format: "%.2fx", Double(raw) / Double(written)), privacy: .public)) \(sliceCount, privacy: .public) slice(s) \(tb_dpcm_gpu_last_was_zero_copy(self.dpcmGPU!) != 0 ? "zero-copy" : "staged", privacy: .public)")
-                    }
+                if submitted == 0 {
+                    // `process` now measures submission, which is the part that
+                    // actually occupies this thread.
                     let process = (Self.hostNow() - frameEnteredAt) * 1000.0
                     if process >= 0, process < 500 {
                         latProcessSum += process
@@ -1218,6 +1234,15 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     lock.unlock()
                     return
                 }
+
+                // Refused: every encoder slot is busy, or the geometry is one
+                // it will not take. Either way this frame is dropped rather than
+                // queued -- waiting would put the block back on this thread. The
+                // retain was already released above, so the pixel buffer unlocks
+                // when the context goes out of scope here.
+                cadenceDrops += 1
+                return
+
                 // Encoder refused (only possible on a bad size or capacity):
                 // fall through and send the frame uncompressed.
             }

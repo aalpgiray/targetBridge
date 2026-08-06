@@ -129,6 +129,61 @@ size_t tb_dpcm_gpu_encode_bands(tb_dpcm_gpu *e,
                                 int band_count, int ten_bit, size_t header_reserve,
                                 tb_dpcm_gpu_band *out);
 
+/* How many frames may be encoding at once. Each in-flight frame needs its own
+ * blob, meta and offs buffers, so this is the memory multiplier; three matches
+ * the sender's in-flight packet budget. */
+#define TB_DPCM_GPU_JOBS 3
+
+/* Called when a frame has finished encoding, on the encoder's own queue — NOT
+ * the caller's. `bands` is valid only for the duration of the call: the slot is
+ * recycled as soon as it returns, so send from inside it or copy.
+ * `ok` is 0 if the encode failed, in which case `bands` is meaningless. */
+typedef void (*tb_dpcm_gpu_done)(void *ctx, int ok,
+                                 const tb_dpcm_gpu_band *bands, int band_count);
+
+/* Encode without blocking the calling thread.
+ *
+ * WHY
+ *
+ * tb_dpcm_gpu_encode_bands() waits on the GPU twice, and those waits happen on
+ * whatever thread called it — for the sender that is ScreenCaptureKit's capture
+ * queue, the one thing that must keep up with the display. Measured there:
+ * `process` (callback entry to send) ran 13-15 ms against a 16.7 ms period,
+ * because the wait is not for our own work but for a GPU shared with
+ * WindowServer and whatever the user is watching. With ~2 ms of headroom any
+ * spike pushes a frame into the next period, and then two go out together:
+ * capture measured a clean 100% while `send` sat at 85-90% with 7% of packets
+ * leaving within 8 ms of the previous one.
+ *
+ * Batching the bands into two submissions cut the round trips from 2N to 2 and
+ * bought about 1 ms, which is all it could: the cost was never the number of
+ * waits, it was waiting at all.
+ *
+ * So this submits and returns. The host-side plan step still has to run between
+ * the two GPU passes, but it runs on the encoder's own serial queue rather than
+ * the caller's, and `done` fires from there too.
+ *
+ * OWNERSHIP
+ *
+ * `src` is read by the GPU AFTER this returns, so the caller must keep those
+ * pixels alive and unmodified until `done` runs — for a CVPixelBuffer that
+ * means holding the lock and a reference, not just the pointer.
+ *
+ * Returns 0 if the frame was submitted, -1 if it was rejected: bad geometry, or
+ * TB_DPCM_GPU_JOBS frames already in flight. A rejection is ordinary
+ * backpressure and the caller should drop the frame; `done` is NOT called.
+ *
+ * Completion order matches submission order — one command queue, and the plan
+ * stage is serial. */
+int tb_dpcm_gpu_encode_bands_async(tb_dpcm_gpu *e,
+                                   const uint8_t *src, int stride, int w, int band_h,
+                                   int band_count, int ten_bit, size_t header_reserve,
+                                   tb_dpcm_gpu_done done, void *ctx);
+
+/* Wait for every in-flight frame to finish. Call before destroying the encoder
+ * or the pixel buffers it is still reading. */
+void tb_dpcm_gpu_drain(tb_dpcm_gpu *e);
+
 /* Whether the last encode could read `src` in place. Reported so the sender can
  * say so once rather than guessing about it. */
 int tb_dpcm_gpu_last_was_zero_copy(const tb_dpcm_gpu *e);
