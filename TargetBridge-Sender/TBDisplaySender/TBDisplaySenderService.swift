@@ -147,11 +147,25 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         }
     }
 
+    /// Frames ScreenCaptureKit may hold for us before it stalls.
+    ///
+    /// This was 2, against Apple's default of 8. The header is explicit that
+    /// more frames "may allow you to process frame data without stalling the
+    /// display stream", and our capture callback runs 10-14 ms against a
+    /// 16.7 ms period -- so with two buffers SCK regularly had nowhere to put
+    /// the next frame.
+    ///
+    /// That matters more than it sounds: a stalled stream delivers NOTHING, not
+    /// an idle frame. So a queue stall and a compositor that genuinely drew
+    /// nothing look identical from the frame-status counters, and the 4-5% of
+    /// refreshes missing from the capture cadence were attributed to the
+    /// compositor on exactly that evidence. 8 is Apple's default and the
+    /// documented maximum.
     var queueDepth: Int {
         if let envVal = ProcessInfo.processInfo.environment["QD"], let parsed = Int(envVal) {
             return parsed
         }
-        return 2
+        return 8
     }
 
     var expectedFrameRate: Int {
@@ -3342,7 +3356,20 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             let configuration = SCStreamConfiguration()
             configuration.width = preset.width
             configuration.height = preset.height
-            configuration.minimumFrameInterval = CMTime(value: 1, timescale: Int32(preset.expectedFrameRate))
+            // A THROTTLE, not a target: it caps how often frames may arrive.
+            // Apple's header says "Set this to kCMTimeZero to capture at
+            // display's native refresh rate", so asking for 60 was asking SCK
+            // to police a 16.67 ms gate with a timer of its own that is not
+            // phase-locked to the compositor -- and a frame produced a hair
+            // inside that gate can be held or skipped, which is precisely the
+            // 2-period gaps in the capture cadence.
+            //
+            // Presets that deliberately want a LOWER rate keep the throttle;
+            // that is what it is for.
+            configuration.minimumFrameInterval =
+                preset.expectedFrameRate >= 60
+                ? .zero
+                : CMTime(value: 1, timescale: Int32(preset.expectedFrameRate))
             configuration.queueDepth = preset.queueDepth
             // Full-color 4:4:4 raw = capture packed BGRA; otherwise 4:2:0 NV12.
             // 10-bit uses packed 2-10-10-10, which is also 4 bytes/pixel — same
