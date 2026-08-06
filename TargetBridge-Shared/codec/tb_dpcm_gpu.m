@@ -54,6 +54,12 @@ struct tb_dpcm_gpu_job {
     id<MTLBuffer> blob;  size_t blob_cap;
     id<MTLBuffer> meta;  size_t meta_cap;
     id<MTLBuffer> offs;  size_t offs_cap;
+    /* One uint per band: the payload bit count, written by the GPU plan. The
+     * host reads it in the completion handler, which is the only host touch of
+     * this frame's data and happens after everything is done. */
+    id<MTLBuffer> bits;  size_t bits_cap;
+    /* Per-group rounded totals, the middle of the three-kernel plan. */
+    id<MTLBuffer> gtot;  size_t gtot_cap;
     id<MTLBuffer> src;             /* retained until the GPU is done reading */
 
     struct enc_geom  g;
@@ -73,6 +79,11 @@ struct tb_dpcm_gpu {
     id<MTLCommandQueue>         queue;
     id<MTLComputePipelineState> analyze;
     id<MTLComputePipelineState> pack;
+    /* The plan step, moved off the host — see the shader comment. */
+    id<MTLComputePipelineState> scanGroups;
+    id<MTLComputePipelineState> scanBases;
+    id<MTLComputePipelineState> applyBases;
+    id<MTLComputePipelineState> zeroPayload;
 
     /* Non-blocking path. `plan` is serial, which is what keeps completions in
      * submission order; `slots` is what applies backpressure when every job is
@@ -177,6 +188,122 @@ static NSString *tb_enc_shader_source(void) {
      * `payload` and `payloadAtomic` are the same buffer bound twice: interior
      * words belong to exactly one thread and can be stored plainly, which is the
      * whole point of the batching. */
+    /* ---- step 2, on the GPU: the plan ----
+     *
+     * This ran on the host between the two GPU passes, which is why the encoder
+     * had to round-trip at all. It is O(tiles): a prefix sum of per-tile bit
+     * costs into each tile's bit offset, the group table, and the packed width
+     * nibbles.
+     *
+     * It looks sequential because each group's start is rounded up to a byte:
+     *
+     *     if (t % 64 == 0) bitpos = (bitpos + 7) & ~7;
+     *
+     * But every group base is ITSELF a multiple of 8, and for a = 0 (mod 8),
+     * round8(a + b) == a + round8(b). So
+     *
+     *     base[g] = base[g-1] + round8(groupTotal[g-1])
+     *
+     * is an ordinary prefix sum over ROUNDED group totals. Verified against the
+     * sequential algorithm on 20000 random layouts before any of this was
+     * written (scratchpad/scan_check.c).
+     *
+     * Three kernels: within-group scan, scan of the group bases, then add.
+     */
+    "kernel void tb_enc_scan_groups(device const uint *meta   [[buffer(0)]],\n"
+    "                               device       uint *offs   [[buffer(1)]],\n"
+    "                               device       uint *gtotal [[buffer(2)]],\n"
+    "                               device atomic_uint *widths[[buffer(3)]],\n"
+    "                               constant EncParams &P     [[buffer(4)]],\n"
+    "                               uint grp  [[threadgroup_position_in_grid]],\n"
+    "                               uint lane [[thread_position_in_threadgroup]]) {\n"
+    "  const uint tile = grp * 64u + lane;\n"
+    "  const uint cost = (tile < P.tileCount) ? meta[tile * 2u + 1u] : 0u;\n"
+    "\n"
+    /* Hillis-Steele exclusive scan over the group's 64 costs. */
+    "  threadgroup uint sh[64];\n"
+    "  sh[lane] = cost;\n"
+    "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "  for (uint off = 1u; off < 64u; off <<= 1) {\n"
+    "    uint v = (lane >= off) ? sh[lane - off] : 0u;\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "    sh[lane] += v;\n"
+    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    "  }\n"
+    "  const uint inclusive = sh[lane];\n"
+    "  const uint exclusive = inclusive - cost;\n"
+    "\n"
+    "  if (tile < P.tileCount) offs[tile] = exclusive;\n"
+    /* Lane 63 holds the group's inclusive total; round it here so the next pass
+     * is a plain sum. */
+    "  if (lane == 63u) gtotal[grp] = (sh[63] + 7u) & ~7u;\n"
+    "\n"
+    /* Width nibbles. Tile t owns nibbles 3t..3t+2, and neighbouring tiles share
+     * a byte, so this merges atomically into 32-bit words rather than assigning
+     * bytes to threads. */
+    "  if (tile < P.tileCount) {\n"
+    "    const uint packed = meta[tile * 2u + 0u];\n"
+    "    for (uint c = 0u; c < 3u; ++c) {\n"
+    "      const uint idx = tile * 3u + c;\n"
+    "      const uint n   = (packed >> (8u * c)) & 0xFu;\n"
+    "      const uint bit = (idx & 1u) ? 4u : 0u;\n"
+    "      const uint byteIdx = idx >> 1;\n"
+    "      const uint word    = byteIdx >> 2;\n"
+    "      const uint shift   = ((byteIdx & 3u) * 8u) + bit;\n"
+    "      atomic_fetch_or_explicit(&widths[word], n << shift, memory_order_relaxed);\n"
+    "    }\n"
+    "  }\n"
+    "}\n"
+    "\n"
+    /* Exclusive prefix sum over the rounded group totals, one threadgroup.
+     * groupCount is at most a few thousand, so a strided serial accumulate by a
+     * single lane is simpler than a multi-pass scan and costs microseconds. */
+    "kernel void tb_enc_scan_bases(device uint *gtotal      [[buffer(0)]],\n"
+    "                              device uint *groupTable  [[buffer(1)]],\n"
+    "                              device uint *outTotalBits[[buffer(2)]],\n"
+    "                              device const uint *meta   [[buffer(3)]],\n"
+    "                              constant EncParams &P     [[buffer(4)]],\n"
+    "                              uint lane [[thread_position_in_threadgroup]]) {\n"
+    "  if (lane != 0u) return;\n"
+    "  const uint groups = (P.tileCount + 63u) / 64u;\n"
+    "  uint acc = 0u;\n"
+    "  for (uint g = 0u; g < groups; ++g) {\n"
+    "    groupTable[g] = acc;\n"
+    "    acc += gtotal[g];\n"
+    "  }\n"
+    /* The payload length uses the LAST group's unrounded total, not the rounded
+     * one -- trailing alignment is not part of the stream. */
+    "  const uint lastBase = groupTable[groups - 1u];\n"
+    "  uint lastSum = 0u;\n"
+    "  const uint first = (groups - 1u) * 64u;\n"
+    "  for (uint t = first; t < P.tileCount; ++t) lastSum += meta[t * 2u + 1u];\n"
+    "  outTotalBits[0] = lastBase + lastSum;\n"
+    "}\n"
+    "\n"
+    /* Zero the payload before the packer merges into it.
+     *
+     * A blit fill cannot do this any more: the length is computed on the GPU and
+     * the host no longer knows it at encode time. Dispatched over the WORST-CASE
+     * word count with an early-out, which costs nothing for the threads that
+     * exit -- the alternative, filling the worst case unconditionally, would be
+     * ~59 MB of writes per frame. */
+    "kernel void tb_enc_zero_payload(device uint *payload      [[buffer(0)]],\n"
+    "                                device const uint *totalBits[[buffer(1)]],\n"
+    "                                uint w [[thread_position_in_grid]]) {\n"
+    "  const uint words = (totalBits[0] + 31u) / 32u + 1u;\n"
+    "  if (w >= words) return;\n"
+    "  payload[w] = 0u;\n"
+    "}\n"
+    "\n"
+    /* offs[] currently holds each tile's offset within its group; add the base. */
+    "kernel void tb_enc_apply_bases(device uint *offs            [[buffer(0)]],\n"
+    "                               device const uint *groupTable[[buffer(1)]],\n"
+    "                               constant EncParams &P        [[buffer(2)]],\n"
+    "                               uint tile [[thread_position_in_grid]]) {\n"
+    "  if (tile >= P.tileCount) return;\n"
+    "  offs[tile] += groupTable[tile >> 6];\n"
+    "}\n"
+    "\n"
     "kernel void tb_enc_pack(device const uint *src           [[buffer(0)]],\n"
     "                        device const uint *meta          [[buffer(1)]],\n"
     "                        device const uint *offs          [[buffer(2)]],\n"
@@ -266,7 +393,16 @@ tb_dpcm_gpu *tb_dpcm_gpu_create(void) {
                           [lib newFunctionWithName:@"tb_enc_analyze"] error:&err];
         e->pack    = [e->dev newComputePipelineStateWithFunction:
                           [lib newFunctionWithName:@"tb_enc_pack"] error:&err];
-        if (!e->analyze || !e->pack) {
+        e->scanGroups = [e->dev newComputePipelineStateWithFunction:
+                          [lib newFunctionWithName:@"tb_enc_scan_groups"] error:&err];
+        e->scanBases  = [e->dev newComputePipelineStateWithFunction:
+                          [lib newFunctionWithName:@"tb_enc_scan_bases"] error:&err];
+        e->applyBases = [e->dev newComputePipelineStateWithFunction:
+                          [lib newFunctionWithName:@"tb_enc_apply_bases"] error:&err];
+        e->zeroPayload = [e->dev newComputePipelineStateWithFunction:
+                          [lib newFunctionWithName:@"tb_enc_zero_payload"] error:&err];
+        if (!e->analyze || !e->pack || !e->scanGroups || !e->scanBases ||
+            !e->applyBases || !e->zeroPayload) {
             fprintf(stderr, "[dpcm-gpu] pipeline failed: %s\n",
                     err.localizedDescription.UTF8String ?: "?");
             free(e);
@@ -289,11 +425,14 @@ void tb_dpcm_gpu_destroy(tb_dpcm_gpu *e) {
     for (int i = 0; i < TB_DPCM_GPU_JOBS; ++i) {
         e->jobs[i].blob = nil; e->jobs[i].meta = nil;
         e->jobs[i].offs = nil; e->jobs[i].src  = nil;
+        e->jobs[i].bits = nil; e->jobs[i].gtot = nil;
     }
     e->plan_q = nil;
     e->slots = nil;
     e->blob = nil; e->meta = nil; e->offs = nil; e->staged = nil;
-    e->analyze = nil; e->pack = nil; e->queue = nil; e->dev = nil;
+    e->analyze = nil; e->pack = nil;
+    e->scanGroups = nil; e->scanBases = nil; e->applyBases = nil; e->zeroPayload = nil;
+    e->queue = nil; e->dev = nil;
     free(e);
 }
 
@@ -658,6 +797,9 @@ static int job_ensure(tb_dpcm_gpu *e, struct tb_dpcm_gpu_job *j,
     if (ensure_buffer(e, &j->blob, &j->blob_cap, g->band_span * (size_t)band_count) != 0) return -1;
     if (ensure_buffer(e, &j->meta, &j->meta_cap, g->meta_span * (size_t)band_count) != 0) return -1;
     if (ensure_buffer(e, &j->offs, &j->offs_cap, g->offs_span * (size_t)band_count) != 0) return -1;
+    const size_t groups = (g->tile_count + 63) / 64;
+    if (ensure_buffer(e, &j->gtot, &j->gtot_cap, groups * 4 * (size_t)band_count) != 0) return -1;
+    if (ensure_buffer(e, &j->bits, &j->bits_cap, 4 * (size_t)band_count) != 0) return -1;
     return 0;
 }
 
@@ -801,49 +943,119 @@ int tb_dpcm_gpu_encode_bands_async(tb_dpcm_gpu *e,
         }
         e->last_zero_copy = 1;
 
-        /* One analyze buffer per band, each planning and packing its own as
-         * soon as it lands. Bands are independent -- every band's bit offsets
-         * start from zero -- so band 0 can be on the wire while band 3 is still
-         * being analysed. Batching them into one submission was right when the
-         * caller was blocked waiting; now that nobody waits, the only thing
-         * batching buys is a burst at the far end. */
+        /* ONE command buffer per band: analyze, plan, pack.
+         *
+         * The plan step used to run on the host between two GPU passes, which is
+         * the only reason the encoder round-tripped at all. It is now three
+         * kernels (see the shader), so a band is a single submission with a
+         * single completion and no host involvement until the bytes are ready.
+         *
+         * Dispatches inside one compute encoder run in order with implicit
+         * barriers, which is exactly the dependency chain this needs.
+         */
         for (int b = 0; b < band_count; ++b) {
+            const struct enc_geom *g = &j->g;
+            const size_t bandBase = g->band_span * (size_t)b + g->blob_off;
             id<MTLCommandBuffer> cb = [e->queue commandBuffer];
+
+            /* Header, group table and width plane must start zeroed: the width
+             * nibbles are merged in atomically. The seed plane must NOT be
+             * cleared -- analyze writes it, and clearing that far erased it once
+             * already. */
+            id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+            [be fillBuffer:j->blob range:NSMakeRange(bandBase, g->seed_plane_off) value:0];
+            [be endEncoding];
+
             id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+
             [ce setComputePipelineState:e->analyze];
-            [ce setBytes:&j->P length:sizeof(j->P) atIndex:3];
             [ce setBuffer:j->src  offset:j->band_bytes  * (size_t)b atIndex:0];
-            [ce setBuffer:j->meta offset:j->g.meta_span * (size_t)b atIndex:1];
-            [ce setBuffer:j->blob offset:j->g.band_span * (size_t)b + j->g.blob_off + j->g.seed_plane_off
-                  atIndex:2];
-            [ce dispatchThreadgroups:MTLSizeMake(j->g.tile_count, 1, 1)
+            [ce setBuffer:j->meta offset:g->meta_span   * (size_t)b atIndex:1];
+            [ce setBuffer:j->blob offset:bandBase + g->seed_plane_off atIndex:2];
+            [ce setBytes:&j->P length:sizeof(j->P) atIndex:3];
+            [ce dispatchThreadgroups:MTLSizeMake(g->tile_count, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+
+            const NSUInteger groups = (g->tile_count + 63) / 64;
+            [ce setComputePipelineState:e->scanGroups];
+            [ce setBuffer:j->meta  offset:g->meta_span * (size_t)b atIndex:0];
+            [ce setBuffer:j->offs  offset:g->offs_span * (size_t)b atIndex:1];
+            [ce setBuffer:j->gtot  offset:groups * 4 * (size_t)b atIndex:2];
+            [ce setBuffer:j->blob  offset:bandBase + g->width_plane_off atIndex:3];
+            [ce setBytes:&j->P length:sizeof(j->P) atIndex:4];
+            [ce dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+
+            [ce setComputePipelineState:e->scanBases];
+            [ce setBuffer:j->gtot offset:groups * 4 * (size_t)b atIndex:0];
+            [ce setBuffer:j->blob offset:bandBase + g->group_table_off atIndex:1];
+            [ce setBuffer:j->bits offset:4 * (size_t)b atIndex:2];
+            [ce setBuffer:j->meta offset:g->meta_span * (size_t)b atIndex:3];
+            [ce setBytes:&j->P length:sizeof(j->P) atIndex:4];
+            [ce dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+
+            [ce setComputePipelineState:e->applyBases];
+            [ce setBuffer:j->offs offset:g->offs_span * (size_t)b atIndex:0];
+            [ce setBuffer:j->blob offset:bandBase + g->group_table_off atIndex:1];
+            [ce setBytes:&j->P length:sizeof(j->P) atIndex:2];
+            [ce dispatchThreadgroups:MTLSizeMake((g->tile_count + 255) / 256, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            const size_t pay = bandBase + g->payload_off;
+            const NSUInteger maxWords = (tb_dpcm_max_size(j->w, j->band_h) / 4) + 2;
+            [ce setComputePipelineState:e->zeroPayload];
+            [ce setBuffer:j->blob offset:pay atIndex:0];
+            [ce setBuffer:j->bits offset:4 * (size_t)b atIndex:1];
+            [ce dispatchThreadgroups:MTLSizeMake((maxWords + 255) / 256, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            [ce setComputePipelineState:e->pack];
+            [ce setBuffer:j->src  offset:j->band_bytes * (size_t)b atIndex:0];
+            [ce setBuffer:j->meta offset:g->meta_span  * (size_t)b atIndex:1];
+            [ce setBuffer:j->offs offset:g->offs_span  * (size_t)b atIndex:2];
+            [ce setBuffer:j->blob offset:pay atIndex:3];
+            [ce setBuffer:j->blob offset:pay atIndex:4];
+            [ce setBytes:&j->P length:sizeof(j->P) atIndex:5];
+            const NSUInteger threads = (NSUInteger)g->tile_count * 3;
+            [ce dispatchThreadgroups:MTLSizeMake((threads + 255) / 256, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
             [ce endEncoding];
 
             const int last = (b + 1 == band_count);
             [cb addCompletedHandler:^(id<MTLCommandBuffer> done_cb) {
-                if (done_cb.error) {
-                    fprintf(stderr, "[dpcm-gpu] analyze band %d: %s\n", b,
+                const int ok = (done_cb.error == nil);
+                if (!ok) {
+                    fprintf(stderr, "[dpcm-gpu] band %d: %s\n", b,
                             done_cb.error.localizedDescription.UTF8String);
-                    if (j->done) j->done(j->ctx, 0, NULL, b, last);
-                    if (last) {
-                        j->src = nil; j->done = NULL; j->ctx = NULL;
-                        dispatch_semaphore_signal(e->slots);
-                    }
-                    return;
+                } else {
+                    /* The only host work left: read the length the GPU computed
+                     * and write the 32-byte header in front of it. */
+                    const uint32_t totalBits =
+                        ((const uint32_t *)j->bits.contents)[b];
+                    const size_t payload_bytes = (totalBits + 7u) / 8u;
+                    uint8_t *blob = (uint8_t *)j->blob.contents + bandBase;
+                    put_u32(blob +  0, TB_DPCM_MAGIC);
+                    put_u32(blob +  4, (uint32_t)j->w);
+                    put_u32(blob +  8, (uint32_t)j->band_h);
+                    blob[12] = 3;
+                    blob[13] = TB_DPCM_CHANNELS;
+                    blob[14] = (uint8_t)(TB_DPCM_FLAG_ALPHA_OMITTED |
+                                         (j->ten_bit ? TB_DPCM_FLAG_TEN_BIT : 0u));
+                    blob[15] = 0;
+                    put_u32(blob + 16, j->g.group_count);
+                    put_u32(blob + 20, (uint32_t)j->g.width_plane_bytes);
+                    put_u32(blob + 24, (uint32_t)j->g.seed_plane_bytes);
+                    put_u32(blob + 28, (uint32_t)payload_bytes);
+                    j->bands[b].blob = blob - j->header_reserve;
+                    j->bands[b].len  = j->header_reserve + j->g.payload_off + payload_bytes;
                 }
-                /* Off Metal's callback thread and onto ours: the plan is host
-                 * work and holding a driver thread for it would throttle every
-                 * other command buffer's completion. Serial, so bands stay in
-                 * order. */
-                dispatch_async(e->plan_q, ^{
-                    plan_band((uint8_t *)j->blob.contents,
-                              (const uint8_t *)j->meta.contents,
-                              (uint8_t *)j->offs.contents,
-                              &j->g, b, j->w, j->band_h, j->ten_bit,
-                              j->header_reserve, j->payload_bytes, j->bands);
-                    job_submit_pack_band(e, j, b);
-                });
+                if (j->done) j->done(j->ctx, ok, ok ? &j->bands[b] : NULL, b, last);
+                if (last) {
+                    j->src = nil; j->done = NULL; j->ctx = NULL;
+                    dispatch_semaphore_signal(e->slots);
+                }
             }];
             [cb commit];
         }
