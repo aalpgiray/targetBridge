@@ -1610,13 +1610,15 @@ static void write_be32(uint8_t *dst, uint32_t value) {
     dst[3] = (uint8_t)(value & 0xff);
 }
 
-static int send_all(int fd, const uint8_t *buf, size_t len) {
+static int send_all_within(int fd, const uint8_t *buf, size_t len, unsigned budget_ms) {
     /* Bound the EAGAIN retry loop: this runs on the event-loop thread, so an
      * unresponsive reader (half-open peer, saturated link) must not wedge
      * rendering and quit handling forever. 2s of zero progress means the
      * session is effectively dead; give up and let the caller/watchdog
-     * tear it down. */
-    const uint64_t deadline_ms = now_ms() + 2000;
+     * tear it down.
+     *
+     * Optional traffic passes a much smaller budget — see pump_log_shipping. */
+    const uint64_t deadline_ms = now_ms() + budget_ms;
     size_t off = 0;
     while (off < len) {
         ssize_t n = write(fd, buf + off, len - off);
@@ -1635,6 +1637,10 @@ static int send_all(int fd, const uint8_t *buf, size_t len) {
         return -1;
     }
     return 0;
+}
+
+static int send_all(int fd, const uint8_t *buf, size_t len) {
+    return send_all_within(fd, buf, len, 2000);
 }
 
 /* Every packet written to the client socket goes through here.
@@ -2351,29 +2357,52 @@ static void link_reader_stop(struct tb_link_reader *r) {
  * writer to this fd, and a second one would let two partial packets interleave
  * on the same socket. Bounded per call so a burst of logging cannot displace
  * the frame this loop exists to render — the rest waits for the next pass. */
+/* Shipping the log must never cost a frame.
+ *
+ * The first version ran every main-loop pass and used the ordinary two-second
+ * stall budget, which created a feedback loop that collapsed the stream to
+ * 7 fps on fullscreen video: a saturated sender stops reading upstream, the
+ * receiver's send buffer fills, the render loop blocks inside send_all(), so it
+ * stops reading frames, so the sender's writes never complete, so its in-flight
+ * budget pins (13/12 observed) and it drops nearly every frame (96 in one
+ * window). The receiver looked 90% idle throughout because it was starved, not
+ * busy.
+ *
+ * Three limits, all of them about never blocking the render loop:
+ *   - at most one 8 KB packet every 200 ms, so ~40 KB/s, far too little to fill
+ *     a socket buffer even when the link is busy;
+ *   - trylock, so a mic write in progress defers us instead of queueing;
+ *   - a 15 ms stall budget instead of 2000, so a full buffer costs at most part
+ *     of one frame.
+ * Anything not sent stays in the ring for the next pass, and the ring already
+ * reports what it had to drop. */
 static void pump_log_shipping(struct app *a) {
     if (!a || a->client_fd < 0) return;
 
+    static uint64_t next_ship_ms = 0;
+    const uint64_t now = now_ms();
+    if (now < next_ship_ms) return;
+
     /* Take the lock BEFORE draining. Draining removes bytes from the ring, so
-     * discovering afterwards that the socket is busy would throw them away.
-     *
-     * trylock rather than lock: send_all() tolerates a stalled socket for two
-     * seconds, and the render loop must not block that long behind the mic
-     * thread for something as optional as a log line. Whatever is pending just
-     * waits in the ring for the next pass. */
+     * discovering afterwards that the socket is busy would throw them away. */
     if (pthread_mutex_trylock(&g_send_lock) != 0) return;
 
     uint8_t buf[8192];
-    for (int chunk = 0; chunk < 4; ++chunk) {
-        const size_t n = tb_logship_drain(buf, sizeof(buf));
-        if (n == 0) break;
-        /* A failed send is not worth reporting: the report would go to stderr,
-         * which is what just failed to send, and the session teardown that
-         * follows will say so anyway. */
-        if (tb_send_packet_locked(a, TB_PKT_LOG, buf, n) < 0) break;
+    const size_t n = tb_logship_drain(buf, sizeof(buf));
+    if (n > 0) {
+        uint8_t header[TB_HDR_BYTES];
+        write_be32(header, (uint32_t)(1 + n));
+        header[4] = TB_PKT_LOG;
+        /* Header and body share the budget. Giving up between them would leave
+         * a partial packet and corrupt the stream, so the body is only attempted
+         * once the header is fully out, and both use the same short budget. */
+        if (send_all_within(a->client_fd, header, sizeof(header), 15) == 0) {
+            (void)send_all_within(a->client_fd, buf, n, 15);
+        }
     }
 
     pthread_mutex_unlock(&g_send_lock);
+    next_ship_ms = now + 200;
 }
 
 /* Main thread: run queued control packets, then render at most one frame (the
