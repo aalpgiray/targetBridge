@@ -57,7 +57,16 @@
  *
  * A slice slot is a fraction of a frame (~1.7 MB at 18 bands against ~30 MB
  * whole), so depth is cheap where it used to be expensive. */
-#define TB_UPLOAD_RING 32
+/* Eight, not thirty-two. Sized for bands at ~1.7 MB, thirty-two forgot that the
+ * same ring carries WHOLE frames on the unsliced path, and every slot grows to
+ * the largest request it has ever seen: 32 x ~30 MB is a gigabyte of staging
+ * buffers. Measured 4.4 GB peak footprint on the receiver, which put the machine
+ * into swap and stalled the stream to zero with none of the drop paths firing —
+ * nothing was broken, it was just thrashing.
+ *
+ * Eight is comfortably above the 4-band working set and bounds the ring at
+ * ~240 MB in the worst case. */
+#define TB_UPLOAD_RING 8
 
 /* Frames in flight. One surface is not enough once a frame arrives as bands:
  * the next frame's first band starts decoding while the current frame is still
