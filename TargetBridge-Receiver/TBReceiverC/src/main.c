@@ -1225,7 +1225,7 @@ static void handle_raw_dpcm_slice(struct app *a, const uint8_t *p, size_t len) {
     const int is_last = (index + 1 == count);
     if (tb_disp_render_dpcm_slice(a->disp, p + TB_DPCM_SLICE_HEADER,
                                   len - TB_DPCM_SLICE_HEADER,
-                                  (int)frame_w, (int)frame_h, (int)y0, is_last) != 0) {
+                                  (int)frame_w, (int)frame_h, 0, (int)y0, is_last) != 0) {
         a->frames_dropped++;
         /* Fall through: the frame still presents on its last band, so a lost
          * band must be counted, not silently forgotten. */

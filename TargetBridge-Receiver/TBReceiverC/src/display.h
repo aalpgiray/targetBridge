@@ -86,10 +86,13 @@ void tb_disp_render_packed32(struct tb_display *d,
  * dropped rather than assume the screen is current. */
 int  tb_disp_render_dpcm(struct tb_display *d, const uint8_t *blob, size_t len);
 
-/* Decode one band of a TBD2 frame; present when it is the last of its frame.
- * `blob`/`len` are the TBD2 payload with the slice header already stripped. */
+/* Decode one region of a TBD2 frame; present when it is the last of its frame.
+ * `blob`/`len` are the TBD2 payload with the packet header already stripped.
+ *
+ * `x0`/`y0` place it, both multiples of the tile size. A full-width band passes
+ * x0 = 0; a damage rect passes both. */
 int  tb_disp_render_dpcm_slice(struct tb_display *d, const uint8_t *blob, size_t len,
-                               int frame_w, int frame_h, int y0, int is_last);
+                               int frame_w, int frame_h, int x0, int y0, int is_last);
 
 /* Whether this receiver can decode TBD1 at all, i.e. whether it should advertise
  * "supportsDPCM" to the sender. False on any Mac without a working compute

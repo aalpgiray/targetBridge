@@ -84,10 +84,17 @@ struct tb_dpcm_gpu_params {
     uint32_t widthOff, seedOff, payOff;
     uint32_t bits;      /* 8 or 10; channel c sits at bit c*bits */
     uint32_t alpha;     /* opaque alpha, pre-shifted for this depth */
-    /* First row of the destination this blob belongs to. A slice is simply a
-     * shorter frame written further down the surface, which is why slicing needed
-     * no new codec: the tiles were already independent. Zero for a whole frame. */
+    /* Where in the destination this blob belongs. A slice is simply a shorter
+     * frame written further down the surface, which is why slicing needed no new
+     * codec: the tiles were already independent.
+     *
+     * A DAMAGE RECT is the same idea in both axes -- a narrower, shorter frame
+     * written at a column as well as a row. The codec needs nothing for it
+     * either: an encoder given (base + y*stride + x*4, stride, w, h) produces a
+     * blob that decodes losslessly, verified against the reference. Both are
+     * zero for a whole frame. */
     uint32_t rowOffset;
+    uint32_t colOffset;
 };
 
 static struct {
@@ -325,7 +332,7 @@ static NSString *tb_shader_source(void) {
     "struct DpcmParams {\n"
     "  uint width, height, tilesX, tilesY, tileCount, outStridePx;\n"
     "  uint widthOff, seedOff, payOff;\n"
-    "  uint bits, alpha, rowOffset;\n"
+    "  uint bits, alpha, rowOffset, colOffset;\n"
     "};\n"
     "static inline uint tb_width_get(device const uchar *plane, uint idx) {\n"
     "  uchar b = plane[idx >> 1];\n"
@@ -417,7 +424,7 @@ static NSString *tb_shader_source(void) {
     "                         int((sraw >> (1u * P.bits)) & mask),\n"
     "                         int((sraw >> (2u * P.bits)) & mask));\n"
     "  const uint3 v = uint3(seed + acc) & mask;\n"
-    "  out[(P.rowOffset + tyi * 8u + y) * P.outStridePx + (txi * 8u + x)] =\n"
+    "  out[(P.rowOffset + tyi * 8u + y) * P.outStridePx + (P.colOffset + txi * 8u + x)] =\n"
     "      P.alpha | v.x | (v.y << P.bits) | (v.z << (2u * P.bits));\n"
     "}\n";
 }
@@ -821,11 +828,11 @@ int tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len) {
     /* A whole frame is the single-slice case: one band, at row 0, presented
      * immediately. Kept as one code path so the sliced path is the tested one
      * even when the sender is not slicing. */
-    return tb_metal_plane_render_dpcm_slice(blob, len, 0, 0, 0, 1);
+    return tb_metal_plane_render_dpcm_slice(blob, len, 0, 0, 0, 0, 1);
 }
 
 int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
-                                     int frame_w, int frame_h, int y0,
+                                     int frame_w, int frame_h, int x0, int y0,
                                      int is_last) {
     if (!g.ready || !g.dpcmPipe || !blob) return -1;
 
@@ -898,7 +905,7 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
             (uint32_t)in.payload_off,
             in.ten_bit ? 10u : 8u,
             in.ten_bit ? (3u << 30) : (0xFFu << 24),
-            (uint32_t)y0
+            (uint32_t)y0, (uint32_t)x0
         };
 
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];

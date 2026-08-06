@@ -82,13 +82,18 @@ int  tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len);
  *
  * It cost nothing to add to the format. Tiles were already independent 8x8
  * units with byte-aligned group bases, so a band is just a shorter frame written
- * further down the surface: same bytes, same ratio, no seam. `y0` must be a
- * multiple of the tile height and the band must be full width.
+ * further down the surface: same bytes, same ratio, no seam.
+ *
+ * `x0`/`y0` place the blob in the surface and must both be multiples of the tile
+ * size. A full-width band passes x0 = 0; a DAMAGE RECT passes both, and needs
+ * nothing else -- the codec never knew the difference, since an encoder handed
+ * (base + y*stride + x*4, stride, w, h) produces a blob that decodes losslessly
+ * on its own. Verified against the reference encoder.
  *
  * `frame_w`/`frame_h` describe the whole surface; pass 0 for both when the blob
  * is a whole frame. */
 int  tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
-                                      int frame_w, int frame_h, int y0,
+                                      int frame_w, int frame_h, int x0, int y0,
                                       int is_last);
 
 #endif

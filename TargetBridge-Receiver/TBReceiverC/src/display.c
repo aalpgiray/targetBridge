@@ -1331,13 +1331,13 @@ void tb_disp_render_packed32(struct tb_display *d,
 }
 
 int tb_disp_render_dpcm_slice(struct tb_display *d, const uint8_t *blob, size_t len,
-                              int frame_w, int frame_h, int y0, int is_last) {
+                              int frame_w, int frame_h, int x0, int y0, int is_last) {
     if (!d) return -1;
     if (!tb_metal_plane_available()) tb_metal_plane_init(d->win);
     if (!tb_metal_plane_available()) return -1;
 
     double m0 = tb_now_ms();
-    if (tb_metal_plane_render_dpcm_slice(blob, len, frame_w, frame_h, y0, is_last) != 0)
+    if (tb_metal_plane_render_dpcm_slice(blob, len, frame_w, frame_h, x0, y0, is_last) != 0)
         return -1;
     /* Every band counts as activity, not just the last. The main loop falls back
      * to the status screen when video goes quiet, and that screen tears the plane
