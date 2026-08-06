@@ -255,14 +255,14 @@ final class TBDisplaySenderService: ObservableObject {
             largeCursor: largeCursor,
             preventDisplaySleep: preventDisplaySleep,
             autoRestartOnWake: autoRestartOnWake,
-            audioEnabled: audioEnabled && audioTransportAvailable,
+            audioEnabled: audioEnabled,
             verboseDisplayLogging: verboseDisplayLogging
         )
         if let previous = sessions.last {
             session.capturePreset = previous.capturePreset
             session.captureSource = previous.captureSource
             session.transportKind = previous.transportKind
-            session.audioEnabled = audioTransportAvailable && previous.audioEnabled
+            session.audioEnabled = previous.audioEnabled
             session.inputGestureMode = previous.inputGestureMode
         }
         session.audioAddonAvailable = audioTransportAvailable
@@ -296,6 +296,16 @@ final class TBDisplaySenderService: ObservableObject {
 
     private static let persistedSessionsKey = "fd.tbdisplaysender.sessions.v1"
     private static let receiverDisplayProfilesKey = "fd.tbdisplaysender.receiverDisplayProfiles.v1"
+    /// One-shot repair for state the audio latch corrupted.
+    ///
+    /// `normalizeAddonState` used to write availability into the persisted
+    /// `audioEnabled`, so a single launch where the addon had not loaded turned
+    /// audio off permanently. That write is gone, but a session saved while the
+    /// bug was live still carries `audioEnabled: false` and would keep it
+    /// forever. Any false written by the latch is indistinguishable from a
+    /// deliberate one, so this restores audio ONCE on sessions whose transport
+    /// is available, and never runs again.
+    private static let audioLatchRepairKey = "fd.tbdisplaysender.audioLatchRepaired.v1"
 
     /// Snapshot of the user-configurable settings for a single session. Transient
     /// runtime state (connection, FPS, …) is intentionally excluded — only the
@@ -377,15 +387,18 @@ final class TBDisplaySenderService: ObservableObject {
                 largeCursor: largeCursor,
                 preventDisplaySleep: preventDisplaySleep,
                 autoRestartOnWake: autoRestartOnWake,
-                audioEnabled: audioEnabled && audioTransportAvailable,
+                audioEnabled: audioEnabled,
                 verboseDisplayLogging: verboseDisplayLogging
             )
             apply(config, to: session)
             session.audioAddonAvailable = audioTransportAvailable
-        session.audioDriverAvailable = audioDriverAvailable
+            session.audioDriverAvailable = audioDriverAvailable
             attachSession(session)
             sessions.append(session)
         }
+        // Mark the latch repair done whether or not it changed anything, so a
+        // later deliberate "audio off" is never second-guessed.
+        UserDefaults.standard.set(true, forKey: Self.audioLatchRepairKey)
         // Enforce the single-master invariant: only one session may hold a
         // non-`off` input role. (Persisted data should already satisfy this, but
         // restore sets roles directly, so guard against stale/edited defaults.)
@@ -424,7 +437,13 @@ final class TBDisplaySenderService: ObservableObject {
         session.receiverIP = config.receiverIP
         session.selectedReceiverID = config.selectedReceiverID
         session.localInterfaceIP = config.localInterfaceIP
-        session.audioEnabled = config.audioEnabled && audioTransportAvailable
+        if !UserDefaults.standard.bool(forKey: Self.audioLatchRepairKey),
+           audioTransportAvailable,
+           !config.audioEnabled {
+            session.audioEnabled = true
+        } else {
+            session.audioEnabled = config.audioEnabled
+        }
         session.brightness = config.brightness
         session.volume = config.volume ?? 0.5
         session.matchRenderToStream = config.matchRenderToStream ?? false
@@ -456,7 +475,7 @@ final class TBDisplaySenderService: ObservableObject {
         session.captureSource = settings.captureSource
         session.capturePreset = settings.capturePreset
         session.matchRenderToStream = settings.matchRenderToStream
-        session.audioEnabled = settings.audioEnabled && audioTransportAvailable
+        session.audioEnabled = settings.audioEnabled
 
         guard let receiverKey = receiverProfileKey(for: session) else { return }
         var profiles = persistedDisplayProfiles
@@ -637,10 +656,21 @@ final class TBDisplaySenderService: ObservableObject {
         let inputEnabled = inputDockstationAvailable
 
         for session in sessions {
+            // Availability is reported, never written into the user's choice.
+            //
+            // This used to do `if !audioEnabled { session.audioEnabled = false }`,
+            // and since `audioEnabled` is the PERSISTED field that latched audio
+            // off for good: one launch where the addon had not loaded yet turned
+            // the preference off, and the addon coming back could not turn it on
+            // again. Observed as `audioEnabled: false` in the saved session with
+            // the addon plainly enabled, which left the sender never binding its
+            // audio port, so the driver's liveness probe found nothing and
+            // withdrew the device from the whole system.
+            //
+            // Nothing needs this write: both places that act on audio check
+            // availability themselves at the point of use, and the UI greys the
+            // control off `audioAddonAvailable`.
             session.audioAddonAvailable = audioEnabled
-            if !audioEnabled {
-                session.audioEnabled = false
-            }
             if !networkLinkEnabled, session.transportKind == .networkLink {
                 session.transportKind = .thunderboltBridge
             }

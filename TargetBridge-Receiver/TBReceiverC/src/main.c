@@ -77,6 +77,15 @@
 #define TB_VIDEO_QUEUE 12
 #define TB_VIDEO_POOL  (TB_VIDEO_QUEUE + 4)
 
+/* How far behind capture a frame is presented. It must exceed the usual
+ * encode+wire delay or frames arrive after their slot; covering the rare 45 ms
+ * tail instead would cost 50 ms of latency to fix a 4% case, and a frame that
+ * misses simply shows one refresh late — which is what happens today anyway. */
+#define TB_PACE_LEAD_NS      (25ull * 1000000ull)
+/* A frame never waits longer than this, whatever the clock estimate says. A
+ * wrong offset then costs one late frame instead of the session. */
+#define TB_PACE_MAX_HOLD_MS  50
+
 /* A non-frame packet copied off a reader thread for the main thread to run
  * through on_packet() unchanged. */
 struct tb_ctrl_msg {
@@ -149,6 +158,29 @@ struct app {
     int              vq_head;
     int              vq_count;
     uint64_t         vq_overflow;    /* increments dropped because it was full */
+
+    /* Presentation pacing.
+     *
+     * The transport is clean -- 94-96% of presents one refresh apart, no drops,
+     * no lost bands -- and 25 fps video still judders, because macOS has already
+     * composited it as a 2,3,2,3 pulldown and we resample that onto this panel's
+     * refresh grid. A frame arriving a hair late waits a whole extra period, so
+     * 2,3,2,3 becomes 2,4,1,3: a hitch roughly twice a second, worst on the slow
+     * pans where the eye is tracking.
+     *
+     * Presenting on the sender's CAPTURE time instead of on arrival reproduces
+     * its spacing rather than the wire's. Simulated against the measured
+     * distributions before writing any of it: hitches 8.8% -> 4.7% for 14 ms.
+     *
+     * `offset` converts a sender capture time into receiver time, estimated as
+     * the SMALLEST (arrival - capture) seen recently: the least-delayed frame is
+     * the closest thing to a pure clock difference, since every other sample has
+     * queueing added and none can have less. */
+    uint64_t         pace_offset_ns;
+    uint64_t         pace_min_ns;      /* smallest delta this window */
+    uint64_t         pace_win_end_ms;
+    uint64_t         pace_held_since;  /* 0 when nothing is waiting */
+    int              pace_enabled;
     uint32_t         connecting_since;/* when this client last had no video */
     uint32_t         dpcm_frame_id;   /* frame currently being assembled from slices */
     int              dpcm_seq_warned;
@@ -2500,6 +2532,55 @@ static int pump_network(struct app *a) {
         size_t         plen = 0;
         uint8_t        ptype = TB_PKT_RAW_FRAME;
 
+        /* Pacing gate: hold a frame's LAST band until its capture time comes
+         * round. Earlier bands decode on arrival, so only the moment of
+         * presentation moves and the GPU work still spreads across the frame.
+         *
+         * Everything here is guarded so it can only ever be a small
+         * improvement, never a new stall -- a previous pacing attempt made
+         * playback worse and had to be reverted:
+         *   - a backed-up queue skips pacing entirely and catches up;
+         *   - a frame held too long presents anyway, so a bad clock estimate
+         *     costs one late frame rather than the stream;
+         *   - TB_PACE=0 turns it off without a rebuild.
+         */
+        if (a->pace_enabled) {
+            pthread_mutex_lock(&a->net_lock);
+            const int depth = a->vq_count;
+            const struct tb_video_slot *head = depth > 0 ? &a->vq[a->vq_head] : NULL;
+            const int gate = head && head->type == TB_PKT_RAW_DPCM_SLICE &&
+                             head->len >= TB_DPCM_SLICE_HEADER && depth <= 2;
+            uint64_t capture_ns = 0;
+            int is_last = 0;
+            if (gate) {
+                const uint8_t *h = head->payload;
+                capture_ns = ((uint64_t)be32(h) << 32) | be32(h + 4);
+                const uint16_t index = (uint16_t)((h[24] << 8) | h[25]);
+                const uint16_t count = (uint16_t)((h[26] << 8) | h[27]);
+                is_last = (count > 0 && index + 1 == count);
+            }
+            pthread_mutex_unlock(&a->net_lock);
+
+            if (gate && is_last && capture_ns > 0) {
+                const uint64_t now_ns = now_ms() * 1000000ull;
+                const uint64_t delta = (now_ns > capture_ns) ? now_ns - capture_ns : 0;
+                if (a->pace_min_ns == 0 || delta < a->pace_min_ns) a->pace_min_ns = delta;
+                if (now_ms() >= a->pace_win_end_ms) {
+                    a->pace_offset_ns = a->pace_min_ns;
+                    a->pace_min_ns = 0;
+                    a->pace_win_end_ms = now_ms() + 2000;
+                }
+                if (a->pace_offset_ns > 0) {
+                    const uint64_t due = capture_ns + a->pace_offset_ns + TB_PACE_LEAD_NS;
+                    if (now_ns < due) {
+                        if (a->pace_held_since == 0) a->pace_held_since = now_ms();
+                        if (now_ms() - a->pace_held_since < TB_PACE_MAX_HOLD_MS) break;
+                    }
+                }
+            }
+            a->pace_held_since = 0;
+        }
+
         pthread_mutex_lock(&a->net_lock);
         if (a->vq_count > 0) {
             struct tb_video_slot *slot = &a->vq[a->vq_head];
@@ -2651,6 +2732,7 @@ int main(int argc, char **argv) {
      * writes to a socket, and neither should be able to kill the receiver. */
     (void)tb_logship_start();
 
+
     char tb_ip[64] = {0};
     char net_ip[64] = {0};
     if (tb_net_get_tb_ip(tb_ip, sizeof(tb_ip)) == 0) {
@@ -2674,6 +2756,16 @@ int main(int argc, char **argv) {
     a.client_fd = -1;
     a.client_fd2 = -1;
     pthread_mutex_init(&a.net_lock, NULL);
+
+    /* Pacing defaults on but stays one env var from off: the last attempt at
+     * this made playback worse, and a bad night should not need a rebuild. */
+    {
+        const char *pace = getenv("TB_PACE");
+        a.pace_enabled = !(pace && pace[0] == '0');
+        a.pace_win_end_ms = now_ms() + 2000;
+        fprintf(stderr, "[pace] presentation pacing %s\n",
+                a.pace_enabled ? "on (TB_PACE=0 disables)" : "off");
+    }
     a.reader1 = (struct tb_link_reader *)calloc(1, sizeof(*a.reader1));
     a.reader2 = (struct tb_link_reader *)calloc(1, sizeof(*a.reader2));
     a.ctrl_q  = (struct tb_ctrl_msg *)calloc(TB_CTRL_QUEUE_MAX, sizeof(*a.ctrl_q));
