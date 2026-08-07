@@ -479,7 +479,13 @@ int tb_metal_plane_init(SDL_Window *win) {
         CGColorSpaceRef dcs = CGDisplayCopyColorSpace(CGMainDisplayID());
         CFStringRef name = dcs ? CGColorSpaceCopyName(dcs) : NULL;
         fprintf(stderr,
-                "[metal] drawable=BGR10A2Unorm  panel bits/sample=%ld  P3=%d  maxEDR=%.2f  colorspace=%s\n",
+                /* NSBitsPerSampleFromDepth is a legacy WINDOW depth: it reports
+                 * 8 on essentially every Mac, including 10-bit panels, and
+                 * reading it as the panel's capability sent us down a wrong
+                 * path. Reported as `windowDepth` so nobody mistakes it for the
+                 * panel again. What actually establishes depth is the drawable
+                 * format, the colorspace, and the sender's own probe. */
+                "[metal] drawable=BGR10A2Unorm  windowDepth(legacy)=%ld  P3=%d  maxEDR=%.2f  colorspace=%s\n",
                 (long)NSBitsPerSampleFromDepth(scr.depth),
                 (int)[scr canRepresentDisplayGamut:NSDisplayGamutP3],
                 (double)scr.maximumExtendedDynamicRangeColorComponentValue,
@@ -747,7 +753,27 @@ static int tb_present(id<MTLCommandBuffer> cb, id<MTLBuffer> src,
     id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
     [enc setRenderPipelineState:g.pipe];
     [enc setFragmentTexture:srcTex atIndex:0];
-    [enc setFragmentBytes:&g.dither length:sizeof(g.dither) atIndex:0];
+    /* Dither 8-bit content only.
+     *
+     * At 8 bits the source sits on a coarser grid than the drawable, the steps
+     * are real, and spreading them is measurably better — an 8-bit ramp banded
+     * here while the same data was smooth in any ordinary window.
+     *
+     * At 10 bits there is nothing left to spread and this only adds noise. The
+     * amplitude is half an 8-bit step, which is a FULL least-significant bit at
+     * 10-bit (0.5/255 against 1/1023), so it was perturbing values the pipeline
+     * carries exactly.
+     *
+     * It ran unconditionally because the panel was believed to be 8-bit, read
+     * from NSBitsPerSampleFromDepth — a legacy window depth that reports 8 on
+     * essentially every Mac and says nothing about deep colour. This panel is
+     * 10-bit (8-bit native plus 2-bit FRC) and the whole chain carries 10:
+     * an HDR virtual display gives a 16-bpc framebuffer, capture is packed
+     * ARGB2101010, TBD2 is lossless, and the drawable is BGR10A2Unorm.
+     * Confirmed by eye — gradients look better with this off at 10 bits, which
+     * could only happen if the extra bits reach the panel. */
+    const float dither = ten_bit ? 0.0f : g.dither;
+    [enc setFragmentBytes:&dither length:sizeof(dither) atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 
     if (g.cur_visible && g.cursorPipe) {

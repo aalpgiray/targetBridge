@@ -1083,9 +1083,15 @@ private final class TBVideoPipeline: @unchecked Sendable {
         // three frames, not three packets — survives.
         let packetsPerFrame = (dpcmEnabled && dpcmSlicesEnabled) ? max(1, dpcmSliceCount) : 1
         let inFlightBudget = preset.maxPendingVideoPackets * packetsPerFrame
-        let backedUp = useSecondary
-            ? pendingVideoPacketsSecondary >= inFlightBudget
-            : pendingVideoPackets >= inFlightBudget
+        // Reserve the WHOLE frame, not one packet.
+        //
+        // This checked `pending >= budget` once and then sent packetsPerFrame
+        // packets, so it could pass at 17 and land at 25 against a budget of 24.
+        // Observed exactly that at N=8 -- `inflight 25/24` with 167 drops -- and
+        // it is the same frame-versus-band unit confusion that has bitten this
+        // code repeatedly: the check counted packets, the send counted frames.
+        let pendingNow = useSecondary ? pendingVideoPacketsSecondary : pendingVideoPackets
+        let backedUp = pendingNow + packetsPerFrame > inFlightBudget
         if backedUp {
             // A skipped frame's damage would otherwise be lost for good, since
             // the receiver cannot know it missed an update. Carry the rects

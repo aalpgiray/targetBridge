@@ -70,11 +70,16 @@
 #define TB_CTRL_QUEUE_MAX 512
 
 /* Video packets the reader may hand over before the main thread has caught up.
- * Three frames at four bands, which is the sender's own in-flight budget, so
- * the two ends agree on how far ahead the wire is allowed to get. Each slot
- * holds a reader's parser buffer — a band is a few MB, so this is tens of MB,
- * not the 4.4 GB an earlier oversized ring cost. */
-#define TB_VIDEO_QUEUE 12
+ * Three frames at EIGHT bands, matching the sender's in-flight budget at its
+ * highest usable slice count, so the two ends agree on how far ahead the wire
+ * may get.
+ *
+ * It was 12 (three frames at four bands), which is why N=8 overflowed even with
+ * everything else healthy: twelve slots is one and a half frames at eight bands.
+ * Each slot holds a reader's parser buffer, and a band shrinks as the count
+ * rises, so doubling the slots does not double the memory — it is tens of MB
+ * either way, not the 4.4 GB an earlier oversized ring cost. */
+#define TB_VIDEO_QUEUE 24
 #define TB_VIDEO_POOL  (TB_VIDEO_QUEUE + 4)
 
 /* How far behind capture a frame is presented. It must exceed the usual
