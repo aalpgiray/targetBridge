@@ -583,15 +583,25 @@ int tb_metal_plane_init(SDL_Window *win) {
     g.queue = [g.dev newCommandQueue];
     g.inflight = dispatch_semaphore_create(TB_UPLOAD_RING);
     {
+        /* On by default since 2026-08-07. Shipped opt-in first because this is
+         * the code that glitched at every slice count above one, and that
+         * failure was content-dependent — it needed real use to trust, not a
+         * clean minute. It got that: sustained video, scrolling and window
+         * dragging with no artefact, `submit` down from 24% to 15% of wall
+         * time, and every frame counter clean throughout.
+         *
+         * TB_ASYNC_PRESENT=0 falls back, because the failure mode here is
+         * visible-only — no counter we have goes red when it happens — so the
+         * escape hatch is for eyes, not for logs. */
         const char *ap = getenv("TB_ASYNC_PRESENT");
-        g.async_present = (ap && ap[0] == '1');
+        g.async_present = !(ap && ap[0] == '0');
         if (g.async_present) {
             g.presentQ = dispatch_queue_create("tb.present", DISPATCH_QUEUE_SERIAL);
             if (!g.presentQ) g.async_present = 0;
         }
         fprintf(stderr, "[metal] present %s\n",
-                g.async_present ? "async (TB_ASYNC_PRESENT=1)"
-                                : "synchronous (TB_ASYNC_PRESENT=1 enables async)");
+                g.async_present ? "async (TB_ASYNC_PRESENT=0 reverts)"
+                                : "synchronous");
     }
     g.frames_free = dispatch_semaphore_create(TB_FRAME_RING);
     g.frame_widx = 0;
