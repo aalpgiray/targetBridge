@@ -14,7 +14,22 @@ typedef void (*tb_pkt_cb)(uint8_t type, const uint8_t *payload, size_t len, void
 /* Streaming packet parser (handles fragmented TCP reads). */
 struct tb_parser {
     uint8_t   *buf;
-    size_t     len;     /* used bytes */
+    /* Valid data is buf[off .. len). `off` exists so dispatching a packet does
+     * not have to shuffle everything behind it to the front.
+     *
+     * It used to: every packet ended with a memmove of the whole unconsumed
+     * tail, so handling one packet cost O(bytes still buffered). That is fine
+     * until the reader falls behind — and then it is quadratic, and it feeds
+     * itself. A backlog makes each packet more expensive to parse, which grows
+     * the backlog. Measured on a wedged 5K link: the reader thread was at 100%
+     * CPU inside that memmove, the receive buffer sat at its 4 MiB cap with the
+     * data unread, and the sender's send buffer filled behind it. It never
+     * recovered on its own; only a reconnect cleared it.
+     *
+     * Advancing an offset is O(1). The buffer is compacted only when the move
+     * is paid for by what it reclaims (see parser_maybe_compact). */
+    size_t     off;     /* first unconsumed byte */
+    size_t     len;     /* end of valid data */
     size_t     cap;     /* allocated capacity */
     tb_pkt_cb  cb;
     void      *ud;
@@ -24,6 +39,14 @@ struct tb_parser {
     size_t     spare_cap;
     uint8_t   *held;       /* buffer yielded to the caller */
     size_t     held_cap;
+    /* Bytes this parser has shuffled around internally (compaction + the hold
+     * handoff). The stall this offset exists to prevent is invisible to the
+     * packet counters -- every packet still parsed correctly, just slower and
+     * slower -- so the cost itself is what has to be measured. Asserted against
+     * a budget in tests/test_net_parser.c. */
+    size_t     moved_bytes;
+    size_t     compact_bytes;  /* of moved_bytes: buffer compaction */
+    size_t     hold_bytes;     /* of moved_bytes: the hold handoff */
 };
 
 void tb_parser_init  (struct tb_parser *p, tb_pkt_cb cb, void *ud);

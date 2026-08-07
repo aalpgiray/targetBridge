@@ -44,8 +44,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <time.h>
@@ -120,14 +118,9 @@ struct app {
     struct tb_display *disp;
     struct tb_decoder *dec;
     struct tb_parser   parser;
-    /* Dual-cable: a second client connection (cable 2) that carries half the
-     * interleaved frames. Fed through its own parser into the same on_packet
-     * handler, so frames from both links render identically. */
-    struct tb_parser   parser2;
 
     int      server_fd;
     int      client_fd;
-    int      client_fd2;
 
     /* Threaded receive. read() of a 5K raw frame costs ~23 ms and the GPU
      * upload ~13 ms; run on one thread they serialize to ~36 ms/frame. Each
@@ -217,7 +210,6 @@ struct app {
     uint64_t         reader_recv_ms;
 
     struct tb_link_reader *reader1;
-    struct tb_link_reader *reader2;
 
     /* Base image for damage updates: TB_PKT_RAW_DAMAGE patches rectangles into
      * this, so it must persist across frames. Rebuilt whenever a full
@@ -2532,44 +2524,6 @@ static void link_reader_stop(struct tb_link_reader *r) {
  *     of one frame.
  * Anything not sent stays in the ring for the next pass, and the ring already
  * reports what it had to drop. */
-/* Whether two sockets are connected to the same remote HOST (port ignored --
- * the peer picks a fresh ephemeral one per connection).
- *
- * Guards the second cable. The listener accepts anything that completes a TCP
- * handshake, and the slot is claimed by the first arrival, so any process that
- * touches the port takes the place of the sender's real secondary and then
- * feeds its bytes to the frame parser. That is not hypothetical: on 2026-08-06
- * something opened the port and sent an SSH banner, whose first four bytes
- * ("SSH-") read as a 1.4 GB packet length. The parser's sanity check caught it
- * and the link recovered in about two seconds, but only because the garbage
- * happened to be implausible -- bytes inside the legal length range would have
- * been consumed as a frame.
- *
- * Comparing against the established primary needs no wire-format change and no
- * sender change, and it is the honest rule anyway: a second cable is a second
- * cable from the same machine, or it is not one.
- *
- * Returns 0 when either address cannot be read, so an unverifiable peer is
- * refused rather than trusted. */
-static int tb_same_peer_host(int fd_a, int fd_b) {
-    struct sockaddr_storage sa, sb;
-    socklen_t la = sizeof(sa), lb = sizeof(sb);
-    if (getpeername(fd_a, (struct sockaddr *)&sa, &la) != 0) return 0;
-    if (getpeername(fd_b, (struct sockaddr *)&sb, &lb) != 0) return 0;
-    if (sa.ss_family != sb.ss_family) return 0;
-    if (sa.ss_family == AF_INET) {
-        const struct sockaddr_in *x = (const struct sockaddr_in *)&sa;
-        const struct sockaddr_in *y = (const struct sockaddr_in *)&sb;
-        return x->sin_addr.s_addr == y->sin_addr.s_addr;
-    }
-    if (sa.ss_family == AF_INET6) {
-        const struct sockaddr_in6 *x = (const struct sockaddr_in6 *)&sa;
-        const struct sockaddr_in6 *y = (const struct sockaddr_in6 *)&sb;
-        return memcmp(&x->sin6_addr, &y->sin6_addr, sizeof(x->sin6_addr)) == 0;
-    }
-    return 0;
-}
-
 static void pump_log_shipping(struct app *a) {
     if (!a || a->client_fd < 0) return;
 
@@ -2746,20 +2700,9 @@ static void drop_pending_network(struct app *a) {
     pthread_mutex_unlock(&a->net_lock);
 }
 
-static void close_secondary(struct app *a) {
-    link_reader_stop(a->reader2);
-    if (a->client_fd2 >= 0) {
-        close(a->client_fd2);
-        a->client_fd2 = -1;
-        tb_parser_free(&a->parser2);
-        fprintf(stderr, "[main] second cable disconnected\n");
-    }
-}
-
 static void close_client(struct app *a) {
     tb_mic_capture_stop();
     g_mic_app = NULL;
-    close_secondary(a);   /* the session is over — drop the second cable too */
     link_reader_stop(a->reader1);
     drop_pending_network(a);
     if (a->client_fd >= 0) close(a->client_fd);
@@ -2860,7 +2803,6 @@ int main(int argc, char **argv) {
     a.audio_input_is_s16 = 1;
     a.server_fd = -1;
     a.client_fd = -1;
-    a.client_fd2 = -1;
     pthread_mutex_init(&a.net_lock, NULL);
 
     /* Pacing defaults on but stays one env var from off: the last attempt at
@@ -2873,9 +2815,8 @@ int main(int argc, char **argv) {
                 a.pace_enabled ? "on (TB_PACE=0 disables)" : "off");
     }
     a.reader1 = (struct tb_link_reader *)calloc(1, sizeof(*a.reader1));
-    a.reader2 = (struct tb_link_reader *)calloc(1, sizeof(*a.reader2));
     a.ctrl_q  = (struct tb_ctrl_msg *)calloc(TB_CTRL_QUEUE_MAX, sizeof(*a.ctrl_q));
-    if (!a.reader1 || !a.reader2 || !a.ctrl_q) {
+    if (!a.reader1 || !a.ctrl_q) {
         fprintf(stderr, "[main] reader allocation failed\n");
         return 1;
     }
@@ -2990,8 +2931,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Accept the primary client, or — once it's connected — the optional
-         * second cable (dual-cable frame pipe). One accept per iteration. */
+        /* Accept the client. One accept per iteration. */
         if (a.client_fd < 0) {
             int c = tb_net_accept(a.server_fd);
             if (c >= 0) {
@@ -3028,27 +2968,6 @@ int main(int argc, char **argv) {
                 tb_mic_start_if_possible(&a);
                 send_receiver_info(&a);
             }
-        } else if (a.client_fd2 < 0) {
-            int c2 = tb_net_accept(a.server_fd);
-            if (c2 >= 0 && !tb_same_peer_host(a.client_fd, c2)) {
-                fprintf(stderr, "[main] refused second cable from a different host\n");
-                close(c2);
-                c2 = -1;
-            }
-            if (c2 >= 0) {
-                a.client_fd2 = c2;
-                a.last_recv_ms = t;
-                fprintf(stderr, "[main] second cable connected (dual-cable)\n");
-                tb_parser_free(&a.parser2);
-                tb_parser_init(&a.parser2, on_packet, &a);
-                if (a.threaded_rx && link_reader_start(a.reader2, &a, c2) != 0) {
-                    fprintf(stderr, "[main] second cable reader failed; dropping cable 2\n");
-                    close(c2);
-                    a.client_fd2 = -1;
-                }
-                /* No receiver-info on the secondary: it's a send-only frame
-                 * pipe and the sender never reads it. */
-            }
         }
 
         acc_other_ms += now_ms_f() - loop_mark_ms;
@@ -3059,9 +2978,6 @@ int main(int argc, char **argv) {
                 /* Reader threads own the sockets; here we only consume what
                  * they produced and watch for a link that ended. */
                 socket_activity = pump_network(&a);
-                if (a.reader2 && a.reader2->active && a.reader2->ended) {
-                    close_secondary(&a);            /* fall back to one cable */
-                }
                 if (a.reader1 && a.reader1->ended) fatal = 1;
             } else {
                 int drain_result = drain_socket(&a);   /* primary */
@@ -3070,14 +2986,6 @@ int main(int argc, char **argv) {
                 } else {
                     socket_activity = drain_result;
                     if (drain_result > 0) a.last_recv_ms = t;
-                    if (a.client_fd2 >= 0) {
-                        int d2 = drain_fd(a.client_fd2, &a.parser2);
-                        if (d2 < 0) {
-                            close_secondary(&a);
-                        } else {
-                            if (d2 > 0) { socket_activity = 1; a.last_recv_ms = t; }
-                        }
-                    }
                 }
             }
             if (fatal) {
@@ -3233,12 +3141,6 @@ int main(int argc, char **argv) {
             nfds_t npfd = 0;
             if (a.client_fd >= 0) {
                 pfds[npfd].fd = a.client_fd;
-                pfds[npfd].events = POLLIN;
-                pfds[npfd].revents = 0;
-                npfd++;
-            }
-            if (a.client_fd2 >= 0) {
-                pfds[npfd].fd = a.client_fd2;
                 pfds[npfd].events = POLLIN;
                 pfds[npfd].revents = 0;
                 npfd++;

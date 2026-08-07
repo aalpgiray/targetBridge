@@ -294,7 +294,6 @@ private struct TBDisplaySenderSessionCard: View {
                             TBDisplaySenderL10n.videoPathValue(isRaw: session.videoPathIsRaw,
                                                                isBGRA: session.videoPathIsBGRA,
                                                                isTenBit: session.videoPathIsTenBit,
-                                                               dualCable: session.videoPathDualCable,
                                                                service.language))
                     infoRow(TBDisplaySenderL10n.fpsLabel(service.language), "\(session.senderFPS)")
                 }
@@ -650,26 +649,6 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                         settingRow(tenBitTitle, details: tenBitDetails) {
                             Toggle("", isOn: $session.tenBit)
                                 .labelsHidden()
-                                .disabled(session.isConnected || session.isStreaming)
-                        }
-                    }
-
-                    settingRow(dualCableTitle, details: dualCableDetails) {
-                        Toggle("", isOn: $session.dualCableEnabled)
-                            .labelsHidden()
-                            .disabled(session.isConnected || session.isStreaming)
-                    }
-                    if session.dualCableEnabled {
-                        settingRow(dualCableLocalTitle, details: dualCableLocalDetails) {
-                            TextField("10.0.2.1", text: $session.secondaryLocalInterfaceIP)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 150)
-                                .disabled(session.isConnected || session.isStreaming)
-                        }
-                        settingRow(dualCableReceiverTitle, details: dualCableReceiverDetails) {
-                            TextField("10.0.2.2", text: $session.secondaryReceiverIP)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(width: 150)
                                 .disabled(session.isConnected || session.isStreaming)
                         }
                     }
@@ -1280,55 +1259,6 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .english: return "Packed 2-10-10-10: also 4 bytes/pixel, so it costs no extra bandwidth over 8-bit 4:4:4 — it only removes gradient banding."
         case .french: return "2-10-10-10 compressé : également 4 octets/pixel, donc aucune bande passante supplémentaire — supprime seulement les bandes dans les dégradés."
         default: return "2-10-10-10 compresso: sempre 4 byte/pixel, nessuna banda passante extra rispetto a 8-bit 4:4:4 — elimina solo le bande nei gradienti."
-        }
-    }
-    private var dualCableTitle: String {
-        switch service.language {
-        case .italian: return "Doppio cavo (dual-link)"
-        case .english: return "Dual cable (two Thunderbolt links)"
-        case .french: return "Double câble (deux liens Thunderbolt)"
-        case .german: return "Doppelkabel (zwei Thunderbolt-Links)"
-        case .chinese: return "双线缆（双 Thunderbolt 链路）"
-        }
-    }
-    private var dualCableDetails: String {
-        switch service.language {
-        case .italian: return "Divide i fotogrammi su due cavi Thunderbolt per raddoppiare la banda (per formati come 10-bit 4:4:4). Richiede due interfacce con IP separati."
-        case .english: return "Splits frames across two Thunderbolt cables to roughly double bandwidth (for formats like 10-bit 4:4:4). Requires two interfaces on separate subnets."
-        case .french: return "Répartit les images sur deux câbles Thunderbolt. Nécessite deux interfaces sur des sous-réseaux distincts."
-        case .german: return "Verteilt Frames auf zwei Thunderbolt-Kabel, um die Bandbreite etwa zu verdoppeln (für Formate wie 10-Bit 4:4:4). Erfordert zwei Schnittstellen in getrennten Subnetzen."
-        case .chinese: return "将帧拆分到两条 Thunderbolt 线缆以大致翻倍带宽（用于 10-bit 4:4:4 等格式）。需要两个位于不同子网的接口。"
-        }
-    }
-    private var dualCableLocalTitle: String {
-        switch service.language {
-        case .italian: return "Cavo 2 · IP locale"
-        case .english: return "Cable 2 · local IP"
-        case .french: return "Câble 2 · IP locale"
-        case .german: return "Kabel 2 · lokale IP"
-        case .chinese: return "线缆 2 · 本机 IP"
-        }
-    }
-    private var dualCableLocalDetails: String {
-        switch service.language {
-        case .english: return "This Mac's second Thunderbolt interface IP (e.g. 10.0.2.1)."
-        case .french: return "IP de la deuxième interface Thunderbolt de ce Mac (par ex. 10.0.2.1)."
-        default: return "IP della seconda interfaccia Thunderbolt di questo Mac (es. 10.0.2.1)."
-        }
-    }
-    private var dualCableReceiverTitle: String {
-        switch service.language {
-        case .italian: return "Cavo 2 · IP receiver"
-        case .english: return "Cable 2 · receiver IP"
-        case .french: return "Câble 2 · IP du récepteur"
-        case .german: return "Kabel 2 · Empfänger-IP"
-        case .chinese: return "线缆 2 · 接收端 IP"
-        }
-    }
-    private var dualCableReceiverDetails: String {
-        switch service.language {
-        case .english: return "The receiver's second Thunderbolt IP (e.g. 10.0.2.2)."
-        default: return "IP della seconda interfaccia Thunderbolt del receiver (es. 10.0.2.2)."
         }
     }
     private var renderMatchingTitle: String {
