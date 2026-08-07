@@ -54,17 +54,53 @@ private let tbAnyInputEvent = CGEventType(rawValue: ~0)!
 /// actually feels bad — the wait between a keystroke and the pixels for it.
 ///
 /// Measured as: on the first content frame ending a run of idle frames, how
-/// long ago the machine last saw input. Attributing that frame to that input is
-/// an assumption, and it is only sound when the two are close, so samples
-/// beyond `tbWakeMaxPlausible` are dropped rather than averaged in — a frame
-/// arriving two seconds after the last keypress was caused by something else.
+/// long ago the machine last saw input.
+///
+/// The trap, and the reason this is more than a subtraction: plenty of things
+/// end an idle run without anybody touching the machine. A blinking text caret
+/// is the worst of them — it ticks about twice a second, forever, and the first
+/// version of this counted every blink as a wake-up, then reported how long ago
+/// the last keypress was. That is where the 1.4 s "worst cases" came from, and
+/// it made the average a blend of two unrelated quantities that shifted with
+/// whatever window happened to be focused.
+///
+/// So the input must have arrived DURING the quiet stretch to count. If the
+/// last event predates the idle run, this frame was produced by something else
+/// and the sample is discarded rather than averaged in. Requiring causation to
+/// be at least possible is the whole difference between a number and a mood.
+///
+/// Split by how long the screen had been quiet first, because two different
+/// events were being averaged together and only one of them is a complaint.
+///
+/// Typing a word leaves ~60 ms gaps between keystrokes; each one ends a tiny
+/// idle run and resumes almost instantly. Reading for fifteen seconds and then
+/// typing is the case that feels bad. Pooled, twenty of the former bury one of
+/// the latter — a run measured 27 ms average with a 479 ms sample inside it.
+/// The average was not wrong, it was answering a question nobody asked.
+///
+/// So: `long` is the resumption after a real pause and the only number worth
+/// optimising; `short` is ordinary typing and was never a problem. A change
+/// that moves the pooled average proves nothing, because that average also
+/// moves with how much someone happened to type in a row.
 ///
 /// Single writer on the capture queue, read there too.
-nonisolated(unsafe) var tbWakeSum = 0.0
-nonisolated(unsafe) var tbWakeMax = 0.0
-nonisolated(unsafe) var tbWakeCount = 0
-nonisolated(unsafe) var tbWakeWasIdle = false
+nonisolated(unsafe) var tbWakeShortSum = 0.0
+nonisolated(unsafe) var tbWakeShortCount = 0
+nonisolated(unsafe) var tbWakeLongSum = 0.0
+nonisolated(unsafe) var tbWakeLongMax = 0.0
+nonisolated(unsafe) var tbWakeLongCount = 0
+nonisolated(unsafe) var tbWakeRejected = 0
+/// Where a quiet stretch stops being a gap between keystrokes and starts being
+/// somebody reading.
+private let tbWakeLongIdle = 1.0
+/// When the current run of idle frames began, on the monotonic clock. Zero when
+/// not currently idle.
+nonisolated(unsafe) var tbWakeIdleSince = 0.0
 private let tbWakeMaxPlausible = 1.5
+
+private func tbMonotonicNow() -> Double {
+    Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+}
 
 
 enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
@@ -1035,7 +1071,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
         let drops = cadenceDrops
         let idle = tbIdleFramesSeen
         let idleGap = tbIdleInputGapMin
-        let wakeSum = tbWakeSum, wakeMax = tbWakeMax, wakeN = tbWakeCount
+        let wShortSum = tbWakeShortSum, wShortN = tbWakeShortCount
+        let wLongSum = tbWakeLongSum, wLongMax = tbWakeLongMax, wLongN = tbWakeLongCount
+        let wakeRej = tbWakeRejected
         let sProbe = stageProbeMax, sLock = stageLockMax
         let sCtx = stageCtxMax, sSubmit = stageSubmitMax
         let hadProcess = latProcessMax > 0
@@ -1048,7 +1086,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
 
         tbIdleFramesSeen = 0
         tbIdleInputGapMin = .greatestFiniteMagnitude
-        tbWakeSum = 0; tbWakeMax = 0; tbWakeCount = 0
+        tbWakeShortSum = 0; tbWakeShortCount = 0
+        tbWakeLongSum = 0; tbWakeLongMax = 0; tbWakeLongCount = 0
+        tbWakeRejected = 0
         if pathRectFrames > 0 || pathWholeFrames > 0 {
             let total = pathRectFrames + pathWholeFrames
             let avgPct = pathRectFrames > 0
@@ -1077,7 +1117,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
                                    samples: samples,
                                    inflight: inflight, budget: budget,
                                    idleInputGap: idleGap,
-                                   wakeSum: wakeSum, wakeMax: wakeMax, wakeCount: wakeN)
+                                   wakeShortSum: wShortSum, wakeShortCount: wShortN,
+                                   wakeLongSum: wLongSum, wakeLongMax: wLongMax,
+                                   wakeLongCount: wLongN, wakeRejected: wakeRej)
 
         latDeliverySum = 0; latDeliveryMax = 0
         latProcessSum = 0; latProcessMax = 0
@@ -2208,6 +2250,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     @Published var inputBindings: [TBInputBinding] = []
 
     private var connection: NWConnection?
+    /// Holds the virtual display at a full compositing rate — see TBKeepWarm.
+    private let keepWarm = TBKeepWarm()
     private let connectionQueue = DispatchQueue(label: "fd.tbmonitor.sender.connection", qos: .userInteractive)
     private var recvBuffer = Data()
 
@@ -2318,14 +2362,26 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
             switch status {
             case .complete, .started:
-                if tbWakeWasIdle {
-                    tbWakeWasIdle = false
+                if tbWakeIdleSince > 0 {
+                    let idleSince = tbWakeIdleSince
+                    tbWakeIdleSince = 0
+                    let now = tbMonotonicNow()
                     let gap = CGEventSource.secondsSinceLastEventType(
                         .combinedSessionState, eventType: tbAnyInputEvent)
-                    if gap >= 0, gap <= tbWakeMaxPlausible {
-                        tbWakeSum += gap
-                        tbWakeMax = max(tbWakeMax, gap)
-                        tbWakeCount += 1
+                    // Did that input land inside the quiet stretch? If it
+                    // predates it, this frame is a caret blink or a clock and
+                    // has nothing to do with the user.
+                    if gap >= 0, gap <= tbWakeMaxPlausible, now - gap >= idleSince {
+                        if now - idleSince >= tbWakeLongIdle {
+                            tbWakeLongSum += gap
+                            tbWakeLongMax = max(tbWakeLongMax, gap)
+                            tbWakeLongCount += 1
+                        } else {
+                            tbWakeShortSum += gap
+                            tbWakeShortCount += 1
+                        }
+                    } else {
+                        tbWakeRejected += 1
                     }
                 }
                 return true
@@ -2334,7 +2390,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 // experiment is on; `.blank` and the stopped states stay
                 // filtered either way, since those are not a picture at all.
                 tbIdleFramesSeen += 1
-                tbWakeWasIdle = true
+                if tbWakeIdleSince == 0 { tbWakeIdleSince = tbMonotonicNow() }
                 let gap = CGEventSource.secondsSinceLastEventType(
                     .combinedSessionState, eventType: tbAnyInputEvent)
                 if gap < tbIdleInputGapMin { tbIdleInputGapMin = gap }
@@ -2749,6 +2805,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             streamingActivity = nil
         }
         stopAudioDeviceCapture()
+        keepWarm.stop()
         pipeline?.stop()
         pipeline = nil
         releaseInjectedModifiersIfNeeded()
@@ -3538,6 +3595,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             guard pipeline.start() else { return false }
             startAudioDeviceCaptureIfNeeded()
             self.pipeline = pipeline
+            self.keepWarm.start(displayID: session.displayID)
             TBLog.connection.info("capture: pipeline started preset=\(preset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) codec=\(codecName, privacy: .public) rawNV12=\(usesRawNV12, privacy: .public)")
 
             let display: SCDisplay
@@ -4310,6 +4368,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             streamingActivity = nil
         }
         stopAudioDeviceCapture()
+        keepWarm.stop()
         pipeline?.stop()
         pipeline = nil
         isStreaming = false

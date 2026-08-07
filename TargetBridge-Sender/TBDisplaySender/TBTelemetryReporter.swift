@@ -59,7 +59,9 @@ enum TBTelemetryReporter {
                        processSum: Double, processMax: Double, samples: Int,
                        inflight: Int, budget: Int,
                        idleInputGap: Double,
-                       wakeSum: Double, wakeMax: Double, wakeCount: Int) {
+                       wakeShortSum: Double, wakeShortCount: Int,
+                       wakeLongSum: Double, wakeLongMax: Double, wakeLongCount: Int,
+                       wakeRejected: Int) {
         queue.async {
             // An idle burst means the compositor produced nothing. Whether that
             // is a wedge or simply nobody at the keyboard is decided by how
@@ -75,9 +77,13 @@ enum TBTelemetryReporter {
             emit("cadence capture(pts) \(fmt(capBins)) \(idleNote)")
             emit("cadence emit(wall)   \(fmt(emitBins))  drops \(drops)")
             // The wake-up cost, which every other number here is blind to.
-            if wakeCount > 0 {
-                let avg = wakeSum / Double(wakeCount) * 1000.0
-                emit("wake: \(wakeCount) resumes, \(String(format: "%.0f", avg)) ms avg / \(String(format: "%.0f", wakeMax * 1000.0)) ms worst (input -> first new frame)")
+            // `long` is the one that matters: resuming after a real pause.
+            // `short` is the gap between keystrokes mid-word, which was never
+            // slow and only ever diluted the average.
+            if wakeShortCount > 0 || wakeLongCount > 0 || wakeRejected > 0 {
+                let shortAvg = wakeShortCount > 0 ? wakeShortSum / Double(wakeShortCount) * 1000.0 : 0
+                let longAvg  = wakeLongCount  > 0 ? wakeLongSum  / Double(wakeLongCount)  * 1000.0 : 0
+                emit("wake: short(<1s) \(wakeShortCount) @ \(String(format: "%.0f", shortAvg)) ms | LONG(>=1s) \(wakeLongCount) @ \(String(format: "%.0f", longAvg)) ms worst \(String(format: "%.0f", wakeLongMax * 1000.0)) ms | \(wakeRejected) not input-caused")
             }
             emitBins = [Int](repeating: 0, count: 8)
             if hadProcess {
