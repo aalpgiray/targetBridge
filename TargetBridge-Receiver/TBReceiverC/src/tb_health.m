@@ -105,6 +105,17 @@ static int tb_health_gpu_percent(void) {
     return best;
 }
 
+/* Written by the reader and render threads, read by the reporter. Doubles are
+ * not atomic, so a report can catch a partially-updated total -- accepted
+ * deliberately: a lock here would put contention on the two hottest threads to
+ * protect a diagnostic, and being off by one frame's microseconds changes no
+ * decision this number informs. */
+static volatile double g_read_ms = 0, g_copy_ms = 0, g_submit_ms = 0;
+
+void tb_health_note_read(double ms)        { g_read_ms   += ms; }
+void tb_health_note_upload_copy(double ms) { g_copy_ms   += ms; }
+void tb_health_note_submit(double ms)      { g_submit_ms += ms; }
+
 static void tb_health_sample(double span_ms, double *last_cpu_s) {
     double cpu_s = tb_health_cpu_seconds();
     double cpu_pct = -1.0;
@@ -120,8 +131,15 @@ static void tb_health_sample(double span_ms, double *last_cpu_s) {
     if (gpu >= 0) snprintf(gpubuf, sizeof(gpubuf), "%d%%", gpu);
     else          snprintf(gpubuf, sizeof(gpubuf), "n/a");
 
-    fprintf(stderr, "[health] thermal %s | cpu %.0f%% | gpu %s | load %.2f\n",
-            tb_health_thermal(), cpu_pct < 0 ? 0.0 : cpu_pct, gpubuf, load[0]);
+    /* As a share of wall-clock, so it reads on the same scale as cpu%. */
+    double rd = g_read_ms, cp = g_copy_ms, sb = g_submit_ms;
+    g_read_ms = g_copy_ms = g_submit_ms = 0;
+
+    fprintf(stderr,
+            "[health] thermal %s | cpu %.0f%% | gpu %s | load %.2f"
+            " || read %.0f%% | uploadcopy %.0f%% | submit %.0f%%\n",
+            tb_health_thermal(), cpu_pct < 0 ? 0.0 : cpu_pct, gpubuf, load[0],
+            rd / span_ms * 100.0, cp / span_ms * 100.0, sb / span_ms * 100.0);
 }
 
 static void *tb_health_main(void *unused) {

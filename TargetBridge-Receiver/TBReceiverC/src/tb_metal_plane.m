@@ -38,6 +38,14 @@
 
 #include "tb_metal_plane.h"
 #include "tb_dpcm.h"
+#include "tb_health.h"
+#include <stdatomic.h>
+
+#include <sys/time.h>
+static double tb_mp_now_ms(void) {
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
 
 #include <SDL.h>
 #include <stdio.h>
@@ -121,6 +129,28 @@ static struct {
     int                   frame_widx;      /* being decoded into */
     int                   frame_open;      /* a frame holds a ring slot */
     dispatch_semaphore_t  frames_free;
+
+    /* Present without blocking the render thread — TB_ASYNC_PRESENT=1.
+     *
+     * Presenting has to wait for every band's decode, and the simple way to do
+     * that is to block on the last one, which is what the synchronous path
+     * does. It costs the render thread roughly 4 ms a frame sitting idle, and
+     * during that time it cannot start on the next frame's early bands.
+     *
+     * Waiting is unavoidable; doing it on the render thread is not. Each band
+     * counts itself in before commit and out on completion, and whoever takes
+     * the count to zero performs the present. That needs no assumption about
+     * completion order — which matters, because the two claims in this file
+     * disagree about whether one queue guarantees it, and the comment written
+     * after the N>1 glitches says it does not. Counting is true either way.
+     *
+     * Off by default: this is the code that has glitched before. */
+    int                   async_present;
+    dispatch_queue_t      presentQ;
+    _Atomic int           bands_inflight;  /* committed, not yet completed */
+    int                   present_armed;   /* presentQ only */
+    int                   present_idx;
+    int                   present_ten_bit;
     size_t                frame_bpr;
     int                   frame_w, frame_h;
 
@@ -552,6 +582,17 @@ int tb_metal_plane_init(SDL_Window *win) {
 
     g.queue = [g.dev newCommandQueue];
     g.inflight = dispatch_semaphore_create(TB_UPLOAD_RING);
+    {
+        const char *ap = getenv("TB_ASYNC_PRESENT");
+        g.async_present = (ap && ap[0] == '1');
+        if (g.async_present) {
+            g.presentQ = dispatch_queue_create("tb.present", DISPATCH_QUEUE_SERIAL);
+            if (!g.presentQ) g.async_present = 0;
+        }
+        fprintf(stderr, "[metal] present %s\n",
+                g.async_present ? "async (TB_ASYNC_PRESENT=1)"
+                                : "synchronous (TB_ASYNC_PRESENT=1 enables async)");
+    }
     g.frames_free = dispatch_semaphore_create(TB_FRAME_RING);
     g.frame_widx = 0;
     g.frame_open = 0;
@@ -850,6 +891,38 @@ static int tb_frame_ensure(void) {
     return g.frame[i] ? 0 : -1;
 }
 
+/* Runs on presentQ once every band of the armed frame has completed. Mirrors
+ * the tail of the synchronous path exactly — same ring-slot bookkeeping, same
+ * failure handling — just off the render thread. */
+static void tb_present_armed_frame(void) {
+    if (!g.present_armed) return;
+    g.present_armed = 0;
+
+    const int idx = g.present_idx;
+    const int ten = g.present_ten_bit;
+    dispatch_semaphore_t frames = g.frames_free;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> pcb = [g.queue commandBuffer];
+        [pcb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
+            (void)done;
+            dispatch_semaphore_signal(frames);
+        }];
+        if (dispatch_semaphore_wait(g.inflight,
+                                    dispatch_time(DISPATCH_TIME_NOW,
+                                                  100 * NSEC_PER_MSEC)) != 0) {
+            dispatch_semaphore_signal(frames);
+            return;
+        }
+        /* Same rule as the synchronous path: tb_present returns without
+         * committing when no drawable is free, so the handler never runs and
+         * the ring slot would leak. Three of those and everything blocks. */
+        if (tb_present(pcb, g.frame[idx], MTLStorageModePrivate, ten) != 0) {
+            dispatch_semaphore_signal(frames);
+        }
+    }
+}
+
 int tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len) {
     /* A whole frame is the single-slice case: one band, at row 0, presented
      * immediately. Kept as one code path so the sliced path is the tested one
@@ -860,7 +933,8 @@ int tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len) {
 int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
                                      int frame_w, int frame_h, int x0, int y0,
                                      int is_last) {
-    if (!g.ready || !g.dpcmPipe || !blob) return -1;
+    const double tb_submit_t0 = tb_mp_now_ms();
+    if (!g.ready || !g.dpcmPipe || !blob) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }
 
     /* Validate before anything touches the GPU. This is also what lets the
      * shader run without a single bounds check: parse re-derives the entire
@@ -869,15 +943,15 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
     struct tb_dpcm_info in;
     if (tb_dpcm_parse(blob, len, &in) != 0) {
         fprintf(stderr, "[metal] rejected malformed TBD2 blob (%zu bytes)\n", len);
-        return -1;
+        { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }
     }
 
     /* A slice describes a band of a larger surface; a whole frame describes
      * itself. Passing 0 for the frame size means "this blob is the frame". */
     if (frame_w <= 0 || frame_h <= 0) { frame_w = in.width; frame_h = in.height; }
-    if (in.width != frame_w) return -1;                       /* bands are full width */
-    if (y0 < 0 || (int64_t)y0 + in.height > frame_h) return -1;
-    if (y0 % TB_DPCM_TILE) return -1;                         /* must land on a tile row */
+    if (in.width != frame_w) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }                       /* bands are full width */
+    if (y0 < 0 || (int64_t)y0 + in.height > frame_h) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }
+    if (y0 % TB_DPCM_TILE) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }                         /* must land on a tile row */
 
     @autoreleasepool {
         tb_geometry_set(frame_w, frame_h);
@@ -889,7 +963,7 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
              * start was dropped would decode its remaining bands over whatever
              * the slot last held and present a mixture — the failure this ring
              * exists to prevent. */
-            if (y0 != 0) return -1;
+            if (y0 != 0) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }
             /* Bounded, never DISPATCH_TIME_FOREVER: this runs on the thread that
              * also services the window, so an unbounded wait turns a GPU backlog
              * into an unresponsive app. Dropping a frame costs one stale 16.7 ms
@@ -903,20 +977,22 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
                     fprintf(stderr, "[metal] all %d frame surfaces busy; dropping frames\n",
                             TB_FRAME_RING);
                 }
-                return -1;
+                { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }
             }
             g.frame_open = 1;
         }
         if (tb_frame_ensure() != 0) {
             dispatch_semaphore_signal(g.frames_free);
             g.frame_open = 0;
-            return -1;
+            { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }
         }
         id<MTLBuffer> dst = g.frame[g.frame_widx];
 
         id<MTLBuffer> up = tb_upload_take(len);
-        if (!up) return -1;
+        if (!up) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }
+        double cp0 = tb_mp_now_ms();
         memcpy([up contents], blob, len);
+        tb_health_note_upload_copy(tb_mp_now_ms() - cp0);
 
         /* The blob is bound whole and the planes reached by offset, because
          * Metal wants buffer offsets 4-byte aligned and the seed and payload
@@ -957,13 +1033,39 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
          * synchronise ACROSS queues, and waiting on one within a single queue
          * deadlocks, which is what it did. */
         dispatch_semaphore_t sem = g.inflight;
+        const int async_present = g.async_present;
+
+        if (async_present) {
+            /* Arm BEFORE committing the last band, or its completion handler
+             * could run first and find nothing to do — after which no other
+             * band would ever take the count to zero again. */
+            if (is_last) {
+                dispatch_sync(g.presentQ, ^{
+                    g.present_idx     = g.frame_widx;
+                    g.present_ten_bit = in.ten_bit ? 1 : 0;
+                    g.present_armed   = 1;
+                });
+                g.frame_widx = (g.frame_widx + 1) % TB_FRAME_RING;
+                g.frame_open = 0;
+            }
+            atomic_fetch_add(&g.bands_inflight, 1);
+        }
+
         [cb addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull done) {
             (void)done;
             dispatch_semaphore_signal(sem);
+            if (async_present) {
+                /* Last one out presents. No assumption about the order these
+                 * complete in — only about how many are left. */
+                if (atomic_fetch_sub(&g.bands_inflight, 1) == 1) {
+                    dispatch_async(g.presentQ, ^{ tb_present_armed_frame(); });
+                }
+            }
         }];
         [cb commit];
 
-        if (!is_last) return 0;
+        if (async_present) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return 0; }
+        if (!is_last) { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return 0; }
 
         /* Wait for this frame's decodes before presenting.
          *
@@ -1007,7 +1109,7 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
                                     dispatch_time(DISPATCH_TIME_NOW,
                                                   100 * NSEC_PER_MSEC)) != 0) {
             dispatch_semaphore_signal(frames);
-            return -1;
+            { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return -1; }
         }
         const int rc = tb_present(pcb, g.frame[presented_idx], MTLStorageModePrivate, in.ten_bit);
         if (rc != 0) {
@@ -1016,6 +1118,6 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
              * three of those and the next frame blocks forever. */
             dispatch_semaphore_signal(frames);
         }
-        return rc;
+        { tb_health_note_submit(tb_mp_now_ms() - tb_submit_t0); return rc; }
     }
 }

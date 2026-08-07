@@ -2376,7 +2376,9 @@ static void *link_reader_main(void *ud) {
             if (tb_parser_reserve_space(&r->parser, 1024 * 1024, &dst, &avail) < 0) {
                 r->ended = 1; return NULL;
             }
+            double rd0 = now_ms_f();
             ssize_t n = read(r->fd, dst, avail);
+            tb_health_note_read(now_ms_f() - rd0);
             if (n > 0) {
                 pthread_mutex_lock(&a->net_lock);
                 a->reader_recv_ms = now_ms();

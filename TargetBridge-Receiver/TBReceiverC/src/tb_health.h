@@ -50,6 +50,19 @@ extern "C" {
  * costs nothing to put it somewhere it cannot matter. */
 void tb_health_start(void);
 
+/* Per-stage CPU accounting for the receive path.
+ *
+ * "63% of a core" is an aggregate, and an aggregate has never once been enough
+ * to find anything in this project. Three stages are plausible and they want
+ * different fixes: the kernel->userspace copy in read(), the memcpy that stages
+ * a blob into a Metal upload buffer, and everything else in submitting a slice.
+ * Splitting them is what named the sender's spike in a single run.
+ *
+ * Call with elapsed milliseconds; totals are folded into the [health] line. */
+void tb_health_note_read(double ms);
+void tb_health_note_upload_copy(double ms);
+void tb_health_note_submit(double ms);
+
 #ifdef __cplusplus
 }
 #endif
