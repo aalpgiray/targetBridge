@@ -58,7 +58,8 @@ enum TBTelemetryReporter {
                        deliverySum: Double, deliveryMax: Double,
                        processSum: Double, processMax: Double, samples: Int,
                        inflight: Int, budget: Int,
-                       idleInputGap: Double) {
+                       idleInputGap: Double,
+                       wakeSum: Double, wakeMax: Double, wakeCount: Int) {
         queue.async {
             // An idle burst means the compositor produced nothing. Whether that
             // is a wedge or simply nobody at the keyboard is decided by how
@@ -73,6 +74,11 @@ enum TBTelemetryReporter {
             }
             emit("cadence capture(pts) \(fmt(capBins)) \(idleNote)")
             emit("cadence emit(wall)   \(fmt(emitBins))  drops \(drops)")
+            // The wake-up cost, which every other number here is blind to.
+            if wakeCount > 0 {
+                let avg = wakeSum / Double(wakeCount) * 1000.0
+                emit("wake: \(wakeCount) resumes, \(String(format: "%.0f", avg)) ms avg / \(String(format: "%.0f", wakeMax * 1000.0)) ms worst (input -> first new frame)")
+            }
             emitBins = [Int](repeating: 0, count: 8)
             if hadProcess {
                 emit("stage worst ms: probe \(String(format: "%.1f", probe)) | lock \(String(format: "%.1f", lock)) | ctx \(String(format: "%.1f", ctx)) | submit \(String(format: "%.1f", submit))")

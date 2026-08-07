@@ -132,7 +132,7 @@ SOURCES=(
     "$SRC/tb_logship.c"
     "$CODEC/tb_dpcm.c"
     "$SRC/tb_gesture_bridge.m" "$SRC/tb_display_tweaks.m"
-    "$SRC/tb_mic_capture.m" "$SRC/tb_metal_plane.m"
+    "$SRC/tb_mic_capture.m" "$SRC/tb_metal_plane.m" "$SRC/tb_health.m"
 )
 for s in "${SOURCES[@]}"; do
     [ -f "$s" ] || { echo "!! missing source $s"; exit 1; }
@@ -158,7 +158,7 @@ clang -arch x86_64 -mmacosx-version-min=$MIN_MACOS -o "$OBJ/tbreceiver" "${objs[
     -framework CoreGraphics -framework CoreText -framework VideoToolbox \
     -framework CoreMedia -framework CoreVideo -framework IOSurface \
     -framework CoreServices -framework CoreAudio -framework AVFoundation \
-    -framework Metal -framework QuartzCore
+    -framework Metal -framework QuartzCore -framework IOKit
 
 # ---------------------------------------------------------------- bundle
 echo "==> assembling bundle"

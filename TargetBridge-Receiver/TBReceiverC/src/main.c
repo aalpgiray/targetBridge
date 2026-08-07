@@ -23,6 +23,7 @@
 #include "tb_mic_capture.h"
 #include "tb_i18n.h"
 #include "tb_logship.h"
+#include "tb_health.h"
 
 #include <SDL.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -2807,6 +2808,10 @@ int main(int argc, char **argv) {
 
     /* Pacing defaults on but stays one env var from off: the last attempt at
      * this made playback worse, and a bad night should not need a rebuild. */
+    /* Vitals for the machine nobody is sitting at. Its stderr is shipped to the
+     * sender, so this lands next to the sender's own telemetry. */
+    tb_health_start();
+
     {
         const char *pace = getenv("TB_PACE");
         a.pace_enabled = !(pace && pace[0] == '0');

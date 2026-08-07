@@ -62,6 +62,18 @@
 @interface CGVirtualDisplaySettings : NSObject
 @property (nonatomic) BOOL hiDPI;
 @property (nonatomic, copy) NSArray *modes;
+/* Found by runtime introspection (scratchpad/vdintrospect.m), not documentation
+ * — these exist on the real class and were simply never declared here.
+ *
+ * `refreshDeadline` is the interesting one. A virtual display has no scanout to
+ * force a rhythm, so it composites on demand: leave the screen alone and
+ * content production sags to ~5.6 Hz, which is why the first keystroke after a
+ * pause waits ~180 ms before anything appears. A deadline is exactly the beat
+ * that is missing. Units and semantics are unknown and there is nothing to read
+ * — it is set empirically, behind TBRefreshDeadline, and left off by default. */
+@property (nonatomic) double refreshDeadline;
+@property (nonatomic) BOOL isReference;
+@property (nonatomic) uint32_t rotation;
 @end
 
 @interface CGVirtualDisplay : NSObject

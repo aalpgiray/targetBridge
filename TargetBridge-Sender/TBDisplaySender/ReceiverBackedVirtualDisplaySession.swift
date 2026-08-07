@@ -189,6 +189,19 @@ final class ReceiverBackedVirtualDisplaySession {
         TBLog.connection.notice("virtual display transferFunction=\(tf, privacy: .public)")
         settings.modes = [mode]
 
+        // Off unless asked for, so the default path is byte-for-byte unchanged.
+        //
+        //   defaults write com.targetbridge.sender TBRefreshDeadline -float 0.0167
+        //
+        // See the header: a virtual display composites on demand, so a quiet
+        // screen slows it down and the next keystroke waits for its next tick.
+        // Whether this property is that tick — and in what units — is unknown,
+        // which is the whole reason it is a knob rather than a constant.
+        if let raw = UserDefaults.standard.object(forKey: "TBRefreshDeadline") as? Double, raw > 0 {
+            settings.refreshDeadline = raw
+            TBLog.connection.notice("virtual display refreshDeadline=\(raw, privacy: .public)")
+        }
+
         guard display.apply(settings), display.displayID != kCGNullDirectDisplay else {
             return false
         }

@@ -45,6 +45,27 @@ nonisolated(unsafe) var tbIdleInputGapMin = Double.greatestFiniteMagnitude
 /// `kCGAnyInputEventType`, which Swift does not surface as a constant.
 private let tbAnyInputEvent = CGEventType(rawValue: ~0)!
 
+/// How long the first NEW frame took to arrive after a quiet stretch.
+///
+/// This is the number behind "it feels sluggish when I start typing again".
+/// Every aggregate we had said 60 fps and said it honestly: the link carries
+/// what it is given, on time, and the frame rate while reading is low because
+/// a still screen produces nothing. None of that can see the one moment that
+/// actually feels bad — the wait between a keystroke and the pixels for it.
+///
+/// Measured as: on the first content frame ending a run of idle frames, how
+/// long ago the machine last saw input. Attributing that frame to that input is
+/// an assumption, and it is only sound when the two are close, so samples
+/// beyond `tbWakeMaxPlausible` are dropped rather than averaged in — a frame
+/// arriving two seconds after the last keypress was caused by something else.
+///
+/// Single writer on the capture queue, read there too.
+nonisolated(unsafe) var tbWakeSum = 0.0
+nonisolated(unsafe) var tbWakeMax = 0.0
+nonisolated(unsafe) var tbWakeCount = 0
+nonisolated(unsafe) var tbWakeWasIdle = false
+private let tbWakeMaxPlausible = 1.5
+
 
 enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     case standard1440p
@@ -1014,6 +1035,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         let drops = cadenceDrops
         let idle = tbIdleFramesSeen
         let idleGap = tbIdleInputGapMin
+        let wakeSum = tbWakeSum, wakeMax = tbWakeMax, wakeN = tbWakeCount
         let sProbe = stageProbeMax, sLock = stageLockMax
         let sCtx = stageCtxMax, sSubmit = stageSubmitMax
         let hadProcess = latProcessMax > 0
@@ -1026,6 +1048,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
 
         tbIdleFramesSeen = 0
         tbIdleInputGapMin = .greatestFiniteMagnitude
+        tbWakeSum = 0; tbWakeMax = 0; tbWakeCount = 0
         if pathRectFrames > 0 || pathWholeFrames > 0 {
             let total = pathRectFrames + pathWholeFrames
             let avgPct = pathRectFrames > 0
@@ -1053,7 +1076,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
                                    processSum: pSum, processMax: pMax,
                                    samples: samples,
                                    inflight: inflight, budget: budget,
-                                   idleInputGap: idleGap)
+                                   idleInputGap: idleGap,
+                                   wakeSum: wakeSum, wakeMax: wakeMax, wakeCount: wakeN)
 
         latDeliverySum = 0; latDeliveryMax = 0
         latProcessSum = 0; latProcessMax = 0
@@ -2294,12 +2318,23 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
             switch status {
             case .complete, .started:
+                if tbWakeWasIdle {
+                    tbWakeWasIdle = false
+                    let gap = CGEventSource.secondsSinceLastEventType(
+                        .combinedSessionState, eventType: tbAnyInputEvent)
+                    if gap >= 0, gap <= tbWakeMaxPlausible {
+                        tbWakeSum += gap
+                        tbWakeMax = max(tbWakeMax, gap)
+                        tbWakeCount += 1
+                    }
+                }
                 return true
             case .idle:
                 // Identical pixels. Carried only when the constant-rate
                 // experiment is on; `.blank` and the stopped states stay
                 // filtered either way, since those are not a picture at all.
                 tbIdleFramesSeen += 1
+                tbWakeWasIdle = true
                 let gap = CGEventSource.secondsSinceLastEventType(
                     .combinedSessionState, eventType: tbAnyInputEvent)
                 if gap < tbIdleInputGapMin { tbIdleInputGapMin = gap }
