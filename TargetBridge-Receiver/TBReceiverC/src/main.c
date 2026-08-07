@@ -44,6 +44,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <time.h>
@@ -2530,6 +2532,44 @@ static void link_reader_stop(struct tb_link_reader *r) {
  *     of one frame.
  * Anything not sent stays in the ring for the next pass, and the ring already
  * reports what it had to drop. */
+/* Whether two sockets are connected to the same remote HOST (port ignored --
+ * the peer picks a fresh ephemeral one per connection).
+ *
+ * Guards the second cable. The listener accepts anything that completes a TCP
+ * handshake, and the slot is claimed by the first arrival, so any process that
+ * touches the port takes the place of the sender's real secondary and then
+ * feeds its bytes to the frame parser. That is not hypothetical: on 2026-08-06
+ * something opened the port and sent an SSH banner, whose first four bytes
+ * ("SSH-") read as a 1.4 GB packet length. The parser's sanity check caught it
+ * and the link recovered in about two seconds, but only because the garbage
+ * happened to be implausible -- bytes inside the legal length range would have
+ * been consumed as a frame.
+ *
+ * Comparing against the established primary needs no wire-format change and no
+ * sender change, and it is the honest rule anyway: a second cable is a second
+ * cable from the same machine, or it is not one.
+ *
+ * Returns 0 when either address cannot be read, so an unverifiable peer is
+ * refused rather than trusted. */
+static int tb_same_peer_host(int fd_a, int fd_b) {
+    struct sockaddr_storage sa, sb;
+    socklen_t la = sizeof(sa), lb = sizeof(sb);
+    if (getpeername(fd_a, (struct sockaddr *)&sa, &la) != 0) return 0;
+    if (getpeername(fd_b, (struct sockaddr *)&sb, &lb) != 0) return 0;
+    if (sa.ss_family != sb.ss_family) return 0;
+    if (sa.ss_family == AF_INET) {
+        const struct sockaddr_in *x = (const struct sockaddr_in *)&sa;
+        const struct sockaddr_in *y = (const struct sockaddr_in *)&sb;
+        return x->sin_addr.s_addr == y->sin_addr.s_addr;
+    }
+    if (sa.ss_family == AF_INET6) {
+        const struct sockaddr_in6 *x = (const struct sockaddr_in6 *)&sa;
+        const struct sockaddr_in6 *y = (const struct sockaddr_in6 *)&sb;
+        return memcmp(&x->sin6_addr, &y->sin6_addr, sizeof(x->sin6_addr)) == 0;
+    }
+    return 0;
+}
+
 static void pump_log_shipping(struct app *a) {
     if (!a || a->client_fd < 0) return;
 
@@ -2990,6 +3030,11 @@ int main(int argc, char **argv) {
             }
         } else if (a.client_fd2 < 0) {
             int c2 = tb_net_accept(a.server_fd);
+            if (c2 >= 0 && !tb_same_peer_host(a.client_fd, c2)) {
+                fprintf(stderr, "[main] refused second cable from a different host\n");
+                close(c2);
+                c2 = -1;
+            }
             if (c2 >= 0) {
                 a.client_fd2 = c2;
                 a.last_recv_ms = t;

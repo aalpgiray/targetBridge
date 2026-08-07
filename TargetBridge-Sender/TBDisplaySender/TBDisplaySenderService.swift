@@ -7,6 +7,7 @@ import Foundation
 import AVFoundation
 import IOSurface
 import Network
+import os
 @preconcurrency import ScreenCaptureKit
 import VideoToolbox
 
@@ -451,7 +452,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
     // secondary) to roughly double throughput. Control packets always go on the
     // primary. Attached after the primary is streaming; confined to `queue`.
     private var secondaryConnection: NWConnection?
-    private var pendingVideoPacketsSecondary = 0
+    /// See `pendingVideoPackets` — same hazard, same reason for the lock.
+    private let pendingVideoPacketsSecondary = OSAllocatedUnfairLock(initialState: 0)
     private var rawFrameCounter = 0
     /// Damage streaming: send whole frames only when we must (first frame,
     /// format/size change, too much changed, or a periodic resync) and send
@@ -640,12 +642,52 @@ private final class TBVideoPipeline: @unchecked Sendable {
     // Confined to `queue`.
     private var vtEncoder: VTCompressionSession?
     private var vtEncoderRef: Unmanaged<TBVideoPipeline>?
-    private var pendingVideoPackets = 0
+    /// Packets handed to the transport and not yet reported back as processed.
+    ///
+    /// This said "confined to `queue`" and was not. THREE queues touch it: the
+    /// capture queue reads it for the backpressure test and increments it on the
+    /// raw paths, the encoder's own `plan_q` increments it from the DPCM `send`
+    /// callback, and `queue` ran every decrement. A plain `Int` under
+    /// `+= 1` / `= max(0, x - 1)` is a read-modify-write, so a collision loses
+    /// one of the two updates.
+    ///
+    /// Losing them is not symmetric, which is what makes it worth a lock rather
+    /// than a shrug. The clamp absorbs a lost increment — the count simply
+    /// floors at zero — while a lost DECREMENT is permanent. So the value is a
+    /// random walk against a reflecting barrier, and it can only drift upward.
+    /// Drift far enough and `backedUp` is true for every frame, which is a
+    /// stream that decays to nothing and recovers only when the sender is
+    /// restarted. That is not the stall we chased on 2026-08-07 (this read
+    /// 0-1/12 throughout it) but it is a faithful reproduction of the symptom,
+    /// waiting to happen.
+    private let pendingVideoPackets = OSAllocatedUnfairLock(initialState: 0)
     private var inFlightEncodeFrames = 0
     private var displayStreamFrameSequence: CMTimeValue = 0
     private var lastEncodedDisplayPTS: CMTime?
     private var ackSent: Bool
     private var running = false
+
+    /// The in-flight count for whichever cable a frame is going out on.
+    ///
+    /// Retain before handing the packet to the transport, release when it
+    /// reports the packet processed. Both are atomic, and the release no longer
+    /// hops through `queue` to get there: the hop existed to make the mutation
+    /// safe, the lock does that now, and going direct means the backpressure
+    /// test reads a count that is current rather than one queue-hop stale.
+    private func pendingRetain(secondary: Bool) {
+        (secondary ? pendingVideoPacketsSecondary : pendingVideoPackets)
+            .withLock { $0 += 1 }
+    }
+
+    private func pendingRelease(secondary: Bool) {
+        (secondary ? pendingVideoPacketsSecondary : pendingVideoPackets)
+            .withLock { $0 = max(0, $0 - 1) }
+    }
+
+    private func pendingCount(secondary: Bool = false) -> Int {
+        (secondary ? pendingVideoPacketsSecondary : pendingVideoPackets)
+            .withLock { $0 }
+    }
 
     // Read from the main thread (fps timer / watchdog); guarded by `lock`.
     private let lock = NSLock()
@@ -719,7 +761,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     }
 
     func diagnosticsSnapshot() -> (pending: Int, inFlight: Int, ptsSeq: CMTimeValue) {
-        queue.sync { (pending: pendingVideoPackets, inFlight: inFlightEncodeFrames, ptsSeq: displayStreamFrameSequence) }
+        queue.sync { (pending: pendingCount(), inFlight: inFlightEncodeFrames, ptsSeq: displayStreamFrameSequence) }
     }
 
     private func markCaptureFrame() {
@@ -834,7 +876,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
         if preset.dropsBeforeEncodeWhenBacklogged,
-           (pendingVideoPackets >= preset.maxPendingVideoPackets ||
+           (pendingCount() >= preset.maxPendingVideoPackets ||
             inFlightEncodeFrames >= preset.maxInFlightEncodeFrames) {
             return
         }
@@ -848,7 +890,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         markCaptureFrame()
         guard running, let encoder = vtEncoder else { return }
         if preset.dropsBeforeEncodeWhenBacklogged,
-           (pendingVideoPackets >= preset.maxPendingVideoPackets ||
+           (pendingCount() >= preset.maxPendingVideoPackets ||
             inFlightEncodeFrames >= preset.maxInFlightEncodeFrames) {
             return
         }
@@ -923,7 +965,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         let notSync = attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool ?? false
         let isKeyframe = !notSync
 
-        if !isKeyframe, pendingVideoPackets >= preset.maxPendingVideoPackets {
+        if !isKeyframe, pendingCount() >= preset.maxPendingVideoPackets {
             return
         }
 
@@ -934,12 +976,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
         }
 
         if let packet = buildFramePacket(from: sampleBuffer) {
-            pendingVideoPackets += 1
+            pendingRetain(secondary: false)
             connection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
                 guard let self else { return }
-                self.queue.async {
-                    self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
-                }
+                self.pendingRelease(secondary: false)
             }))
             lock.lock(); _sentFrames += 1; lock.unlock()
         }
@@ -957,7 +997,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     func detachSecondaryConnection() {
         queue.async { [weak self] in
             self?.secondaryConnection = nil
-            self?.pendingVideoPacketsSecondary = 0
+            self?.pendingVideoPacketsSecondary.withLock { $0 = 0 }
         }
     }
 
@@ -1017,7 +1057,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         let dSum = latDeliverySum, dMax = latDeliveryMax
         let pSum = latProcessSum, pMax = latProcessMax
         let samples = latSamples
-        let inflight = pendingVideoPackets
+        let inflight = pendingCount()
         let budget = preset.maxPendingVideoPackets
             * ((dpcmEnabled && dpcmSlicesEnabled) ? max(1, dpcmSliceCount) : 1)
 
@@ -1115,7 +1155,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         // Observed exactly that at N=8 -- `inflight 25/24` with 167 drops -- and
         // it is the same frame-versus-band unit confusion that has bitten this
         // code repeatedly: the check counted packets, the send counted frames.
-        let pendingNow = useSecondary ? pendingVideoPacketsSecondary : pendingVideoPackets
+        let pendingNow = pendingCount(secondary: useSecondary)
         let backedUp = pendingNow + packetsPerFrame > inFlightBudget
         if backedUp {
             // A skipped frame's damage would otherwise be lost for good, since
@@ -1211,16 +1251,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 carriedDirty.removeAll(keepingCapacity: true)
                 framesSinceKeyframe += 1
                 let dmg = TBMonitorProtocol.makePacket(type: .rawDamage, payload: d)
-                if useSecondary { pendingVideoPacketsSecondary += 1 } else { pendingVideoPackets += 1 }
+                pendingRetain(secondary: useSecondary)
                 targetConnection.send(content: dmg, completion: .contentProcessed({ [weak self] _ in
                     guard let self else { return }
-                    self.queue.async {
-                        if useSecondary {
-                            self.pendingVideoPacketsSecondary = max(0, self.pendingVideoPacketsSecondary - 1)
-                        } else {
-                            self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
-                        }
-                    }
+                    self.pendingRelease(secondary: useSecondary)
                 }))
                 lock.lock()
                 _sentFrames += 1
@@ -1344,12 +1378,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
                             rect: (x: r.x, y: r.y, index: i, count: rects.count),
                             send: { [weak self] packet in
                                 guard let self else { return }
-                                self.pendingVideoPackets += 1
+                                self.pendingRetain(secondary: false)
                                 targetConnection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
                                     guard let self else { return }
-                                    self.queue.async {
-                                        self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
-                                    }
+                                    self.pendingRelease(secondary: false)
                                 }))
                             },
                             finished: { _, _ in
@@ -1439,12 +1471,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     height: height,
                     send: { [weak self] packet in
                         guard let self else { return }
-                        self.pendingVideoPackets += 1
+                        self.pendingRetain(secondary: false)
                         targetConnection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
                             guard let self else { return }
-                            self.queue.async {
-                                self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
-                            }
+                            self.pendingRelease(secondary: false)
                         }))
                     },
                     finished: { [weak self] written, ok in
@@ -1564,16 +1594,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 carriedDirty.removeAll(keepingCapacity: true)
                 framesSinceKeyframe += 1
                 let dmg = TBMonitorProtocol.makePacket(type: .rawDamage, payload: d)
-                if useSecondary { pendingVideoPacketsSecondary += 1 } else { pendingVideoPackets += 1 }
+                pendingRetain(secondary: useSecondary)
                 targetConnection.send(content: dmg, completion: .contentProcessed({ [weak self] _ in
                     guard let self else { return }
-                    self.queue.async {
-                        if useSecondary {
-                            self.pendingVideoPacketsSecondary = max(0, self.pendingVideoPacketsSecondary - 1)
-                        } else {
-                            self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
-                        }
-                    }
+                    self.pendingRelease(secondary: useSecondary)
                 }))
                 lock.lock()
                 _sentFrames += 1
@@ -1601,16 +1625,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
         }
 
         let packet = TBMonitorProtocol.makePacket(type: .rawFrame, payload: payload)
-        if useSecondary { pendingVideoPacketsSecondary += 1 } else { pendingVideoPackets += 1 }
+        pendingRetain(secondary: useSecondary)
         targetConnection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
             guard let self else { return }
-            self.queue.async {
-                if useSecondary {
-                    self.pendingVideoPacketsSecondary = max(0, self.pendingVideoPacketsSecondary - 1)
-                } else {
-                    self.pendingVideoPackets = max(0, self.pendingVideoPackets - 1)
-                }
-            }
+            self.pendingRelease(secondary: useSecondary)
         }))
         lock.lock()
         _sentFrames += 1
