@@ -22,6 +22,28 @@ import VideoToolbox
 /// queue, so a plain var is honest here rather than lucky.
 nonisolated(unsafe) var tbIdleFramesSeen = 0
 
+/// The smallest "seconds since the last local input event" seen at the moment
+/// an idle frame arrived, since the last cadence report.
+///
+/// This is the discriminator for the intermittent stall. A burst of idle frames
+/// has two completely different causes that the idle count alone cannot tell
+/// apart: nobody was touching the machine, or the virtual display stopped
+/// producing while somebody was actively using it. Only the second is a bug,
+/// and it is the one that gets reported as "everything bogged down".
+///
+/// Local HID rather than the forwarded input events: those only arrive when the
+/// receiver holds input control, and in the setup where the stall shows up it
+/// does not — the keyboard and trackpad being used are the sender's own, so
+/// counting wire events would read zero all through a genuine wedge and look
+/// like proof of the opposite.
+///
+/// Sampled only on idle frames, which is both what the question is about and
+/// what keeps it off the hot path in normal operation.
+nonisolated(unsafe) var tbIdleInputGapMin = Double.greatestFiniteMagnitude
+
+/// `kCGAnyInputEventType`, which Swift does not surface as a constant.
+private let tbAnyInputEvent = CGEventType(rawValue: ~0)!
+
 
 enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     case standard1440p
@@ -988,6 +1010,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         let sendBins = sendCadenceBin
         let drops = cadenceDrops
         let idle = tbIdleFramesSeen
+        let idleGap = tbIdleInputGapMin
         let sProbe = stageProbeMax, sLock = stageLockMax
         let sCtx = stageCtxMax, sSubmit = stageSubmitMax
         let hadProcess = latProcessMax > 0
@@ -999,18 +1022,19 @@ private final class TBVideoPipeline: @unchecked Sendable {
             * ((dpcmEnabled && dpcmSlicesEnabled) ? max(1, dpcmSliceCount) : 1)
 
         tbIdleFramesSeen = 0
+        tbIdleInputGapMin = .greatestFiniteMagnitude
         if pathRectFrames > 0 || pathWholeFrames > 0 {
             let total = pathRectFrames + pathWholeFrames
             let avgPct = pathRectFrames > 0
                 ? 100.0 * pathRectFraction / Double(pathRectFrames) : 0
-            TBLog.connection.info("path: \(self.pathRectFrames, privacy: .public) rect / \(self.pathWholeFrames, privacy: .public) whole of \(total, privacy: .public), rect avg \(String(format: "%.1f", avgPct), privacy: .public)% of frame")
+            TBTelemetryReporter.emit("path: \(pathRectFrames) rect / \(pathWholeFrames) whole of \(total), rect avg \(String(format: "%.1f", avgPct))% of frame")
         }
         if oversampleSkips > 0 {
-            TBLog.connection.info("oversample: \(self.oversampleSkips, privacy: .public) frames skipped by the send cap")
+            TBTelemetryReporter.emit("oversample: \(oversampleSkips) frames skipped by the send cap")
         }
         oversampleSkips = 0
         if pathWholeFrames > 0 {
-            TBLog.connection.info("path skips: wanted \(self.skipWanted, privacy: .public) cap \(self.skipCap, privacy: .public) nokey \(self.skipNoKey, privacy: .public) keyage \(self.skipKeyAge, privacy: .public) nodirty \(self.skipNoDirty, privacy: .public) toomuch \(self.skipTooMuch, privacy: .public)")
+            TBTelemetryReporter.emit("path skips: wanted \(skipWanted) cap \(skipCap) nokey \(skipNoKey) keyage \(skipKeyAge) nodirty \(skipNoDirty) toomuch \(skipTooMuch)")
         }
         skipWanted = 0; skipCap = 0; skipNoKey = 0
         skipKeyAge = 0; skipNoDirty = 0; skipTooMuch = 0
@@ -1025,7 +1049,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
                                    deliverySum: dSum, deliveryMax: dMax,
                                    processSum: pSum, processMax: pMax,
                                    samples: samples,
-                                   inflight: inflight, budget: budget)
+                                   inflight: inflight, budget: budget,
+                                   idleInputGap: idleGap)
 
         latDeliverySum = 0; latDeliveryMax = 0
         latProcessSum = 0; latProcessMax = 0
@@ -2331,6 +2356,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 // experiment is on; `.blank` and the stopped states stay
                 // filtered either way, since those are not a picture at all.
                 tbIdleFramesSeen += 1
+                let gap = CGEventSource.secondsSinceLastEventType(
+                    .combinedSessionState, eventType: tbAnyInputEvent)
+                if gap < tbIdleInputGapMin { tbIdleInputGapMin = gap }
                 return sendIdleFrames
             case .blank, .suspended, .stopped:
                 return false

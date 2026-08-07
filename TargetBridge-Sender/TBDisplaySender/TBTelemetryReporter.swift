@@ -57,18 +57,41 @@ enum TBTelemetryReporter {
                        hadProcess: Bool,
                        deliverySum: Double, deliveryMax: Double,
                        processSum: Double, processMax: Double, samples: Int,
-                       inflight: Int, budget: Int) {
+                       inflight: Int, budget: Int,
+                       idleInputGap: Double) {
         queue.async {
-            TBLog.connection.info("cadence capture(pts) \(fmt(capBins), privacy: .public)  idle \(idle, privacy: .public)")
-            TBLog.connection.info("cadence emit(wall)   \(fmt(emitBins), privacy: .public)  drops \(drops, privacy: .public)")
+            // An idle burst means the compositor produced nothing. Whether that
+            // is a wedge or simply nobody at the keyboard is decided by how
+            // recently the machine saw input WHILE those frames were idle --
+            // "idle 996 (input 0.2s)" is a bug, "idle 996 (input 41.7s)" is a
+            // desk nobody is sitting at.
+            let idleNote: String
+            if idle > 0 && idleInputGap.isFinite {
+                idleNote = " idle \(idle) (input \(String(format: "%.1f", idleInputGap))s)"
+            } else {
+                idleNote = " idle \(idle)"
+            }
+            emit("cadence capture(pts) \(fmt(capBins)) \(idleNote)")
+            emit("cadence emit(wall)   \(fmt(emitBins))  drops \(drops)")
             emitBins = [Int](repeating: 0, count: 8)
             if hadProcess {
-                TBLog.connection.info("stage worst ms: probe \(String(format: "%.1f", probe), privacy: .public) | lock \(String(format: "%.1f", lock), privacy: .public) | ctx \(String(format: "%.1f", ctx), privacy: .public) | submit \(String(format: "%.1f", submit), privacy: .public)")
+                emit("stage worst ms: probe \(String(format: "%.1f", probe)) | lock \(String(format: "%.1f", lock)) | ctx \(String(format: "%.1f", ctx)) | submit \(String(format: "%.1f", submit))")
             }
             if samples > 0 {
                 let n = Double(samples)
-                TBLog.connection.info("latency delivery \(String(format: "%.1f", deliverySum / n), privacy: .public) ms avg / \(String(format: "%.1f", deliveryMax), privacy: .public) max | process \(String(format: "%.1f", processSum / n), privacy: .public) ms avg / \(String(format: "%.1f", processMax), privacy: .public) max | inflight \(inflight, privacy: .public)/\(budget, privacy: .public)")
+                emit("latency delivery \(String(format: "%.1f", deliverySum / n)) ms avg / \(String(format: "%.1f", deliveryMax)) max | process \(String(format: "%.1f", processSum / n)) ms avg / \(String(format: "%.1f", processMax)) max | inflight \(inflight)/\(budget)")
             }
         }
+    }
+
+    /// One telemetry line to both sinks.
+    ///
+    /// os_log stays because it is what `log show` and Console read live. The
+    /// file is what survives: these are `.info` records, which unified logging
+    /// keeps in memory and drops after roughly fifteen minutes, and that is
+    /// precisely long enough to lose every intermittent fault worth chasing.
+    static func emit(_ line: String) {
+        TBLog.connection.info("\(line, privacy: .public)")
+        TBReceiverLogSink.shared.note(line)
     }
 }

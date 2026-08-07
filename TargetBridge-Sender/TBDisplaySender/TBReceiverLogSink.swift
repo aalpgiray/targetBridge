@@ -25,6 +25,11 @@ final class TBReceiverLogSink: @unchecked Sendable {
                                       qos: .utility)
     private var handle: FileHandle?
     private var written = 0
+    /// Whether the last byte written ended a line. Receiver bytes arrive
+    /// unframed, so a shipped packet routinely leaves the file mid-line; a
+    /// sender line appended right then would splice itself into the middle of a
+    /// receiver one. Tracked so `note` can break the line first.
+    private var atLineStart = true
 
     /// Rotated rather than truncated at open, so the previous session survives
     /// long enough to be read after a crash — which is exactly when it matters.
@@ -47,6 +52,7 @@ final class TBReceiverLogSink: @unchecked Sendable {
             do {
                 try h.write(contentsOf: bytes)
                 written += bytes.count
+                atLineStart = bytes.last == 0x0A
                 if written >= Self.maxBytes { rotate() }
             } catch {
                 // The sink failing must never take the session with it, and
@@ -56,6 +62,44 @@ final class TBReceiverLogSink: @unchecked Sendable {
             }
         }
     }
+
+    /// Writes one of the SENDER's own telemetry lines into the same file.
+    ///
+    /// The sender already logs this through os_log, and that turned out to be
+    /// the reason a long-standing intermittent stall stayed undiagnosed: os_log
+    /// `.info` is memory-backed and evaporates within about fifteen minutes, so
+    /// by the time anyone looked, the only surviving record was the receiver's.
+    /// Half the evidence, and the half that cannot see why frames stopped being
+    /// produced. Both ends now land in one durable file, in order.
+    ///
+    /// Timestamped because the receiver's shipped lines are not — its stderr
+    /// carries no clock of its own, so these stamps are the only anchors the
+    /// file has for lining the two sides up against each other.
+    func note(_ line: String) {
+        let stamp = Self.clock.string(from: Date())
+        queue.async { [self] in
+            if handle == nil { open() }
+            guard let h = handle else { return }
+            let text = (atLineStart ? "" : "\n") + "\(stamp) [sender] \(line)\n"
+            do {
+                try h.write(contentsOf: Data(text.utf8))
+                written += text.utf8.count
+                atLineStart = true
+                if written >= Self.maxBytes { rotate() }
+            } catch {
+                handle = nil
+            }
+        }
+    }
+
+    /// Wall clock rather than ISO8601: these lines are read next to
+    /// `log show` output, which prints local time, and matching it by eye is
+    /// the whole point of having a stamp.
+    private static let clock: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f
+    }()
 
     /// Marks a session boundary. Without it a reader cannot tell where one run
     /// ends and the next begins, and the file is a rolling record of many.
