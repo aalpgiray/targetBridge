@@ -116,6 +116,7 @@ final class TBDisplaySenderService: ObservableObject {
         discoveryCancellable = receiverDiscovery.$receivers.sink { [weak self] receivers in
             guard let self else { return }
             discoveredReceivers = receivers
+            reconcileDiscoveredReceivers(receivers)
             pushLanguageUpdateToDiscoveredReceivers()
             objectWillChange.send()
         }
@@ -430,6 +431,29 @@ final class TBDisplaySenderService: ObservableObject {
         }
         restoreDisplayProfile(for: session)
         objectWillChange.send()
+    }
+
+    /// Bonjour can rediscover the same receiver with a new address after a
+    /// cable reconnect or wake. Keep selected receivers on their active
+    /// transport address, while leaving manually entered addresses untouched.
+    private func reconcileDiscoveredReceivers(_ receivers: [TBDiscoveredReceiver]) {
+        for session in sessions where
+            !session.selectedReceiverID.isEmpty &&
+            !session.isConnected &&
+            !session.isStreaming {
+            let savedServiceName = String(
+                session.selectedReceiverID.split(separator: "|", maxSplits: 1).first ?? ""
+            )
+            guard let receiver = receivers.first(where: {
+                $0.id == session.selectedReceiverID || $0.serviceName == savedServiceName
+            }) else {
+                continue
+            }
+
+            session.selectedReceiverID = receiver.id
+            session.receiverIP = receiver.ip(for: session.transportKind)
+            session.receiverSupportsHEVCDecodeHint = receiver.supportsHEVCDecode
+        }
     }
 
     func applyDisplayProfile(_ profile: TBDisplayProfile, to session: TBDisplaySenderSession) {
