@@ -3428,17 +3428,26 @@ private final class SBAudioConverter: Sendable {
 
             guard status == noErr else { return nil }
 
-            let firstBufferPtr = withUnsafeMutablePointer(to: &ablPointer.pointee.mBuffers) { $0 }
-            let buffers = UnsafeBufferPointer(start: firstBufferPtr, count: channelCount)
+            let sourceBuffers = UnsafeMutableAudioBufferListPointer(ablPointer)
+            let destinationBuffers = UnsafeMutableAudioBufferListPointer(inputBuffer.mutableAudioBufferList)
+            guard sourceBuffers.count == destinationBuffers.count else { return nil }
 
-            if inFormat.isInterleaved {
-                assertionFailure("SBAudioConverter: unexpected interleaved input format from ScreenCaptureKit")
-                return nil
-            } else {
-                for i in 0..<channelCount {
-                    if let dest = inputBuffer.floatChannelData?[i], let src = buffers[i].mData {
-                        memcpy(dest, src, Int(buffers[i].mDataByteSize))
-                    }
+            // ScreenCaptureKit may supply either one interleaved buffer or one
+            // buffer per channel. Copy the actual AudioBufferList layout rather
+            // than assuming a non-interleaved Float32 input.
+            for index in 0..<sourceBuffers.count {
+                let source = sourceBuffers[index]
+                let destination = destinationBuffers[index]
+                guard let sourceData = source.mData, let destinationData = destination.mData else {
+                    return nil
+                }
+
+                let destinationByteCount = Int(destination.mDataByteSize)
+                let byteCount = min(Int(source.mDataByteSize), destinationByteCount)
+                guard byteCount > 0 else { return nil }
+                memcpy(destinationData, sourceData, byteCount)
+                if byteCount < destinationByteCount {
+                    memset(destinationData.advanced(by: byteCount), 0, destinationByteCount - byteCount)
                 }
             }
 
