@@ -41,9 +41,26 @@ import Foundation
 /// WindowServer must composite the frame. Driven by a CVDisplayLink bound to
 /// that display, so the beat is the display's own rather than a timer racing
 /// it.
+///
+/// THE CHANGE MUST BE MADE ON A LAYER, NOT ON THE WINDOW
+///
+/// The first version set `window.backgroundColor` each tick, which segfaulted
+/// the app roughly hourly:
+///
+///     objc_release
+///     -[_NSWindowTransformAnimation dealloc]
+///     CA::Transaction::commit()
+///
+/// Assigning that property runs AppKit's implicit-animation path and mints an
+/// `_NSWindowTransformAnimation` per assignment. Sixty a second overlap, and
+/// the Core Animation transaction ends up releasing one that is already gone.
+/// Window properties are built for occasional, animated changes; this needs the
+/// opposite, so it drives a CALayer directly with actions disabled and never
+/// touches the window again after it is placed.
 @MainActor
 final class TBKeepWarm {
     private var window: NSWindow?
+    private var layer: CALayer?
     private var link: CVDisplayLink?
     private var phase = false
 
@@ -78,13 +95,26 @@ final class TBKeepWarm {
         w.hasShadow = false
         w.ignoresMouseEvents = true
         w.level = .normal
+        // Nothing about this window should ever animate.
+        w.animationBehavior = .none
         // Present on every Space and in every app, so switching desktops does
         // not silently take the beat away.
         w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         w.backgroundColor = .black
         w.alphaValue = 1.0
+
+        // The layer is the only thing touched after this point.
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 1, height: 1))
+        view.wantsLayer = true
+        let l = CALayer()
+        l.frame = view.bounds
+        l.backgroundColor = CGColor(gray: 0.0, alpha: 1.0)
+        view.layer = l
+        w.contentView = view
+
         w.orderFrontRegardless()
         window = w
+        layer = l
 
         var displayLink: CVDisplayLink?
         guard CVDisplayLinkCreateWithCGDisplay(displayID, &displayLink) == kCVReturnSuccess,
@@ -116,15 +146,24 @@ final class TBKeepWarm {
         }
         window?.close()
         window = nil
+        layer = nil
     }
 
     /// One step of the alternation. Two greys one level apart: enough for
-    /// WindowServer to treat the window as dirty, not enough for an eye to see.
+    /// WindowServer to treat the layer as dirty, not enough for an eye to see.
+    ///
+    /// Inside an explicit transaction with actions disabled. Without that, Core
+    /// Animation would animate the colour change — which is both wrong (the
+    /// point is one discrete change per refresh, not a fade) and the shape of
+    /// the crash this replaced.
     private func tick() {
-        guard let window else { return }
+        guard let layer else { return }
         phase.toggle()
-        let v = phase ? 0.0 : 1.0 / 255.0
-        window.backgroundColor = NSColor(red: v, green: v, blue: v, alpha: 1.0)
+        let v: CGFloat = phase ? 0.0 : 1.0 / 255.0
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer.backgroundColor = CGColor(gray: v, alpha: 1.0)
+        CATransaction.commit()
     }
 
     // No deinit: a nonisolated one cannot touch these main-actor properties
