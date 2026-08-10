@@ -6,6 +6,7 @@ import Darwin
 import Foundation
 import AVFoundation
 import IOSurface
+import IOKit.pwr_mgt
 import Network
 @preconcurrency import ScreenCaptureKit
 import VideoToolbox
@@ -1210,6 +1211,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
     private var sentSnapshot = 0
     private var sessionAckSent = false
+    private var captureBlockedByScreenRecordingPermission = false
     private var fpsTimer: Timer?
     private var heartbeatTimer: Timer?
     private var firstFrameTimer: Timer?
@@ -1225,6 +1227,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var heartbeatSequence: UInt64 = 0
     private var statusState: TBDisplaySenderStatusState = .ready
     private var streamingActivity: NSObjectProtocol?
+    private var displayWakeAssertionID = IOPMAssertionID(0)
     private var lastCheckedCursor: NSCursor?
     private var lastCheckedCursorType: Int = 0
     private var baselineDisplayIDs = Set<CGDirectDisplayID>()
@@ -1634,19 +1637,43 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
     }
 
-    func stop(persistArrangement: Bool = true) {
-        stop(resetStatusTo: .stopped, persistArrangement: persistArrangement)
+    func stop(
+        persistArrangement: Bool = true,
+        completion: (@MainActor @Sendable () -> Void)? = nil
+    ) {
+        TBSenderAutomation.suspendAutomaticReconnectAfterUserStop()
+        stop(
+            resetStatusTo: .stopped,
+            persistArrangement: persistArrangement,
+            teardownReason: "sender_user_stop",
+            teardownCompletion: completion
+        )
+    }
+
+    /// Internal retry stop. Unlike a GUI Stop, this must not disable the
+    /// LaunchAgent marker that represents the user's monitor-mode choice.
+    func stopForAutomaticReconnect() {
+        stop(
+            resetStatusTo: .stopped,
+            persistArrangement: false,
+            teardownReason: "sender_internal_stop"
+        )
     }
 
     func persistExtendedDisplayArrangementSnapshot() {
         persistExtendedDisplayArrangementIfNeeded()
     }
 
-    private func stop(resetStatusTo status: TBDisplaySenderStatusState?, persistArrangement: Bool = true) {
+    private func stop(
+        resetStatusTo status: TBDisplaySenderStatusState?,
+        persistArrangement: Bool = true,
+        teardownReason: String = "sender_internal_stop",
+        teardownCompletion: (@MainActor @Sendable () -> Void)? = nil
+    ) {
+        let connectionToClose = connection
         if persistArrangement {
             persistExtendedDisplayArrangementIfNeeded()
         }
-        sendTeardown(reason: "sender_stop")
         connectTimeoutWorkItem?.cancel()
         connectTimeoutWorkItem = nil
         heartbeatTimer?.invalidate()
@@ -1671,19 +1698,20 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             scStream = nil
         }
         captureDelegate = nil
-        if let activity = streamingActivity {
-            ProcessInfo.processInfo.endActivity(activity)
-            streamingActivity = nil
-        }
+        endCaptureActivity()
         pipeline?.stop()
         pipeline = nil
         releaseInjectedModifiersIfNeeded()
         remoteHeldModifierKeyCodes.removeAll()
         injectedLeftClickTracker.reset()
         suppressedTriggerKeyCode = nil
-        connection?.stateUpdateHandler = nil
-        connection?.cancel()
+        connectionToClose?.stateUpdateHandler = nil
         connection = nil
+        sendTeardownAndClose(
+            reason: teardownReason,
+            over: connectionToClose,
+            completion: teardownCompletion
+        )
         let currentSession = session
         Task { @MainActor in
             currentSession.destroy()
@@ -1883,12 +1911,39 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         send(packet)
     }
 
-    private func sendTeardown(reason: String) {
+    private func sendTeardownAndClose(
+        reason: String,
+        over connection: NWConnection?,
+        completion: (@MainActor @Sendable () -> Void)? = nil
+    ) {
+        guard let connection else {
+            completion?()
+            return
+        }
         guard let packet = TBMonitorProtocol.makeJSONPacket(
             type: .teardown,
             value: TBMonitorTeardown(reason: reason)
-        ) else { return }
-        send(packet)
+        ) else {
+            connection.cancel()
+            completion?()
+            return
+        }
+
+        // Preserve the explicit user/internal reason before closing the socket.
+        // Otherwise the Receiver cannot distinguish Stop from a dropped cable.
+        connection.send(
+            content: packet,
+            contentContext: .finalMessage,
+            isComplete: true,
+            completion: .contentProcessed { _ in
+                connection.cancel()
+                guard let completion else { return }
+                Task { @MainActor in completion() }
+            }
+        )
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0) {
+            connection.cancel()
+        }
     }
 
     private func receiveLoop(on connection: NWConnection) {
@@ -2367,8 +2422,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return
             }
 
+            // A headless Sender may still expose a sleeping physical display.
+            // Wake and hold the graphical session before virtual display setup.
+            self.beginCaptureActivity()
             self.setStatus(.creatingVirtualDisplay)
-            self.baselineDisplayIDs = await self.fetchShareableDisplayIDs()
+            self.baselineDisplayIDs = self.captureSource == .extendedDesktop
+                ? await self.fetchShareableDisplayIDs()
+                : []
             let receiverKey = self.extendedDisplayIdentityKey(for: profile)
             let modeOverride: TBVirtualDisplayModeSize? = (self.matchRenderToStream && self.captureSource == .extendedDesktop)
                 ? self.capturePreset.renderMatchedDisplayMode
@@ -2393,13 +2453,15 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return
             }
             if self.captureSource == .desktopMirror {
-                let displayReady = await self.waitForOnlineDisplay(self.session.displayID)
-                let mirrorConfigured = displayReady && self.configureDesktopMirror(for: self.session.displayID)
-                if !mirrorConfigured {
-                    NSLog(
-                        "TargetBridge: unable to enable mirror mode for virtual display %u on first attempt; scheduling retry",
-                        self.session.displayID
-                    )
+                if CGDisplayIsInMirrorSet(self.session.displayID) == 0 {
+                    let displayReady = await self.waitForOnlineDisplay(self.session.displayID)
+                    let mirrorConfigured = displayReady && self.configureDesktopMirror(for: self.session.displayID)
+                    if !mirrorConfigured {
+                        NSLog(
+                            "TargetBridge: unable to enable mirror mode for virtual display %u on first attempt; scheduling retry",
+                            self.session.displayID
+                        )
+                    }
                 }
             }
             self.virtualDisplayText = TBDisplaySenderL10n.virtualDisplaySummary(
@@ -2416,10 +2478,21 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             // armed against a session that has already delivered frames — it then
             // tears down a healthy stream ~4s in. See onFirstFrame wiring below.
             self.sessionAckSent = false
+            self.captureBlockedByScreenRecordingPermission = false
             self.setStatus(.startingCapture(self.capturePreset.description, self.captureSource))
             let started = await self.startCapture(for: profile)
             guard started else {
-                self.stop(resetStatusTo: nil)
+                if self.captureBlockedByScreenRecordingPermission {
+                    self.captureBlockedByScreenRecordingPermission = false
+                    TBSenderAutomation.suspendAutomaticReconnectForRequiredPermission()
+                    self.stop(
+                        resetStatusTo: nil,
+                        persistArrangement: false,
+                        teardownReason: "sender_user_stop"
+                    )
+                } else {
+                    self.stop(resetStatusTo: nil)
+                }
                 return
             }
 
@@ -2436,6 +2509,16 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
     private func startCapture(for profile: TBMonitorDisplayProfile) async -> Bool {
         do {
+            guard CGPreflightScreenCaptureAccess() else {
+                captureBlockedByScreenRecordingPermission = true
+                _ = CGRequestScreenCaptureAccess()
+                setStatus(.captureDesktopError(
+                    TBDisplaySenderL10n.missingScreenRecordingPermission(language: language)
+                ))
+                TBLog.connection.error("capture: screen recording permission missing; automatic reconnect suspended")
+                return false
+            }
+
             let preset = capturePreset
             let usesRawNV12 = rawNV12Enabled(for: profile)
             let codecType = resolvedCodecType(for: preset, profile: profile)
@@ -2466,17 +2549,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
             let display: SCDisplay
             if captureSource == .desktopMirror {
-                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-                // In mirror mode both surfaces carry the same desktop. Prefer the
-                // receiver-native virtual surface to avoid rescaling the physical
-                // display to the Retina stream dimensions.
-                if session.displayID != kCGNullDirectDisplay,
-                   let virtualDisplay = content.displays.first(where: { $0.displayID == session.displayID }) {
-                    display = virtualDisplay
-                    TBLog.connection.info("capture: using receiver-native mirrored display id=\(virtualDisplay.displayID, privacy: .public)")
-                } else if let mainDisplay = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) {
-                    display = mainDisplay
-                    TBLog.connection.info("capture: receiver display unavailable; using main display id=\(mainDisplay.displayID, privacy: .public)")
+                if let mirrorDisplay = try await resolveMirrorCaptureDisplay() {
+                    display = mirrorDisplay
+                } else if let fallbackDisplayID = directMirrorFallbackDisplayID() {
+                    TBLog.connection.warning("capture: no virtual ScreenCaptureKit display; using direct fallback id=\(fallbackDisplayID, privacy: .public)")
+                    return startDirectDisplayStream(displayID: fallbackDisplayID, preset: preset)
                 } else {
                     return false
                 }
@@ -2550,10 +2627,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             scStream = stream
             isStreaming = true
             if largeCursor { startCursorUpdates(displayID: display.displayID) }
-            streamingActivity = ProcessInfo.processInfo.beginActivity(
-                options: activityOptions(),
-                reason: "TargetBridge streaming active"
-            )
+            beginCaptureActivity(wakeDisplay: false)
             startFPSTimer()
             startCaptureWatchdog()
             return true
@@ -2565,6 +2639,39 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             }
             return false
         }
+    }
+
+    /// Waking a headless graphical session is asynchronous. Poll briefly for a
+    /// receiver-native ScreenCaptureKit surface before using the direct fallback.
+    private func resolveMirrorCaptureDisplay() async throws -> SCDisplay? {
+        for attempt in 0..<30 {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            if session.displayID != kCGNullDirectDisplay,
+               let virtualDisplay = content.displays.first(where: { $0.displayID == session.displayID }) {
+                TBLog.connection.info("capture: using receiver-native mirrored display id=\(virtualDisplay.displayID, privacy: .public)")
+                return virtualDisplay
+            }
+            if let mainDisplay = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) {
+                TBLog.connection.info("capture: using main display id=\(mainDisplay.displayID, privacy: .public)")
+                return mainDisplay
+            }
+            if attempt == 0 {
+                TBLog.connection.info("capture: graphical session is waking; waiting for a shareable display")
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return nil
+    }
+
+    private func directMirrorFallbackDisplayID() -> CGDirectDisplayID? {
+        if session.displayID != kCGNullDirectDisplay, CGDisplayIsOnline(session.displayID) != 0 {
+            return session.displayID
+        }
+        let mainDisplayID = CGMainDisplayID()
+        if mainDisplayID != kCGNullDirectDisplay, CGDisplayIsOnline(mainDisplayID) != 0 {
+            return mainDisplayID
+        }
+        return nil
     }
 
     private func startDirectDisplayStream(displayID: CGDirectDisplayID, preset: TBDisplayCapturePreset) -> Bool {
@@ -2588,10 +2695,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         captureDisplayText = TBDisplaySenderL10n.captureDisplayCGDisplayStream(language, id: displayID)
         isStreaming = true
         if largeCursor { startCursorUpdates(displayID: displayID) }
-        streamingActivity = ProcessInfo.processInfo.beginActivity(
-            options: activityOptions(),
-            reason: "TargetBridge streaming active"
-        )
+        beginCaptureActivity(wakeDisplay: false)
         startFPSTimer()
         startCaptureWatchdog()
         return true
@@ -2603,6 +2707,38 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             options.insert(.idleDisplaySleepDisabled)
         }
         return options
+    }
+
+    private func beginCaptureActivity(wakeDisplay: Bool = true) {
+        if streamingActivity == nil {
+            streamingActivity = ProcessInfo.processInfo.beginActivity(
+                options: activityOptions(),
+                reason: "TargetBridge streaming active"
+            )
+        }
+        guard wakeDisplay, preventDisplaySleep else { return }
+
+        let result = IOPMAssertionDeclareUserActivity(
+            "TargetBridge capture requested" as CFString,
+            kIOPMUserActiveLocal,
+            &displayWakeAssertionID
+        )
+        if result == kIOReturnSuccess {
+            TBLog.connection.info("capture: requested graphical-session wake")
+        } else {
+            TBLog.connection.error("capture: unable to wake graphical session result=\(result, privacy: .public)")
+        }
+    }
+
+    private func endCaptureActivity() {
+        if displayWakeAssertionID != 0 {
+            IOPMAssertionRelease(displayWakeAssertionID)
+            displayWakeAssertionID = 0
+        }
+        if let activity = streamingActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            streamingActivity = nil
+        }
     }
 
     private func waitForCaptureDisplay() async throws -> SCDisplay {
@@ -3217,10 +3353,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             scStream = nil
         }
         captureDelegate = nil
-        if let activity = streamingActivity {
-            ProcessInfo.processInfo.endActivity(activity)
-            streamingActivity = nil
-        }
+        endCaptureActivity()
         pipeline?.stop()
         pipeline = nil
         isStreaming = false
@@ -3230,6 +3363,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         cursorDisplayID = kCGNullDirectDisplay
         lastCursorPacket = nil
 
+        beginCaptureActivity()
         let started = await startCapture(for: profile)
         if !started {
             NSLog("TargetBridge: soft restart after wake failed — falling back to full stop")
@@ -3287,7 +3421,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 } else {
                     setStatus(.noFirstFrame)
                 }
-                stop(resetStatusTo: nil)
+                TBSenderAutomation.suspendAutomaticReconnectAfterCaptureFailure()
+                stop(
+                    resetStatusTo: nil,
+                    persistArrangement: false,
+                    teardownReason: "sender_user_stop"
+                )
             }
         }
     }
