@@ -16,7 +16,7 @@
 
 CC       ?= clang
 PKG      ?= pkgconf
-APP_VERSION ?= 3.4.3
+APP_VERSION ?= 3.5.0
 APP_BUILD   ?= dev
 
 MACOSX_DEPLOYMENT_TARGET ?= 11.0
