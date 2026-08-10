@@ -99,7 +99,20 @@ final class TBKeepWarm {
         w.animationBehavior = .none
         // Present on every Space and in every app, so switching desktops does
         // not silently take the beat away.
-        w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        //
+        // `.fullScreenAuxiliary` is what covers fullscreen, and leaving it out
+        // was a real gap: a fullscreen app gets its own Space, and without this
+        // bit AppKit is free to leave the window out of it. Measured — with
+        // nothing fullscreen, every report read `idle 0`; with a fullscreen
+        // window on the virtual display, 27 of 40 reports had idle frames
+        // again, because the one thing generating damage was no longer being
+        // composited. The header is explicit: "Windows with this collection
+        // behavior can be shown with the fullscreen window."
+        //
+        // At most one of FullScreenPrimary / FullScreenAuxiliary / FullScreenNone
+        // may be set, so this is additive rather than a conflict.
+        w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle,
+                                .fullScreenAuxiliary]
         w.backgroundColor = .black
         w.alphaValue = 1.0
 
