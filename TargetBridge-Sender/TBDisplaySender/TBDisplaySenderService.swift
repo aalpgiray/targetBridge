@@ -2500,7 +2500,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             configuration.showsCursor = !largeCursor
             configuration.scalesToFit = true
             configuration.captureResolution = preset.captureResolution
-            configuration.capturesAudio = audioEnabled
+            configuration.capturesAudio = shouldRelayAudio
             configuration.excludesCurrentProcessAudio = true
             configuration.sampleRate = 48000
             configuration.channelCount = 2
@@ -2539,7 +2539,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 type: .screen,
                 sampleHandlerQueue: pipeline.queue
             )
-            if audioEnabled {
+            if shouldRelayAudio {
                 try stream.addStreamOutput(
                     delegate,
                     type: .audio,
@@ -3331,10 +3331,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func processAudio(_ sampleBuffer: CMSampleBuffer) {
-        guard audioEnabled else { return }
+        guard shouldRelayAudio else { return }
         guard let data = audioConverter.convert(sampleBuffer: sampleBuffer) else { return }
         let packet = TBMonitorProtocol.makePacket(type: .audioFrame, payload: data)
         send(packet)
+    }
+
+    private var shouldRelayAudio: Bool {
+        audioEnabled && audioAddonAvailable
     }
 
     private func send(_ packet: Data) {

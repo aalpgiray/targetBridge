@@ -241,14 +241,14 @@ final class TBDisplaySenderService: ObservableObject {
             largeCursor: largeCursor,
             preventDisplaySleep: preventDisplaySleep,
             autoRestartOnWake: autoRestartOnWake,
-            audioEnabled: audioEnabled && audioRelayAvailable,
+            audioEnabled: audioEnabled,
             verboseDisplayLogging: verboseDisplayLogging
         )
         if let previous = sessions.last {
             session.capturePreset = previous.capturePreset
             session.captureSource = previous.captureSource
             session.transportKind = previous.transportKind
-            session.audioEnabled = audioRelayAvailable && previous.audioEnabled
+            session.audioEnabled = previous.audioEnabled
             session.inputGestureMode = previous.inputGestureMode
         }
         session.audioAddonAvailable = audioRelayAvailable
@@ -281,6 +281,10 @@ final class TBDisplaySenderService: ObservableObject {
 
     private static let persistedSessionsKey = "fd.tbdisplaysender.sessions.v1"
     private static let receiverDisplayProfilesKey = "fd.tbdisplaysender.receiverDisplayProfiles.v1"
+    /// Earlier builds persisted `false` when the audio addon had not finished
+    /// loading. Repair that ambiguous state exactly once without making future
+    /// deliberate choices reversible.
+    private static let audioPreferenceRepairKey = "fd.tbdisplaysender.audioPreferenceRepaired.v2"
 
     /// Snapshot of the user-configurable settings for a single session. Transient
     /// runtime state (connection, FPS, …) is intentionally excluded — only the
@@ -355,6 +359,7 @@ final class TBDisplaySenderService: ObservableObject {
             return
         }
 
+        let repairPending = !UserDefaults.standard.bool(forKey: Self.audioPreferenceRepairKey)
         lastPersistedData = data
         for config in configs {
             let session = TBDisplaySenderSession(
@@ -362,13 +367,21 @@ final class TBDisplaySenderService: ObservableObject {
                 largeCursor: largeCursor,
                 preventDisplaySleep: preventDisplaySleep,
                 autoRestartOnWake: autoRestartOnWake,
-                audioEnabled: audioEnabled && audioRelayAvailable,
+                audioEnabled: audioEnabled,
                 verboseDisplayLogging: verboseDisplayLogging
             )
             apply(config, to: session)
             session.audioAddonAvailable = audioRelayAvailable
             attachSession(session)
             sessions.append(session)
+        }
+        if repairPending {
+            UserDefaults.standard.set(true, forKey: Self.audioPreferenceRepairKey)
+            // The repaired value was applied before the session observer was
+            // attached, so persist it explicitly rather than waiting for a
+            // later user action or letting the next launch restore `false`.
+            lastPersistedData = nil
+            persistSessions()
         }
         // Enforce the single-master invariant: only one session may hold a
         // non-`off` input role. (Persisted data should already satisfy this, but
@@ -408,7 +421,10 @@ final class TBDisplaySenderService: ObservableObject {
         session.receiverIP = config.receiverIP
         session.selectedReceiverID = config.selectedReceiverID
         session.localInterfaceIP = config.localInterfaceIP
-        session.audioEnabled = config.audioEnabled && audioRelayAvailable
+        session.audioEnabled = Self.restoredAudioEnabled(
+            from: config.audioEnabled,
+            repairPending: !UserDefaults.standard.bool(forKey: Self.audioPreferenceRepairKey)
+        )
         session.brightness = config.brightness
         session.volume = config.volume ?? 0.5
         session.matchRenderToStream = config.matchRenderToStream ?? false
@@ -463,7 +479,9 @@ final class TBDisplaySenderService: ObservableObject {
         session.captureSource = settings.captureSource
         session.capturePreset = settings.capturePreset
         session.matchRenderToStream = settings.matchRenderToStream
-        session.audioEnabled = settings.audioEnabled && audioRelayAvailable
+        if let audioEnabled = settings.audioEnabled {
+            session.audioEnabled = audioEnabled
+        }
 
         guard let receiverKey = receiverProfileKey(for: session) else { return }
         var profiles = persistedDisplayProfiles
@@ -644,9 +662,6 @@ final class TBDisplaySenderService: ObservableObject {
 
         for session in sessions {
             session.audioAddonAvailable = audioEnabled
-            if !audioEnabled {
-                session.audioEnabled = false
-            }
             if !networkLinkEnabled, session.transportKind == .networkLink {
                 session.transportKind = .thunderboltBridge
             }
@@ -659,6 +674,10 @@ final class TBDisplaySenderService: ObservableObject {
         normalizeSessionInterfaces()
         updateInputRelayController()
         sessions.forEach { $0.updateInputControlMode() }
+    }
+
+    nonisolated static func restoredAudioEnabled(from persistedValue: Bool, repairPending: Bool) -> Bool {
+        repairPending && !persistedValue ? true : persistedValue
     }
 
     private func updateInputRelayController() {

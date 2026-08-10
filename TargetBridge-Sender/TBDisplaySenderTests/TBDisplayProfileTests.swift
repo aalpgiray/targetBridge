@@ -8,7 +8,7 @@ final class TBDisplayProfileTests: XCTestCase {
         XCTAssertEqual(settings.captureSource, .extendedDesktop)
         XCTAssertEqual(settings.capturePreset, .native5k)
         XCTAssertTrue(settings.matchRenderToStream)
-        XCTAssertFalse(settings.audioEnabled)
+        XCTAssertNil(settings.audioEnabled)
     }
 
     func testLowLatencyPrioritizesSmoothVideoWithoutAudio() {
@@ -17,7 +17,7 @@ final class TBDisplayProfileTests: XCTestCase {
         XCTAssertEqual(settings.captureSource, .desktopMirror)
         XCTAssertEqual(settings.capturePreset, .smooth1440p60)
         XCTAssertFalse(settings.matchRenderToStream)
-        XCTAssertFalse(settings.audioEnabled)
+        XCTAssertNil(settings.audioEnabled)
     }
 
     func testPresentationUsesACompatibleMirrorProfileWithAudio() {
@@ -25,6 +25,12 @@ final class TBDisplayProfileTests: XCTestCase {
 
         XCTAssertEqual(settings.captureSource, .desktopMirror)
         XCTAssertEqual(settings.capturePreset, .standard1440p)
-        XCTAssertTrue(settings.audioEnabled)
+        XCTAssertEqual(settings.audioEnabled, true)
+    }
+
+    func testAudioPreferenceRepairRestoresOnlyTheAmbiguousDisabledState() {
+        XCTAssertTrue(TBDisplaySenderService.restoredAudioEnabled(from: false, repairPending: true))
+        XCTAssertFalse(TBDisplaySenderService.restoredAudioEnabled(from: false, repairPending: false))
+        XCTAssertTrue(TBDisplaySenderService.restoredAudioEnabled(from: true, repairPending: false))
     }
 }
