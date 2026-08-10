@@ -17,6 +17,66 @@ import Foundation
 @MainActor
 enum TBSenderAutomation {
     private static var didHandleLaunchArguments = false
+    private static var continuousConnectTask: Task<Void, Never>?
+
+    static func senderEnabledFlagURL(
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> URL {
+        homeDirectory
+            .appendingPathComponent("Library/Application Support/TargetBridge/Sender", isDirectory: true)
+            .appendingPathComponent("enabled", isDirectory: false)
+    }
+
+    static func suspendAutomaticReconnectAfterUserStop(
+        enabledFlagURL: URL? = nil,
+        fileManager: FileManager = .default
+    ) {
+        suspendAutomaticReconnect(
+            enabledFlagURL: enabledFlagURL,
+            fileManager: fileManager,
+            logReason: "user stopped session"
+        )
+    }
+
+    static func suspendAutomaticReconnectForRequiredPermission(
+        enabledFlagURL: URL? = nil,
+        fileManager: FileManager = .default
+    ) {
+        suspendAutomaticReconnect(
+            enabledFlagURL: enabledFlagURL,
+            fileManager: fileManager,
+            logReason: "screen recording permission required"
+        )
+    }
+
+    static func suspendAutomaticReconnectAfterCaptureFailure(
+        enabledFlagURL: URL? = nil,
+        fileManager: FileManager = .default
+    ) {
+        suspendAutomaticReconnect(
+            enabledFlagURL: enabledFlagURL,
+            fileManager: fileManager,
+            logReason: "capture produced no frames"
+        )
+    }
+
+    private static func suspendAutomaticReconnect(
+        enabledFlagURL: URL?,
+        fileManager: FileManager,
+        logReason: String
+    ) {
+        continuousConnectTask?.cancel()
+        continuousConnectTask = nil
+        let marker = enabledFlagURL ?? senderEnabledFlagURL()
+        do {
+            if fileManager.fileExists(atPath: marker.path) {
+                try fileManager.removeItem(at: marker)
+            }
+            NSLog("[automation] \(logReason); automatic reconnect suspended")
+        } catch {
+            NSLog("[automation] unable to clear automatic reconnect marker: \(error.localizedDescription)")
+        }
+    }
 
     /// Handle a `targetbridge://` URL (from `.onOpenURL`).
     static func handle(url: URL) {
@@ -65,17 +125,54 @@ enum TBSenderAutomation {
     private static func run(action: String, params: [String: String]) {
         switch action {
         case "connect":
-            Task { await connect(params) }
+            continuousConnectTask?.cancel()
+            if flagEnabled(params["retry"] ?? params["autoreconnect"] ?? params["auto-reconnect"]) {
+                continuousConnectTask = Task { await connectContinuously(params) }
+            } else {
+                continuousConnectTask = nil
+                Task { _ = await connect(params) }
+            }
         case "disconnect":
+            continuousConnectTask?.cancel()
+            continuousConnectTask = nil
             disconnect(params)
         default:
             NSLog("[automation] unknown action '\(action)' (expected connect|disconnect)")
         }
     }
 
-    private static func connect(_ params: [String: String]) async {
+    private static func connectContinuously(_ params: [String: String]) async {
+        var attempt = 0
+        while !Task.isCancelled {
+            attempt += 1
+            NSLog("[automation] automatic connection attempt \(attempt)")
+
+            if let session = await connect(params) {
+                if await waitForConnection(session) {
+                    NSLog("[automation] automatic connection active; monitoring link")
+                    while !Task.isCancelled && (session.isConnected || session.isStreaming) {
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    }
+                    guard !Task.isCancelled else { return }
+                    NSLog("[automation] connection lost; retrying")
+                } else {
+                    NSLog("[automation] connection attempt did not become active; retrying")
+                }
+
+                if !session.isConnected && !session.isStreaming {
+                    session.stopForAutomaticReconnect()
+                }
+            }
+
+            guard !Task.isCancelled else { return }
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+    }
+
+    @discardableResult
+    private static func connect(_ params: [String: String]) async -> TBDisplaySenderSession? {
         let service = TBDisplaySenderService.shared
-        guard let session = resolveSession(service, params["session"]) else { return }
+        guard let session = resolveSession(service, params["session"]) else { return nil }
 
         service.refreshLocalInterfaces()
 
@@ -83,16 +180,52 @@ enum TBSenderAutomation {
             session.transportKind = parseTransport(transport)
         }
 
+        let rawPath = params["path"] ?? params["connection-path"] ?? params["connection"]
+        let pathPreference: TBConnectionPathPreference?
+        if let rawPath {
+            guard let parsed = TBConnectionPathPreference.parse(rawPath) else {
+                NSLog("[automation] unknown connection path '\(rawPath)'; aborting connect")
+                return nil
+            }
+            pathPreference = parsed
+        } else {
+            pathPreference = nil
+        }
+
         let receiver = params["receiver"].flatMap { $0.isEmpty ? nil : $0 } ?? "auto"
         if receiver.lowercased() == "auto" {
             guard let discovered = await waitForReceiver(service) else {
                 NSLog("[automation] no receivers discovered; aborting connect")
-                return
+                return nil
             }
-            service.applyDiscoveredReceiver(discovered, to: session)
+            if let pathPreference {
+                guard let selected = await selectConnectionPath(
+                    receiver: discovered,
+                    preference: pathPreference,
+                    requestedLocalIP: params["localip"] ?? params["local-ip"]
+                ) else {
+                    NSLog("[automation] no working \(pathPreference.rawValue) path; aborting connect")
+                    return nil
+                }
+                apply(selected, receiver: discovered, to: session)
+            } else {
+                service.applyDiscoveredReceiver(discovered, to: session)
+            }
             session.selectedReceiverID = discovered.id
         } else if let discovered = service.discoveredReceivers.first(where: { matches(receiver, $0) }) {
-            service.applyDiscoveredReceiver(discovered, to: session)
+            if let pathPreference {
+                guard let selected = await selectConnectionPath(
+                    receiver: discovered,
+                    preference: pathPreference,
+                    requestedLocalIP: params["localip"] ?? params["local-ip"]
+                ) else {
+                    NSLog("[automation] no working \(pathPreference.rawValue) path to \(receiver); aborting connect")
+                    return nil
+                }
+                apply(selected, receiver: discovered, to: session)
+            } else {
+                service.applyDiscoveredReceiver(discovered, to: session)
+            }
             session.selectedReceiverID = discovered.id
         } else {
             // Treat as a raw IP / hostname (bypasses Bonjour).
@@ -100,7 +233,9 @@ enum TBSenderAutomation {
             session.selectedReceiverID = ""
         }
 
-        if let localIP = (params["localip"] ?? params["local-ip"]), !localIP.isEmpty {
+        if pathPreference == nil,
+           let localIP = (params["localip"] ?? params["local-ip"]),
+           !localIP.isEmpty {
             session.localInterfaceIP = localIP
         }
         if session.localInterfaceIP.isEmpty {
@@ -118,14 +253,15 @@ enum TBSenderAutomation {
 
         guard !session.receiverIP.isEmpty else {
             NSLog("[automation] no receiver IP resolved; aborting connect")
-            return
+            return nil
         }
         guard !session.localInterfaceIP.isEmpty else {
             NSLog("[automation] no local interface for transport \(session.transportKind.rawValue); aborting connect")
-            return
+            return nil
         }
-        NSLog("[automation] connecting to \(session.receiverIP) via \(session.transportKind.rawValue) — \(session.captureSource.rawValue)/\(session.capturePreset.rawValue)")
+        NSLog("[automation] connecting to \(session.receiverIP) from \(session.localInterfaceIP) via \(session.transportKind.rawValue) — \(session.captureSource.rawValue)/\(session.capturePreset.rawValue)")
         session.connect()
+        return session
     }
 
     private static func disconnect(_ params: [String: String]) {
@@ -202,6 +338,89 @@ enum TBSenderAutomation {
         return service.discoveredReceivers.first
     }
 
+    private static func selectConnectionPath(
+        receiver: TBDiscoveredReceiver,
+        preference: TBConnectionPathPreference,
+        requestedLocalIP: String?
+    ) async -> TBConnectionMeasurement? {
+        let allInterfaces = TBConnectionDiagnostics.currentIPv4Interfaces()
+        let eligibleInterfaces: [TBConnectionDiagnostics.LocalInterface]
+        if let requestedLocalIP, !requestedLocalIP.isEmpty {
+            eligibleInterfaces = allInterfaces.filter { $0.ip == requestedLocalIP }
+        } else {
+            eligibleInterfaces = allInterfaces
+        }
+
+        let allCandidates = TBConnectionDiagnostics.connectionCandidates(
+            receiver: receiver,
+            interfaces: eligibleInterfaces,
+            hardwareKinds: TBConnectionDiagnostics.hardwarePathKinds()
+        )
+        let candidates = allCandidates.filter { preference.allows($0.kind) }
+        guard !candidates.isEmpty else {
+            NSLog("[automation] no candidate interfaces/endpoints for path \(preference.rawValue)")
+            return nil
+        }
+
+        let measurements = await Task.detached(priority: .userInitiated) {
+            var values: [TBConnectionMeasurement] = []
+            for candidate in candidates {
+                guard !Task.isCancelled else { break }
+                NSLog("[automation] probing \(candidate.kind.rawValue): \(candidate.localIP) (\(candidate.localInterfaceName)) -> \(candidate.receiverIP)")
+                do {
+                    let measurement = try TBConnectionDiagnostics.probe(candidate)
+                    NSLog(
+                        "[automation] path \(candidate.kind.rawValue) measured \(String(format: "%.3f", measurement.throughputGbps)) Gbit/s, \(String(format: "%.2f", measurement.connectLatencyMilliseconds)) ms"
+                    )
+                    values.append(measurement)
+                } catch {
+                    NSLog("[automation] path \(candidate.kind.rawValue) unavailable: \(error.localizedDescription)")
+                }
+                usleep(100_000)
+            }
+            return values
+        }.value
+
+        guard let selected = TBConnectionDiagnostics.selectBestMeasurement(
+            measurements,
+            preference: preference
+        ) else { return nil }
+        NSLog(
+            "[automation] selected \(selected.candidate.kind.rawValue) on \(selected.candidate.localInterfaceName) at \(String(format: "%.3f", selected.throughputGbps)) Gbit/s"
+        )
+        return selected
+    }
+
+    private static func apply(
+        _ measurement: TBConnectionMeasurement,
+        receiver: TBDiscoveredReceiver,
+        to session: TBDisplaySenderSession
+    ) {
+        session.transportKind = measurement.candidate.transportKind
+        session.localInterfaceIP = measurement.candidate.localIP
+        session.receiverIP = measurement.candidate.receiverIP
+        session.receiverSupportsHEVCDecodeHint = receiver.supportsHEVCDecode
+    }
+
+    private static func waitForConnection(_ session: TBDisplaySenderSession) async -> Bool {
+        for _ in 0..<40 {
+            if session.isConnected || session.isStreaming { return true }
+            guard !Task.isCancelled else { return false }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return session.isConnected || session.isStreaming
+    }
+
+    static func flagEnabled(_ value: String?) -> Bool {
+        guard let value else { return false }
+        switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "0", "false", "no", "off":
+            return false
+        default:
+            return true
+        }
+    }
+
     // The pure parsing helpers below are `internal` (not `private`) so the
     // unit-test bundle can exercise them directly.
     static func matches(_ value: String, _ receiver: TBDiscoveredReceiver) -> Bool {
@@ -211,7 +430,11 @@ enum TBSenderAutomation {
         if let host = receiver.shortHostName?.lowercased(), host == needle { return true }
         return receiver.preferredIP.lowercased() == needle
             || receiver.thunderboltIP.lowercased() == needle
+            || receiver.usbIP.lowercased() == needle
+            || receiver.ethernetIP.lowercased() == needle
+            || receiver.wifiIP.lowercased() == needle
             || receiver.networkIP.lowercased() == needle
+            || receiver.resolvedIPv4Addresses.contains(where: { $0.lowercased() == needle })
     }
 
     static func parseTransport(_ value: String) -> TBTransportKind {

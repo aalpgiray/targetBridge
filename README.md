@@ -28,17 +28,18 @@ and improves the project. A special thank-you for this release goes to:
 
 - [@aalpgiray](https://github.com/aalpgiray) for receiver brightness, volume, Night Shift, and True Tone controls.
 - [@preggocl](https://github.com/preggocl) for the Apple Silicon and Intel Sender release build coverage.
+- [@Betafer](https://github.com/Betafer) for measured connection-path selection and Sender automation improvements.
 
-## TargetBridge 3.4.2
+## TargetBridge 3.5.0
 
-TargetBridge 3.4.2 adds receiver controls that make the remote display feel
-more like part of the sender workspace, improves reliability after wake, and
-ships pre-built Sender and Receiver apps for both Apple Silicon and Intel Macs:
+TargetBridge 3.5.0 makes automated connections more reliable while giving
+scripts a controlled way to choose the best available network route:
 
-- control receiver brightness and volume from the Sender menu
-- toggle receiver Night Shift and True Tone from the Sender when the receiver hardware supports them
-- retain receiver identity more reliably after wake and carry improved colour metadata through the session
-- download separate Apple Silicon and Intel Sender builds, with CI validating the architecture of every release artifact
+- use `--path auto` to measure compatible Thunderbolt, USB/USB4, Ethernet, and Wi-Fi paths and choose the fastest one
+- force a preferred route with `--path wired`, `thunderbolt`, `usb`, `ethernet`, or `wifi`
+- run a Sender connection in monitor mode with `--retry`, including safe recovery after a temporary Receiver or cable interruption
+- an explicit Stop or Quit cancels automatic retry, preventing unwanted reconnects
+- keep duplicate-desktop startup resilient when macOS delays publishing a ScreenCaptureKit display
 
 It also keeps the established multi-Mac workspace features:
 
@@ -72,6 +73,7 @@ It also keeps the established multi-Mac workspace features:
 - Input Dockstation, clipboard sync, master/slave roles, and Receiver Master shortcuts: [docs/Features.md#input-dockstation](docs/Features.md#input-dockstation)
 - Receiver device controls (brightness, volume, Night Shift, True Tone): [docs/Features.md#receiver-device-controls](docs/Features.md#receiver-device-controls)
 - Remote connection & automation (URL scheme, launch args, SSH, login/wake): [docs/Automation.md](docs/Automation.md)
+- Measured connection-path selection (Thunderbolt, USB/USB4, Ethernet, Wi-Fi): [docs/Automation.md#1-targetbridge-cli](docs/Automation.md#1-targetbridge-cli)
 - Shared translations (English, Italian, German, French, and Chinese): [docs/Features.md#shared-translations](docs/Features.md#shared-translations)
 - Thunderbolt networking extras (SSH/SFTP, file sharing, Internet Sharing): [docs/Features.md#thunderbolt-networking-extras](docs/Features.md#thunderbolt-networking-extras)
 
