@@ -166,6 +166,8 @@
   "receiver.language.auto": "Automatico",
   "receiver.status.waiting_for_sender": "in attesa del sender",
   "receiver.splash.connecting": "Connessione al MacBook in corso",
+  "receiver.menu.quit": "Esci da TargetBridge Receiver",
+  "receiver.menu.idle": "Nessuna trasmissione",
   "receiver.splash.waiting_first_frame": "In attesa del primo frame…",
   "receiver.status.waiting": "in attesa",
   "receiver.status.stream_active": "stream attivo",

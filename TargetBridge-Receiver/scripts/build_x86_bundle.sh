@@ -132,7 +132,7 @@ SOURCES=(
     "$SRC/tb_logship.c"
     "$CODEC/tb_dpcm.c"
     "$SRC/tb_gesture_bridge.m" "$SRC/tb_display_tweaks.m"
-    "$SRC/tb_mic_capture.m" "$SRC/tb_metal_plane.m" "$SRC/tb_health.m"
+    "$SRC/tb_mic_capture.m" "$SRC/tb_metal_plane.m" "$SRC/tb_health.m" "$SRC/tb_menubar.m"
 )
 for s in "${SOURCES[@]}"; do
     [ -f "$s" ] || { echo "!! missing source $s"; exit 1; }
@@ -158,7 +158,7 @@ clang -arch x86_64 -mmacosx-version-min=$MIN_MACOS -o "$OBJ/tbreceiver" "${objs[
     -framework CoreGraphics -framework CoreText -framework VideoToolbox \
     -framework CoreMedia -framework CoreVideo -framework IOSurface \
     -framework CoreServices -framework CoreAudio -framework AVFoundation \
-    -framework Metal -framework QuartzCore -framework IOKit
+    -framework Metal -framework QuartzCore -framework IOKit -framework Cocoa
 
 # ---------------------------------------------------------------- bundle
 echo "==> assembling bundle"
@@ -190,6 +190,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>CFBundleVersion</key><string>$VERSION</string>
 	<key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
 	<key>NSHighResolutionCapable</key><true/>
+	<!-- Menu-bar app: no Dock icon, no app-switcher entry. This machine is a
+	     monitor, and a monitor should not occupy a slot in Cmd-Tab. -->
+	<key>LSUIElement</key><true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>TargetBridge forwards this Mac's microphone to the sending Mac.</string>
 	<key>NSCameraUsageDescription</key>

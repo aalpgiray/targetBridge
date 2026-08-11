@@ -8,6 +8,7 @@
 
 #include "display.h"
 #include "tb_i18n.h"
+#include "tb_window_mode.h"
 #include "tb_gesture_bridge.h"
 #include "tb_metal_plane.h"
 
@@ -499,12 +500,33 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
 static void tb_disp_refresh_window_mode(struct tb_display *d) {
     if (!d || !d->win) return;
 
-    if ((d->is_connected || d->is_connecting) && d->preferred_fullscreen) {
+    /* The rule itself is in tb_window_mode.h, where it can be tested without a
+     * window server. This function is only the SDL half of it.
+     *
+     * Hidden rather than never created: Metal attaches lazily on the first frame
+     * (tb_metal_plane_init at render time), so the window is not needed early
+     * for that — but SDL_CreateWindow is entangled with SDL_Init, the renderer
+     * and the status texture at startup, and unpicking that ordering buys
+     * nothing a hidden window does not already give. Rendering into a hidden
+     * window is harmless; we simply do not. */
+    switch (tb_window_mode_for(d->is_connected, d->is_connecting,
+                               d->preferred_fullscreen)) {
+    case TB_WINDOW_FULLSCREEN:
+        SDL_ShowWindow(d->win);
         SDL_SetWindowFullscreen(d->win, SDL_WINDOW_FULLSCREEN_DESKTOP);
-    } else {
+        break;
+    case TB_WINDOW_WINDOWED:
+        SDL_ShowWindow(d->win);
         SDL_SetWindowFullscreen(d->win, 0);
         SDL_SetWindowSize(d->win, 980, 620);
         SDL_SetWindowPosition(d->win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        break;
+    case TB_WINDOW_HIDDEN:
+        /* Leaving fullscreen before hiding, not after: hiding a window that is
+         * still a fullscreen Space leaves the Space behind as an empty desktop. */
+        SDL_SetWindowFullscreen(d->win, 0);
+        SDL_HideWindow(d->win);
+        break;
     }
 
     const int should_hide_cursor =
@@ -630,8 +652,10 @@ struct tb_display *tb_disp_create(int fullscreen) {
     d->system_cursor_hidden = 0;
     d->last_video_frame_time = 0;
 
+    /* No unconditional show: refresh_window_mode has just decided, and with no
+     * session yet the answer is "stay hidden". Showing here anyway is what made
+     * the receiver flash a window at launch. */
     tb_disp_refresh_window_mode(d);
-    SDL_ShowWindow(d->win);
     return d;
 }
 
