@@ -116,6 +116,9 @@ want "receiver health telemetry"        1 "tb_health_start"        TargetBridge-
 want "health built into the receiver"   1 "tb_health"              TargetBridge-Receiver/TBReceiverC/Makefile
 want "wake-up measurement"              1 "tbWakeLong\|wakeLong"   TargetBridge-Sender/TBDisplaySender
 want "idle vs wedged discriminator"     1 "tbIdleInputGapMin"      TargetBridge-Sender/TBDisplaySender
+# The lossless path silently downgrading is the failure this whole file exists to
+# catch late; this makes it visible at runtime instead.
+want "resolved video path is logged"    1 "noteResolvedPath"       TargetBridge-Sender/TBDisplaySender
 
 echo "== build tooling ============================================"
 want "self-contained x86_64 bundle"     1 "build_x86_bundle"       TargetBridge-Receiver/scripts

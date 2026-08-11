@@ -678,6 +678,30 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// The compression ratio is worth seeing once per session, not 60 times a
     /// second.
     private var dpcmLogged = false
+    private var pathLogged = false
+
+    /// States, once per session, which video path actually carried a frame — and
+    /// when it is not the best one available, WHY.
+    ///
+    /// This exists because every downgrade in this file used to be silent. The
+    /// lossless path logged its compression ratio on success; the fallbacks
+    /// logged nothing at all, so "we quietly sent 4:2:0 NV12 instead" looked
+    /// exactly like "everything is fine" until somebody noticed it felt slow.
+    /// Diagnosing one such downgrade cost most of a day and three wrong
+    /// theories, every one of them an inference about which path was live that
+    /// could have been a fact instead.
+    ///
+    /// The existing "pipeline started ... codec=HEVC rawNV12=false" line is
+    /// actively misleading — it reports what was CONFIGURED, and reads the same
+    /// whether the frames then go out as HEVC, raw NV12 or lossless DPCM. This
+    /// one reports what happened.
+    private func noteResolvedPath(_ what: String) {
+        guard !pathLogged else { return }
+        pathLogged = true
+        // emit() already writes to os_log AND the durable file; logging here as
+        // well only duplicated it in Console.
+        TBTelemetryReporter.emit("video path: \(what)")
+    }
     private var framesSinceKeyframe = 0
     /// Set whenever a frame is skipped (backpressure) or anything else could
     /// have left the receiver's base image stale. Forces one full frame.
@@ -905,6 +929,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
             sendRawFrame(sampleBuffer)
             return
         }
+        noteResolvedPath("HEVC hardware encoder — preset \(preset.rawValue) is not raw passthrough, so the lossless path does not apply")
         guard running, let encoder = vtEncoder,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
@@ -1338,6 +1363,11 @@ private final class TBVideoPipeline: @unchecked Sendable {
             // the capture-side P3 conversion deposits sub-8-bit detail in the
             // low bits, and on the panel that detail is the difference between a
             // smooth gradient and a banded one.
+            if !dpcmEnabled {
+                // The single most likely reason to be sending 4:2:0 when 4:4:4
+                // lossless was expected, and it used to be invisible.
+                noteResolvedPath("RAW \(planar ? "NV12 4:2:0" : (isTenBit ? "10-bit 4:4:4" : "BGRA 4:4:4")) — the receiver did not advertise DPCM support")
+            }
             if dpcmEnabled {
                 if !dpcmGPUTried {
                     dpcmGPUTried = true
@@ -1346,6 +1376,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
                         TBLog.connection.info("dpcm: gpu encoder on \(String(cString: tb_dpcm_gpu_device_name(e)), privacy: .public)")
                     } else {
                         TBLog.connection.error("dpcm: gpu encoder unavailable; sending uncompressed")
+                        noteResolvedPath("RAW uncompressed — the DPCM GPU encoder could not be created")
                     }
                 }
                 // The encoder leaves room for the packet header ahead of the
@@ -1508,6 +1539,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
                             self.dpcmLogged = true
                             let raw = stride * height
                             TBLog.connection.info("dpcm: \(width, privacy: .public)x\(height, privacy: .public) \(isTenBit ? 10 : 8, privacy: .public)-bit \(raw / 1_000_000, privacy: .public) MB -> \(written / 1_000_000, privacy: .public) MB (\(String(format: "%.2fx", Double(raw) / Double(written)), privacy: .public)) \(sliceCount, privacy: .public) slice(s) async")
+                            self.noteResolvedPath("lossless DPCM · \(width)x\(height) \(isTenBit ? 10 : 8)-bit · \(sliceCount) slice(s) · \(String(format: "%.2fx", Double(raw) / Double(written)))")
                         }
                     })
 
