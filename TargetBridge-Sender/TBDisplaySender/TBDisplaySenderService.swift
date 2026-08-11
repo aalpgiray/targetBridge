@@ -1949,8 +1949,6 @@ private final class TBOnceFlag: @unchecked Sendable {
 @MainActor
 final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @unchecked Sendable {
     private static let receiverIPDefaultsKey = "fd.tbdisplaysender.receiverIP"
-    private static let fullColor444DefaultsKey = "fd.tbdisplaysender.fullColor444"
-    private static let tenBitDefaultsKey = "fd.tbdisplaysender.tenBit"
     private static let damageRectsDefaultsKey = "fd.tbdisplaysender.damageRects"
     private struct SavedExtendedDisplayArrangement {
         let x: Int32
@@ -2090,14 +2088,6 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     // Full-color 4:4:4: capture 8-bit BGRA instead of 4:2:0 NV12 — no chroma
     // subsampling, so colored edges/text are crisp. ~28 Gb/s at 5K@60, so it
     // realistically needs dual-cable. Raw presets only.
-    @Published var fullColor444 = UserDefaults.standard.bool(forKey: fullColor444DefaultsKey) {
-        didSet { UserDefaults.standard.set(fullColor444, forKey: Self.fullColor444DefaultsKey) }
-    }
-    /// 10-bit packed 2-10-10-10. Same 4 bytes/pixel as 8-bit BGRA, so it costs
-    /// no extra bandwidth — it only removes gradient banding. Needs `fullColor444`.
-    @Published var tenBit = UserDefaults.standard.bool(forKey: tenBitDefaultsKey) {
-        didSet { UserDefaults.standard.set(tenBit, forKey: Self.tenBitDefaultsKey) }
-    }
     /// Send only the rectangles that changed. Big win for static/desktop work;
     /// no help when the whole screen changes every frame (video, scrolling),
     /// where it adds per-rect overhead on top of a full frame. Default on.
@@ -3665,17 +3655,29 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 ? .zero
                 : CMTime(value: 1, timescale: Int32(preset.expectedFrameRate))
             configuration.queueDepth = preset.queueDepth
-            // Full-color 4:4:4 raw = capture packed BGRA; otherwise 4:2:0 NV12.
-            // 10-bit uses packed 2-10-10-10, which is also 4 bytes/pixel — same
-            // bandwidth and same per-frame cost as 8-bit BGRA, just finer
-            // gradients. Requires 4:4:4 (there is no subsampled 10-bit here).
-            if fullColor444 && tenBit && preset.isRawPassthrough {
+            // The preset decides the format. Nothing else.
+            //
+            // This used to be a conjunction — fullColor444 && tenBit &&
+            // isRawPassthrough — with two user toggles feeding it and a silent
+            // fall-through to 4:2:0 NV12 if any of them was off. That is three
+            // ways to end up subsampled while believing you asked for lossless,
+            // and it cost a day: the toggles were both ON and the path still
+            // resolved to NV12, which nothing logged. A raw-passthrough preset
+            // means lossless 4:4:4 now; there is no other way to configure it,
+            // so it cannot half-apply.
+            //
+            // 10-bit is unconditional on that path because it is free: packed
+            // 2-10-10-10 is 4 bytes/pixel, exactly like 8-bit BGRA, so it costs
+            // the same bandwidth and the same per-frame work and only removes
+            // gradient banding. There was never a reason to offer 8-bit 4:4:4 as
+            // a choice — it is strictly worse at identical cost.
+            if preset.isRawPassthrough {
                 configuration.pixelFormat = kCVPixelFormatType_ARGB2101010LEPacked
                 // Requesting a colour space makes SCK convert, and a conversion
                 // computed at 10-bit precision fabricates low-order bits out of
                 // 8-bit input — which makes the "is this really 10-bit?" probe
-                // below meaningless. TB_RAW_NO_COLORSPACE=1 skips it so the
-                // captured values are whatever the framebuffer actually holds.
+                // meaningless. TB_RAW_NO_COLORSPACE=1 skips it so the captured
+                // values are whatever the framebuffer actually holds.
                 if ProcessInfo.processInfo.environment["TB_RAW_NO_COLORSPACE"] != "1" {
                     configuration.colorSpaceName = CGColorSpace.displayP3
                 }
@@ -3687,8 +3689,6 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 // above white. Carrying EDR properly would need a float
                 // container at 8 bytes/pixel, which buys nothing while the
                 // virtual display's framebuffer is 8-bit.
-            } else if fullColor444 && preset.isRawPassthrough {
-                configuration.pixelFormat = kCVPixelFormatType_32BGRA
             } else {
                 configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
             }

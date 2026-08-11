@@ -622,13 +622,6 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                         .disabled(session.isConnected || session.isStreaming)
                     }
 
-                    settingRow(fullColorTitle, details: fullColorDetails) {
-                        Toggle("", isOn: $session.fullColor444)
-                            .labelsHidden()
-                            .disabled(session.isConnected || session.isStreaming)
-                    }
-
-
                     // Not disabled while streaming: installing the driver is
                     // independent of the session, and someone who has just
                     // discovered audio is not working should not have to stop
@@ -636,20 +629,6 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                     if service.audioDriverAvailable {
                         settingRow(audioDriverTitle, details: audioDriverDetails) {
                             audioDriverControl
-                        }
-                    }
-
-                    settingRow(damageRectsTitle, details: damageRectsDetails) {
-                        Toggle("", isOn: $session.damageRects)
-                            .labelsHidden()
-                            .disabled(session.isConnected || session.isStreaming)
-                    }
-
-                    if session.fullColor444 {
-                        settingRow(tenBitTitle, details: tenBitDetails) {
-                            Toggle("", isOn: $session.tenBit)
-                                .labelsHidden()
-                                .disabled(session.isConnected || session.isStreaming)
                         }
                     }
 
@@ -1087,22 +1066,6 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         }
     }
 
-    private var fullColorTitle: String {
-        switch service.language {
-        case .italian: return "Colore pieno 4:4:4"
-        case .english: return "Full color (4:4:4)"
-        case .french: return "Couleur complète (4:4:4)"
-        case .german: return "Vollfarbe (4:4:4)"
-        case .chinese: return "全彩 4:4:4"
-        }
-    }
-    private var fullColorDetails: String {
-        switch service.language {
-        case .english: return "Send uncompressed 8-bit RGB (no chroma subsampling) for crisp colored edges/text. ~28 Gb/s at 5K@60 — pair with Dual cable. Raw presets only."
-        case .french: return "Envoie du RVB 8 bits non compressé (sans sous-échantillonnage de chrominance). ~28 Gb/s en 5K@60. Presets raw uniquement."
-        default: return "Invia RGB 8-bit non compresso (nessun sottocampionamento croma). ~28 Gb/s a 5K@60 — usare con Doppio cavo. Solo preset raw."
-        }
-    }
     // MARK: - Audio driver
 
     /// Status plus the one action that makes sense for it. The driver lives in
@@ -1229,38 +1192,6 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         }
     }
 
-    private var damageRectsTitle: String {
-        switch service.language {
-        case .italian: return "Solo aree modificate"
-        case .english: return "Send changed areas only"
-        case .french: return "Envoyer uniquement les zones modifiées"
-        case .german: return "Nur geänderte Bereiche"
-        case .chinese: return "仅发送变化区域"
-        }
-    }
-    private var damageRectsDetails: String {
-        switch service.language {
-        case .english: return "Send only the parts of the screen that changed. Large gain for desktop work (60 fps even at 10-bit 4:4:4); no benefit for video or scrolling, where the whole screen changes every frame. Raw presets only."
-        case .french: return "N'envoie que les parties modifiées de l'écran. Grand gain pour le travail bureautique ; aucun bénéfice pour la vidéo ou le défilement. Presets raw uniquement."
-        default: return "Invia solo le aree dello schermo che cambiano. Grande vantaggio per il lavoro desktop; nessun beneficio con video o scorrimento. Solo preset raw."
-        }
-    }
-    private var tenBitTitle: String {
-        switch service.language {
-        case .italian: return "10 bit per canale"
-        case .english: return "10-bit color"
-        case .french: return "Couleur 10 bits"
-        case .german: return "10-Bit-Farbe"
-        case .chinese: return "10 位色彩"
-        }
-    }
-    private var tenBitDetails: String {
-        switch service.language {
-        case .english: return "Packed 2-10-10-10: also 4 bytes/pixel, so it costs no extra bandwidth over 8-bit 4:4:4 — it only removes gradient banding."
-        case .french: return "2-10-10-10 compressé : également 4 octets/pixel, donc aucune bande passante supplémentaire — supprime seulement les bandes dans les dégradés."
-        default: return "2-10-10-10 compresso: sempre 4 byte/pixel, nessuna banda passante extra rispetto a 8-bit 4:4:4 — elimina solo le bande nei gradienti."
-        }
-    }
     private var renderMatchingTitle: String {
         switch service.language {
         case .italian: return "Rendering alla risoluzione dello stream"
