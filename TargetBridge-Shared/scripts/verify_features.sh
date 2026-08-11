@@ -123,6 +123,14 @@ want "auto-cast tests"                    1 "TBAutoCastTests"      TargetBridge-
 echo "== latency work ============================================"
 want "keep-warm implementation"         1 "TBKeepWarm"             TargetBridge-Sender/TBDisplaySender
 want "keep-warm actually started"       1 "keepWarm.start"         TargetBridge-Sender/TBDisplaySender
+# One deleted line reinstates a double-release that segfaults on every teardown
+# path (cable pull, unlock) with a stack naming nothing of ours. See TBKeepWarm.
+want "keep-warm window over-release fix" 1 "isReleasedWhenClosed"  TargetBridge-Sender/TBDisplaySender
+want "keep-warm survives display loss"  1 "didChangeScreenParametersNotification" TargetBridge-Sender/TBDisplaySender
+want "keep-warm regression tests"       1 "TBKeepWarmTests"        TargetBridge-Sender/TBDisplaySenderTests
+# Without this, unplugging leaves the session alive for the ~10s TCP takes to
+# give up: virtual display still on screen, frames into a socket nobody reads.
+want "link-loss detected by viability"  1 "viabilityUpdateHandler" TargetBridge-Sender/TBDisplaySender
 # Damage rectangles were built, measured at 0 rect / 49440 whole frames, and
 # removed. Assert the ABSENCE: reintroducing the wire types by merge would have
 # the sender emit packets no receiver handles.

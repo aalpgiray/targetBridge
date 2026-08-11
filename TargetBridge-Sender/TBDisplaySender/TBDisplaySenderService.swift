@@ -2325,6 +2325,33 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         )
         connection = conn
 
+        // Unplugging the cable does not fail the connection — it just stops
+        // being deliverable. TCP has no idea the peer became unreachable, so it
+        // retransmits until it gives up, and for about ten seconds the session
+        // looks alive: the virtual display stays on screen, capture keeps
+        // running, frames go into a socket nobody is reading. Only then does the
+        // state handler fire and teardown begin.
+        //
+        // Viability is the signal for exactly this. Network.framework reports
+        // the path becoming undeliverable within about a second of the interface
+        // going away, which turns unplug into a prompt, ordinary teardown — and
+        // leaves auto-cast a clean slate, so plugging back in reconnects instead
+        // of finding a session that still believes in itself.
+        //
+        // Non-viable is not always permanent (Wi-Fi roaming recovers), but for
+        // this link it is: the transport is a cable, and the interface it was
+        // pinned to no longer exists. Treating it as the end is right here and
+        // still safe elsewhere, because reconnecting is cheap.
+        conn.viabilityUpdateHandler = { [weak self, weak conn] viable in
+            guard !viable else { return }
+            Task { @MainActor [weak self, weak conn] in
+                guard let self, let conn, self.connection === conn else { return }
+                guard self.isConnected || self.isStreaming else { return }
+                TBLog.connection.notice("connect: path went non-viable (cable or interface gone); tearing down")
+                self.stop(resetStatusTo: .connectionFailed("Link lost — cable or interface went away"))
+            }
+        }
+
         conn.stateUpdateHandler = { [weak self, weak conn] state in
             Task { @MainActor [weak self, weak conn] in
                 guard let self, let conn, self.connection === conn else { return }
@@ -2560,6 +2587,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         injectedLeftClickTracker.reset()
         suppressedTriggerKeyCode = nil
         connection?.stateUpdateHandler = nil
+        // Cleared with the state handler, not left dangling: cancel() drives the
+        // path non-viable on its way down, and a live handler would re-enter
+        // teardown from inside teardown.
+        connection?.viabilityUpdateHandler = nil
         connection?.cancel()
         connection = nil
         let currentSession = session

@@ -63,6 +63,10 @@ final class TBKeepWarm {
     private var layer: CALayer?
     private var link: CVDisplayLink?
     private var phase = false
+    /// The display we are pinned to, so a screen-parameters change can tell
+    /// whether it is still there. nil whenever we are stopped.
+    private var displayID: CGDirectDisplayID?
+    private var screenObserver: NSObjectProtocol?
 
     static var isEnabled: Bool {
         (UserDefaults.standard.object(forKey: "TBKeepWarm") as? Bool) ?? true
@@ -97,6 +101,20 @@ final class TBKeepWarm {
         w.level = .normal
         // Nothing about this window should ever animate.
         w.animationBehavior = .none
+        // MUST be false, and this line is load-bearing. An NSWindow built with
+        // init(contentRect:…) defaults to releasing itself on close, which is a
+        // manual-retain-counting convention ARC knows nothing about: `close()`
+        // sends one release, and the strong `window` property sends another when
+        // it is cleared. The object dies once too often.
+        //
+        // The symptom is not a crash in stop(). It is a segfault later, in
+        // objc_release under -[NSAutoreleasePool drain] on the main thread, with
+        // a stack that names nothing of ours — because the over-release is only
+        // discovered when the pool gets round to the corpse. It cost most of a
+        // day to find, twice, appearing as "crashes when I unplug the cable" and
+        // "crashes when I unlock the Mac". Both are just teardown paths that
+        // reach stop().
+        w.isReleasedWhenClosed = false
         // Present on every Space and in every app, so switching desktops does
         // not silently take the beat away.
         //
@@ -148,18 +166,57 @@ final class TBKeepWarm {
         }, ctx)
         CVDisplayLinkStart(displayLink)
         link = displayLink
+        self.displayID = displayID
+        observeScreenChanges()
 
         TBLog.connection.notice("keep-warm: on (display \(displayID, privacy: .public)) — TBKeepWarm=false disables")
     }
 
     func stop() {
+        if let observer = screenObserver {
+            NotificationCenter.default.removeObserver(observer)
+            screenObserver = nil
+        }
         if let link {
             CVDisplayLinkStop(link)
+            // Detach the callback before dropping the last reference.
+            // CVDisplayLinkStop does not wait for a callback that is already
+            // running, so releasing the link here can pull it out from under its
+            // own thread. Clearing the callback first means the worst case is a
+            // callback that returns without touching us.
+            CVDisplayLinkSetOutputCallback(link, nil, nil)
             self.link = nil
         }
+        // orderOut first: closing a window that still belongs to a display being
+        // torn down invites AppKit to reposition it mid-teardown, which is the
+        // same window of time the cable pull opens.
+        window?.orderOut(nil)
         window?.close()
         window = nil
         layer = nil
+        displayID = nil
+    }
+
+    /// Stop of our own accord if the display we are pinned to disappears.
+    ///
+    /// The teardown path already calls stop(), but not necessarily first: pulling
+    /// the cable destroys the virtual display, and until the session notices we
+    /// would be driving a CVDisplayLink bound to a display that no longer exists
+    /// and holding a window positioned on it. Ending promptly and on the main
+    /// thread is cheaper than being resilient to every way that can go wrong.
+    private func observeScreenChanges() {
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, let id = self.displayID else { return }
+                guard CGDisplayBounds(id).isEmpty else { return }
+                TBLog.connection.notice("keep-warm: display \(id, privacy: .public) went away; stopping")
+                self.stop()
+            }
+        }
     }
 
     /// One step of the alternation. Two greys one level apart: enough for
