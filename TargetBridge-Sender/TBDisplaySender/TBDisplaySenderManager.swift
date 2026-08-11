@@ -117,6 +117,7 @@ final class TBDisplaySenderService: ObservableObject {
             guard let self else { return }
             discoveredReceivers = receivers
             pushLanguageUpdateToDiscoveredReceivers()
+            evaluateAutoCast()
             objectWillChange.send()
         }
         addonCancellable = addonStore.$addons.sink { [weak self] addons in
@@ -327,6 +328,8 @@ final class TBDisplaySenderService: ObservableObject {
         var inputControlRole: String?
         var inputBindings: [TBInputBinding]?
         var matchRenderToStream: Bool?
+        /// Optional: sessions saved before auto-cast existed decode as nil = off.
+        var autoCastEnabled: Bool?
     }
 
     private var lastPersistedData: Data?
@@ -361,7 +364,8 @@ final class TBDisplaySenderService: ObservableObject {
                 volume: session.volume,
                 inputControlRole: session.inputControlRole.rawValue,
                 inputBindings: session.inputBindings,
-                matchRenderToStream: session.matchRenderToStream
+                matchRenderToStream: session.matchRenderToStream,
+                autoCastEnabled: session.autoCastEnabled
             )
         }
         guard let data = try? JSONEncoder().encode(configs) else { return }
@@ -447,6 +451,7 @@ final class TBDisplaySenderService: ObservableObject {
         session.brightness = config.brightness
         session.volume = config.volume ?? 0.5
         session.matchRenderToStream = config.matchRenderToStream ?? false
+        session.autoCastEnabled = config.autoCastEnabled ?? false
     }
 
     func refreshLocalInterfaces() {
@@ -755,6 +760,50 @@ final class TBDisplaySenderService: ObservableObject {
             if session.localInterfaceIP.isEmpty || !validIPs.contains(session.localInterfaceIP) {
                 session.localInterfaceIP = fallbackIP
             }
+        }
+    }
+
+    /// Called on every discovery update. Cheap and side-effect-free unless
+    /// TBAutoCast actually says to dial — the decision itself lives there so it
+    /// can be tested without Bonjour.
+    private func evaluateAutoCast() {
+        let candidateIDs = discoveredReceivers.map(\.id)
+        let visibleServices = Set(candidateIDs.map(TBAutoCast.serviceName(ofReceiverID:)))
+
+        for session in sessions {
+            // Re-arm first: a deliberate disconnect is only honoured until the
+            // receiver actually leaves. Unplugging and plugging back in is how a
+            // person says "yes, again" — without this the suppression would be
+            // permanent for the rest of the launch.
+            if session.autoCastSuppressedByManualStop,
+               !visibleServices.contains(TBAutoCast.serviceName(ofReceiverID: session.selectedReceiverID)) {
+                session.autoCastSuppressedByManualStop = false
+                session.lastAutoCastAttempt = nil
+            }
+
+            let decision = TBAutoCast.decide(TBAutoCast.Input(
+                enabled: session.autoCastEnabled,
+                sessionIsBusy: session.isBusyForAutoCast,
+                rememberedReceiverID: session.selectedReceiverID,
+                suppressedByManualStop: session.autoCastSuppressedByManualStop,
+                secondsSinceLastAttempt: session.lastAutoCastAttempt.map { -$0.timeIntervalSinceNow },
+                candidateIDs: candidateIDs
+            ))
+
+            guard case .connect(let receiverID) = decision else { continue }
+            guard let receiver = discoveredReceivers.first(where: { $0.id == receiverID }) else { continue }
+
+            session.lastAutoCastAttempt = Date()
+            // Re-apply the receiver rather than trusting the stored IP: the match
+            // was made on service name precisely because the address may have
+            // moved since it was persisted.
+            applyDiscoveredReceiver(receiver, to: session)
+            session.selectedReceiverID = receiver.id
+            if session.localInterfaceIP.isEmpty {
+                session.localInterfaceIP = defaultLocalInterfaceIP(for: session.transportKind)
+            }
+            NSLog("[autocast] \(receiver.serviceName) appeared at \(session.receiverIP); connecting")
+            session.connect()
         }
     }
 

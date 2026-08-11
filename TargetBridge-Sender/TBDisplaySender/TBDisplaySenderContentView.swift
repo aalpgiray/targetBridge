@@ -589,6 +589,13 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                             .font(.system(.body, design: .monospaced))
                             .disabled(session.isConnected || session.isStreaming)
                     }
+
+                    // Deliberately NOT disabled while connected: turning auto-cast
+                    // off mid-session is exactly when someone reaches for it.
+                    settingRow(autoCastTitle, details: autoCastDetails) {
+                        Toggle("", isOn: $session.autoCastEnabled)
+                            .labelsHidden()
+                    }
                 }
 
                 settingsSection(title: outputSettingsTitle) {
@@ -1191,6 +1198,26 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
         case .german: return "In diesem Build nicht enthalten"
         case .chinese: return "此版本未包含"
         case .french: return "Non inclus dans cette version"
+        }
+    }
+
+    private var autoCastTitle: String {
+        switch service.language {
+        case .italian: return "Trasmetti automaticamente"
+        case .english: return "Cast automatically"
+        case .german: return "Automatisch übertragen"
+        case .french: return "Diffuser automatiquement"
+        case .chinese: return "自动投送"
+        }
+    }
+
+    private var autoCastDetails: String {
+        switch service.language {
+        case .italian: return "Si connette da sé quando il ricevitore scelto ricompare in rete, ad esempio quando colleghi il cavo. Se interrompi tu la sessione, non riprende finché il ricevitore non scompare e torna."
+        case .english: return "Connects on its own when the receiver you picked shows up on the network again — plugging the cable back in, for instance. If you disconnect by hand it stays off until the receiver leaves and returns."
+        case .german: return "Verbindet selbstständig, sobald der gewählte Empfänger wieder im Netzwerk erscheint, etwa beim Einstecken des Kabels. Nach manuellem Trennen bleibt es aus, bis der Empfänger verschwindet und zurückkehrt."
+        case .french: return "Se connecte de lui-même lorsque le récepteur choisi réapparaît sur le réseau, par exemple en rebranchant le câble. Après une déconnexion manuelle, il reste inactif jusqu’à ce que le récepteur disparaisse puis revienne."
+        case .chinese: return "所选接收端重新出现在网络上时（例如重新插上线缆）会自动连接。若你手动断开，则须等接收端离开并再次出现后才恢复。"
         }
     }
 

@@ -1932,6 +1932,28 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// downsample and the GPU cost of rendering pixels that get thrown away.
     @Published var matchRenderToStream: Bool = false
 
+    /// Start casting on its own when this session's configured receiver appears
+    /// on the network — see TBAutoCast for the rule and why it is separated out.
+    /// Off by default: a Mac that dials out the moment it sees a familiar service
+    /// name has to be something the user asked for.
+    @Published var autoCastEnabled: Bool = false
+
+    /// Set when the user stops this session by hand, so auto-cast does not undo
+    /// the disconnect a second later. Cleared when the receiver actually leaves
+    /// the network, which is what makes the next plug-in re-arm it. Runtime only
+    /// — a deliberate disconnect should not outlive a relaunch.
+    var autoCastSuppressedByManualStop = false
+
+    /// Last dial attempt, for the retry backoff. Discovery republishes far more
+    /// often than a person would expect.
+    var lastAutoCastAttempt: Date?
+
+    /// Anything where a second dial would be wrong. `connection != nil` is the
+    /// part `isConnected` misses: it covers the in-flight window between dialling
+    /// and being connected, which is exactly when redundant discovery callbacks
+    /// arrive.
+    var isBusyForAutoCast: Bool { isConnected || isStreaming || connection != nil }
+
     @Published var capturePreset: TBDisplayCapturePreset = .standard1440p {
         didSet {
             if !isStreaming {
@@ -2484,6 +2506,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     func stop(persistArrangement: Bool = true) {
+        /// This entry point is the deliberate one — the Disconnect button and the
+        /// automation verb. Every involuntary stop (link drop, dial failure,
+        /// receiver teardown) goes to the private overload instead, and must NOT
+        /// suppress auto-cast: recovering from those is the whole point.
+        autoCastSuppressedByManualStop = true
         stop(resetStatusTo: .stopped, persistArrangement: persistArrangement)
     }
 
