@@ -3609,7 +3609,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             let preset = capturePreset
             let usesRawNV12 = rawNV12Enabled(for: profile)
             let codecType = resolvedCodecType(for: preset, profile: profile)
-            let codecName = usesRawNV12 ? "NV12 RAW" : codecName(for: codecType)
+            // A raw-passthrough preset bypasses the hardware encoder entirely, so
+            // naming it after codecType was reporting a codec that never runs —
+            // the panel read "(5K, HEVC)" while sending bit-exact 10-bit 4:4:4.
+            let codecName = preset.isRawPassthrough
+                ? preset.codecName
+                : (usesRawNV12 ? "NV12 RAW" : codecName(for: codecType))
             activeCodecType = usesRawNV12 ? nil : codecType
             activeCodecName = codecName
             guard let connection else { return false }
