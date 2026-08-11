@@ -511,11 +511,23 @@ enum TBDisplaySenderL10n {
     }
 
     static func streamSummary(preset: TBDisplayCapturePreset, source: TBDisplayCaptureSource, language: TBDisplaySenderLanguage, codecName: String? = nil) -> String {
-        text("sender.stream_summary", language, [
+        let title = preset.title(language)
+        let codec = codecName ?? preset.codecName
+        // When the preset IS the codec, naming both says the same word twice:
+        // "(5K Lossless, Lossless)". Drop the codec rather than the title — the
+        // title is what the user picked and recognises.
+        if codec.caseInsensitiveCompare(title) == .orderedSame || title.localizedCaseInsensitiveContains(codec) {
+            return text("sender.stream_summary_preset_only", language, [
+                "source": source.title(language),
+                "description": preset.description,
+                "preset": title
+            ])
+        }
+        return text("sender.stream_summary", language, [
             "source": source.title(language),
             "description": preset.description,
-            "preset": preset.title(language),
-            "codec": codecName ?? preset.codecName
+            "preset": title,
+            "codec": codec
         ])
     }
 

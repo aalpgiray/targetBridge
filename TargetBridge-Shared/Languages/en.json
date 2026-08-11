@@ -74,6 +74,7 @@
   "sender.receiver_summary": "%{name}: panel %{panelWidth}x%{panelHeight}, mode %{modeWidth}x%{modeHeight} HiDPI",
   "sender.virtual_display_summary": "%{name} (%{id})",
   "sender.stream_summary": "%{source} · %{description} (%{preset}, %{codec})",
+  "sender.stream_summary_preset_only": "%{source} · %{description} (%{preset})",
   "sender.error.screen_recording_permission": "TargetBridge does not have Screen Recording permission. Check Privacy & Security > Screen Recording.",
   "sender.error.sck_permission_mismatch": "ScreenCaptureKit failed even though Screen Recording permission appears granted. Details: %{details}",
   "sender.cable_test.button": "Run Cable Test",

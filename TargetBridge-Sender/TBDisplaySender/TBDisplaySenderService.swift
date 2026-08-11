@@ -158,7 +158,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         case .native5k:
             return "5120 × 2880 @ 48"
         case .native5kRaw60:
-            return "5120 × 2880 @ 60 · lossless 10-bit"
+            return "5120 × 2880 @ 60"
         case .native5k60Experimental:
             return "5120 × 2880 @ 60"
         }

@@ -74,6 +74,7 @@
   "sender.receiver_summary": "%{name}：面板 %{panelWidth}x%{panelHeight}，模式 %{modeWidth}x%{modeHeight} HiDPI",
   "sender.virtual_display_summary": "%{name}（%{id}）",
   "sender.stream_summary": "%{source} · %{description}（%{preset}，%{codec}）",
+  "sender.stream_summary_preset_only": "%{source} · %{description}（%{preset}，%{codec}）",
   "sender.error.screen_recording_permission": "TargetBridge 没有「屏幕录制」权限。请前往「隐私与安全性 → 屏幕录制」检查。",
   "sender.error.sck_permission_mismatch": "屏幕录制权限看起来已授予，但 ScreenCaptureKit 仍然失败。详情：%{details}",
   "sender.cable_test.button": "运行线缆测试",

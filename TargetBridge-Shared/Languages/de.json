@@ -74,6 +74,7 @@
   "sender.receiver_summary": "%{name}: Panel %{panelWidth}x%{panelHeight}, Modus %{modeWidth}x%{modeHeight} HiDPI",
   "sender.virtual_display_summary": "%{name} (%{id})",
   "sender.stream_summary": "%{source} · %{description} (%{preset}, %{codec})",
+  "sender.stream_summary_preset_only": "%{source} · %{description} (%{preset})",
   "sender.error.screen_recording_permission": "TargetBridge hat keine Berechtigung für die Bildschirmaufnahme. Überprüfe Systemeinstellungen > Datenschutz & Sicherheit > Bildschirmaufnahme.",
   "sender.error.sck_permission_mismatch": "ScreenCaptureKit fehlgeschlagen, obwohl die Berechtigung zur Bildschirmaufnahme erteilt zu sein scheint. Details: %{details}",
   "sender.cable_test.button": "Kabeltest ausführen",

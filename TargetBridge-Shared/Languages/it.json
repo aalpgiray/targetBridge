@@ -74,6 +74,7 @@
   "sender.receiver_summary": "%{name}: pannello %{panelWidth}x%{panelHeight}, modalità %{modeWidth}x%{modeHeight} HiDPI",
   "sender.virtual_display_summary": "%{name} (%{id})",
   "sender.stream_summary": "%{source} · %{description} (%{preset}, %{codec})",
+  "sender.stream_summary_preset_only": "%{source} · %{description} (%{preset})",
   "sender.error.screen_recording_permission": "TargetBridge non ha il permesso Registrazione Schermo. Verifica Privacy e Sicurezza > Registrazione Schermo.",
   "sender.error.sck_permission_mismatch": "ScreenCaptureKit ha fallito anche se il permesso Registrazione Schermo risulta concesso. Dettagli: %{details}",
   "sender.cable_test.button": "Esegui Test Cavo",
