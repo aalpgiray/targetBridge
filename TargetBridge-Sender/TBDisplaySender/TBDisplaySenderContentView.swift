@@ -565,6 +565,12 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                             }
                         }
                         .pickerStyle(.menu)
+                        // Picking here is the user stating a preference, which is
+                        // what survives the interface going away and coming back.
+                        .onChange(of: session.localInterfaceIP) { _, newValue in
+                            guard !newValue.isEmpty else { return }
+                            session.preferredLocalInterfaceIP = newValue
+                        }
                         .disabled(session.isConnected || session.isStreaming)
                     }
 

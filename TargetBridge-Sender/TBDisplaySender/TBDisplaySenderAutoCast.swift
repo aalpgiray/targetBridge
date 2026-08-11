@@ -36,21 +36,42 @@ enum TBAutoCast {
         case wait(reason: String)
     }
 
+    /// A receiver currently visible on the network, and every address it
+    /// advertises.
+    struct Candidate: Equatable {
+        let id: String
+        /// preferred / thunderbolt / network, minus the empty ones.
+        let ips: [String]
+
+        init(id: String, ips: [String]) {
+            self.id = id
+            self.ips = ips.filter { !$0.isEmpty }
+        }
+    }
+
     struct Input {
         var enabled: Bool
         /// Connected, connecting or streaming — anything where a second dial
         /// would be wrong.
         var sessionIsBusy: Bool
-        /// The receiver this session was last pointed at, as persisted.
+        /// The receiver this session was last pointed at, as persisted. Empty
+        /// for a session configured by typing an address instead of choosing
+        /// from discovery.
         var rememberedReceiverID: String
+        /// The address the session is pointed at. This is what makes auto-cast
+        /// work for a hand-configured session: it is perfectly reasonable to
+        /// type 10.0.1.2 rather than pick from a menu, and a toggle that
+        /// silently does nothing in that case is a broken toggle, not a
+        /// documented limitation.
+        var rememberedReceiverIP: String
         /// Set when the user stopped this session by hand. Auto-cast must not
         /// immediately undo a deliberate disconnect; it stays set until the
         /// receiver actually goes away, so the next plug-in re-arms it.
         var suppressedByManualStop: Bool
         /// Time since the last attempt on this session, or nil if none yet.
         var secondsSinceLastAttempt: TimeInterval?
-        /// `id` of every receiver currently visible.
-        var candidateIDs: [String]
+        /// Every receiver currently visible.
+        var candidates: [Candidate]
     }
 
     /// Bonjour service names are stable across a cable reconnect, a receiver
@@ -68,17 +89,33 @@ enum TBAutoCast {
         guard !input.suppressedByManualStop else {
             return .wait(reason: "disconnected by hand; waiting for the receiver to reappear")
         }
-        guard !input.rememberedReceiverID.isEmpty else {
+        guard !input.rememberedReceiverID.isEmpty || !input.rememberedReceiverIP.isEmpty else {
             return .wait(reason: "no receiver configured for this session yet")
         }
         if let elapsed = input.secondsSinceLastAttempt, elapsed < retryInterval {
             return .wait(reason: String(format: "retry backoff (%.1fs of %.0fs)", elapsed, retryInterval))
         }
 
-        let wanted = serviceName(ofReceiverID: input.rememberedReceiverID)
-        guard let match = input.candidateIDs.first(where: { serviceName(ofReceiverID: $0) == wanted })
-        else { return .wait(reason: "configured receiver '\(wanted)' not on the network") }
+        // Service name first — it survives an address change, which is the whole
+        // reason it is preferred over the id.
+        if !input.rememberedReceiverID.isEmpty {
+            let wanted = serviceName(ofReceiverID: input.rememberedReceiverID)
+            if let match = input.candidates.first(where: { serviceName(ofReceiverID: $0.id) == wanted }) {
+                return .connect(receiverID: match.id)
+            }
+        }
 
-        return .connect(receiverID: match)
+        // Then the address. A session configured by hand has no service name to
+        // match, so without this the toggle would appear on and do nothing.
+        if !input.rememberedReceiverIP.isEmpty {
+            if let match = input.candidates.first(where: { $0.ips.contains(input.rememberedReceiverIP) }) {
+                return .connect(receiverID: match.id)
+            }
+        }
+
+        let wanted = input.rememberedReceiverID.isEmpty
+            ? input.rememberedReceiverIP
+            : serviceName(ofReceiverID: input.rememberedReceiverID)
+        return .wait(reason: "configured receiver '\(wanted)' not on the network")
     }
 }

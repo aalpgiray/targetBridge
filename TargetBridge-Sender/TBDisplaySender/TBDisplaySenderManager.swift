@@ -330,6 +330,8 @@ final class TBDisplaySenderService: ObservableObject {
         var matchRenderToStream: Bool?
         /// Optional: sessions saved before auto-cast existed decode as nil = off.
         var autoCastEnabled: Bool?
+        /// Optional: sessions saved before this decode as nil and re-learn it.
+        var preferredLocalInterfaceIP: String?
     }
 
     private var lastPersistedData: Data?
@@ -365,7 +367,8 @@ final class TBDisplaySenderService: ObservableObject {
                 inputControlRole: session.inputControlRole.rawValue,
                 inputBindings: session.inputBindings,
                 matchRenderToStream: session.matchRenderToStream,
-                autoCastEnabled: session.autoCastEnabled
+                autoCastEnabled: session.autoCastEnabled,
+                preferredLocalInterfaceIP: session.preferredLocalInterfaceIP
             )
         }
         guard let data = try? JSONEncoder().encode(configs) else { return }
@@ -452,6 +455,7 @@ final class TBDisplaySenderService: ObservableObject {
         session.volume = config.volume ?? 0.5
         session.matchRenderToStream = config.matchRenderToStream ?? false
         session.autoCastEnabled = config.autoCastEnabled ?? false
+        session.preferredLocalInterfaceIP = config.preferredLocalInterfaceIP ?? config.localInterfaceIP
     }
 
     func refreshLocalInterfaces() {
@@ -750,14 +754,47 @@ final class TBDisplaySenderService: ObservableObject {
         return candidates.first(where: { !usedIPs.contains($0.ip) }) ?? candidates.first
     }
 
+    /// Keeps each session pointed at a local interface that actually exists,
+    /// WITHOUT throwing away the one the user chose.
+    ///
+    /// The naive version — replace the IP whenever it is not currently valid —
+    /// loses the choice permanently the first time a cable is unplugged. The
+    /// Thunderbolt address disappears, a fallback is written in its place, and
+    /// because the fallback is itself valid the guard never fires again once the
+    /// cable is back. Observed exactly that: a session on 10.0.1.1 silently
+    /// repointed at a VM bridge on 192.168.64.1 and stayed there, which breaks
+    /// reconnecting by hand as surely as it breaks auto-cast.
+    ///
+    /// So remember the preference separately from the working value: fall back
+    /// while it is missing, restore it the moment it returns.
     private func normalizeSessionInterfaces() {
         for session in sessions {
             let available = availableInterfaces(for: session.transportKind)
             let validIPs = Set(available.map(\.ip))
-            let fallbackIP = suggestedInterfaceForNewSession(transportKind: session.transportKind)?.ip
-                ?? available.first?.ip
-                ?? ""
+
+            // A valid current IP that we have not recorded yet is the user's
+            // choice, by definition — this is the only place it can be learned.
+            if session.preferredLocalInterfaceIP.isEmpty,
+               validIPs.contains(session.localInterfaceIP) {
+                session.preferredLocalInterfaceIP = session.localInterfaceIP
+            }
+
+            if validIPs.contains(session.preferredLocalInterfaceIP) {
+                // Back again (cable replugged) — restore it, even if the
+                // fallback we are currently on is perfectly valid.
+                if session.localInterfaceIP != session.preferredLocalInterfaceIP {
+                    NSLog("[interface] \(session.preferredLocalInterfaceIP) is back; restoring it over \(session.localInterfaceIP)")
+                    session.localInterfaceIP = session.preferredLocalInterfaceIP
+                }
+                continue
+            }
+
             if session.localInterfaceIP.isEmpty || !validIPs.contains(session.localInterfaceIP) {
+                let fallbackIP = suggestedInterfaceForNewSession(transportKind: session.transportKind)?.ip
+                    ?? available.first?.ip
+                    ?? ""
+                // Deliberately not touching preferredLocalInterfaceIP: this is a
+                // stand-in while the real one is away, not a new choice.
                 session.localInterfaceIP = fallbackIP
             }
         }
@@ -767,28 +804,53 @@ final class TBDisplaySenderService: ObservableObject {
     /// TBAutoCast actually says to dial — the decision itself lives there so it
     /// can be tested without Bonjour.
     private func evaluateAutoCast() {
-        let candidateIDs = discoveredReceivers.map(\.id)
-        let visibleServices = Set(candidateIDs.map(TBAutoCast.serviceName(ofReceiverID:)))
+        let candidates = discoveredReceivers.map {
+            TBAutoCast.Candidate(id: $0.id, ips: [$0.preferredIP, $0.thunderboltIP, $0.networkIP])
+        }
 
         for session in sessions {
             // Re-arm first: a deliberate disconnect is only honoured until the
             // receiver actually leaves. Unplugging and plugging back in is how a
             // person says "yes, again" — without this the suppression would be
             // permanent for the rest of the launch.
-            if session.autoCastSuppressedByManualStop,
-               !visibleServices.contains(TBAutoCast.serviceName(ofReceiverID: session.selectedReceiverID)) {
-                session.autoCastSuppressedByManualStop = false
-                session.lastAutoCastAttempt = nil
+            //
+            // "Gone" has to be judged the same way a match is, or a session
+            // configured by hand would never re-arm: it has no service name.
+            if session.autoCastSuppressedByManualStop {
+                let wantedService = TBAutoCast.serviceName(ofReceiverID: session.selectedReceiverID)
+                let stillHere = candidates.contains {
+                    (!session.selectedReceiverID.isEmpty
+                        && TBAutoCast.serviceName(ofReceiverID: $0.id) == wantedService)
+                    || (!session.receiverIP.isEmpty && $0.ips.contains(session.receiverIP))
+                }
+                if !stillHere {
+                    session.autoCastSuppressedByManualStop = false
+                    session.lastAutoCastAttempt = nil
+                }
             }
 
             let decision = TBAutoCast.decide(TBAutoCast.Input(
                 enabled: session.autoCastEnabled,
                 sessionIsBusy: session.isBusyForAutoCast,
                 rememberedReceiverID: session.selectedReceiverID,
+                rememberedReceiverIP: session.receiverIP,
                 suppressedByManualStop: session.autoCastSuppressedByManualStop,
                 secondsSinceLastAttempt: session.lastAutoCastAttempt.map { -$0.timeIntervalSinceNow },
-                candidateIDs: candidateIDs
+                candidates: candidates
             ))
+
+            // Log the reason, but only when it changes — discovery republishes
+            // several times a second. Without this, "the toggle is on and
+            // nothing happens" is invisible from the outside, which is exactly
+            // the failure that shipped.
+            if case .wait(let reason) = decision {
+                if session.autoCastEnabled, session.lastAutoCastWaitReason != reason {
+                    session.lastAutoCastWaitReason = reason
+                    NSLog("[autocast] waiting: \(reason)")
+                }
+                continue
+            }
+            session.lastAutoCastWaitReason = nil
 
             guard case .connect(let receiverID) = decision else { continue }
             guard let receiver = discoveredReceivers.first(where: { $0.id == receiverID }) else { continue }

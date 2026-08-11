@@ -23,17 +23,20 @@ final class TBAutoCastTests: XCTestCase {
         enabled: Bool = true,
         busy: Bool = false,
         remembered: String = "iMac-5K._targetbridge._tcp.|10.0.1.2",
+        rememberedIP: String = "10.0.1.2",
         suppressed: Bool = false,
         sinceLastAttempt: TimeInterval? = nil,
-        candidates: [String] = ["iMac-5K._targetbridge._tcp.|10.0.1.2"]
+        candidates: [String] = ["iMac-5K._targetbridge._tcp.|10.0.1.2"],
+        candidateIPs: [String] = ["10.0.1.2"]
     ) -> TBAutoCast.Input {
         TBAutoCast.Input(
             enabled: enabled,
             sessionIsBusy: busy,
             rememberedReceiverID: remembered,
+            rememberedReceiverIP: rememberedIP,
             suppressedByManualStop: suppressed,
             secondsSinceLastAttempt: sinceLastAttempt,
-            candidateIDs: candidates
+            candidates: candidates.map { TBAutoCast.Candidate(id: $0, ips: candidateIPs) }
         )
     }
 
@@ -57,7 +60,8 @@ final class TBAutoCastTests: XCTestCase {
     func testStillMatchesAfterTheReceiverChangesAddress() {
         let decision = TBAutoCast.decide(armed(
             remembered: "iMac-5K._targetbridge._tcp.|10.0.1.2",
-            candidates: ["iMac-5K._targetbridge._tcp.|192.168.4.31"]
+            candidates: ["iMac-5K._targetbridge._tcp.|192.168.4.31"],
+            candidateIPs: ["192.168.4.31"]
         ))
         XCTAssertEqual(decision, .connect(receiverID: "iMac-5K._targetbridge._tcp.|192.168.4.31"),
                        "must follow the service name to its new address")
@@ -66,7 +70,9 @@ final class TBAutoCastTests: XCTestCase {
     /// And the converse — a *different* receiver appearing must not be treated as
     /// the configured one just because something showed up.
     func testDoesNotConnectToAStrangerOnTheNetwork() {
-        assertWaits(armed(candidates: ["SomeoneElse-iMac._targetbridge._tcp.|10.0.1.9"]),
+        assertWaits(armed(rememberedIP: "10.0.1.2",
+                          candidates: ["SomeoneElse-iMac._targetbridge._tcp.|10.0.1.9"],
+                          candidateIPs: ["10.0.1.9"]),
                     "an unrelated receiver is not the configured one")
     }
 
@@ -88,12 +94,12 @@ final class TBAutoCastTests: XCTestCase {
     }
 
     func testNeedsAReceiverToHaveBeenConfigured() {
-        assertWaits(armed(remembered: ""), "nothing has been configured to connect to")
-        assertWaits(armed(remembered: "", candidates: []), "no receiver, no candidates")
+        assertWaits(armed(remembered: "", rememberedIP: ""), "nothing has been configured to connect to")
+        assertWaits(armed(remembered: "", rememberedIP: "", candidates: []), "no receiver, no candidates")
     }
 
     func testDoesNotConnectWhenTheReceiverIsAbsent() {
-        assertWaits(armed(candidates: []), "the configured receiver is not on the network")
+        assertWaits(armed(candidates: [], candidateIPs: []), "the configured receiver is not on the network")
     }
 
     // MARK: - backoff
@@ -123,11 +129,49 @@ final class TBAutoCastTests: XCTestCase {
         XCTAssertEqual(TBAutoCast.serviceName(ofReceiverID: ""), "")
     }
 
+    /// The regression that made the shipped toggle look broken: a session
+    /// configured by TYPING an address has no selectedReceiverID at all, so
+    /// matching only on service name meant auto-cast silently never fired while
+    /// the UI cheerfully showed it enabled. Typing 10.0.1.2 is a perfectly
+    /// ordinary way to set this up.
+    func testWorksForASessionConfiguredByTypingAnAddress() {
+        XCTAssertEqual(TBAutoCast.decide(armed(remembered: "", rememberedIP: "10.0.1.2")),
+                       .connect(receiverID: "iMac-5K._targetbridge._tcp.|10.0.1.2"),
+                       "a hand-typed receiver IP must still auto-cast")
+    }
+
+    /// The address may be advertised as any of preferred/thunderbolt/network,
+    /// and the one the user typed can be any of them.
+    func testMatchesAnyAdvertisedAddress() {
+        let input = TBAutoCast.Input(
+            enabled: true, sessionIsBusy: false,
+            rememberedReceiverID: "", rememberedReceiverIP: "192.168.0.192",
+            suppressedByManualStop: false, secondsSinceLastAttempt: nil,
+            candidates: [TBAutoCast.Candidate(id: "iMac._tb._tcp.|10.0.1.2",
+                                              ips: ["10.0.1.2", "", "192.168.0.192"])]
+        )
+        XCTAssertEqual(TBAutoCast.decide(input), .connect(receiverID: "iMac._tb._tcp.|10.0.1.2"))
+    }
+
+    /// Service name wins when both could match, because it is the identity that
+    /// survives the address moving.
+    func testServiceNameTakesPrecedenceOverAddress() {
+        let input = TBAutoCast.Input(
+            enabled: true, sessionIsBusy: false,
+            rememberedReceiverID: "wanted._tb._tcp.|10.0.0.1",
+            rememberedReceiverIP: "10.0.0.9",
+            suppressedByManualStop: false, secondsSinceLastAttempt: nil,
+            candidates: [TBAutoCast.Candidate(id: "other._tb._tcp.|10.0.0.9", ips: ["10.0.0.9"]),
+                         TBAutoCast.Candidate(id: "wanted._tb._tcp.|10.0.0.5", ips: ["10.0.0.5"])]
+        )
+        XCTAssertEqual(TBAutoCast.decide(input), .connect(receiverID: "wanted._tb._tcp.|10.0.0.5"))
+    }
+
     /// An empty remembered id must not match an empty-named candidate through the
     /// service-name comparison — the empty check has to come first, which is easy
     /// to reorder away.
     func testEmptyConfigurationNeverMatchesAnything() {
-        assertWaits(armed(remembered: "", candidates: ["|10.0.1.2"]),
+        assertWaits(armed(remembered: "", rememberedIP: "", candidates: ["|10.0.1.2"], candidateIPs: []),
                     "an unconfigured session must not match a nameless service")
     }
 }

@@ -1781,6 +1781,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     @Published var statusText: String
     @Published var transportKind: TBTransportKind = .thunderboltBridge
     @Published var localInterfaceIP = ""
+
+    /// The local interface the user actually chose, remembered separately from
+    /// the one in use. `localInterfaceIP` is allowed to fall back to something
+    /// else while this one is unplugged; normalizeSessionInterfaces restores it
+    /// the moment it comes back. Without the split, one cable unplug silently
+    /// and permanently repoints the session at whatever else was available.
+    @Published var preferredLocalInterfaceIP = ""
     // Full-color 4:4:4: capture 8-bit BGRA instead of 4:2:0 NV12 — no chroma
     // subsampling, so colored edges/text are crisp. ~28 Gb/s at 5K@60, so it
     // realistically needs dual-cable. Raw presets only.
@@ -1947,6 +1954,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// Last dial attempt, for the retry backoff. Discovery republishes far more
     /// often than a person would expect.
     var lastAutoCastAttempt: Date?
+
+    /// The last reason auto-cast declined to dial, so the log records a change
+    /// rather than the same line many times a second.
+    var lastAutoCastWaitReason: String?
 
     /// Anything where a second dial would be wrong. `connection != nil` is the
     /// part `isConnected` misses: it covers the in-flight window between dialling

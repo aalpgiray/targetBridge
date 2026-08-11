@@ -119,6 +119,12 @@ want "auto-cast runs on discovery"        1 "evaluateAutoCast"     TargetBridge-
 want "manual-stop suppression"            1 "autoCastSuppressedByManualStop" TargetBridge-Sender/TBDisplaySender
 want "auto-cast survives a launch"        1 "autoCastEnabled"      TargetBridge-Sender/TBDisplaySender
 want "auto-cast tests"                    1 "TBAutoCastTests"      TargetBridge-Sender/TBDisplaySenderTests
+# A session configured by typing an address has no selectedReceiverID, so
+# matching only on service name made the shipped toggle silently do nothing.
+want "auto-cast matches a typed address"  1 "rememberedReceiverIP" TargetBridge-Sender/TBDisplaySender
+# One unplug used to repoint a session at whatever interface was left (a VM
+# bridge, in practice) and never move it back, breaking manual reconnect too.
+want "local interface choice survives unplug" 1 "preferredLocalInterfaceIP" TargetBridge-Sender/TBDisplaySender
 
 echo "== latency work ============================================"
 want "keep-warm implementation"         1 "TBKeepWarm"             TargetBridge-Sender/TBDisplaySender
