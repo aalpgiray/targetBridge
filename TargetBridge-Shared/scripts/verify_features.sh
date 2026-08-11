@@ -67,7 +67,6 @@ want "GPU decode on the receiver"       1 "render_dpcm_slice"  TargetBridge-Rece
 # All three live in one file, so check each name rather than counting files.
 want "wire packet: whole frame"          1 "rawDPCM\b"          TargetBridge-Sender/TBDisplayShared
 want "wire packet: slice"                1 "rawDPCMSlice"       TargetBridge-Sender/TBDisplayShared
-want "wire packet: rect"                 1 "rawDPCMRect"        TargetBridge-Sender/TBDisplayShared
 want "wire packet: receiver log"         1 "receiverLog"        TargetBridge-Sender/TBDisplayShared
 want "receiver packet handlers"         1 "RAW_DPCM_SLICE"     TargetBridge-Receiver/TBReceiverC/src
 want "codec built into the receiver"    1 "tb_dpcm"            TargetBridge-Receiver/TBReceiverC/Makefile
@@ -106,7 +105,23 @@ want "Night Shift / True Tone"          1 "nightShift\|NightShift\|night_shift" 
 echo "== latency work ============================================"
 want "keep-warm implementation"         1 "TBKeepWarm"             TargetBridge-Sender/TBDisplaySender
 want "keep-warm actually started"       1 "keepWarm.start"         TargetBridge-Sender/TBDisplaySender
-want "damage rect policy"               1 "TBDamageRects"          TargetBridge-Sender/TBDisplaySender
+# Damage rectangles were built, measured at 0 rect / 49440 whole frames, and
+# removed. Assert the ABSENCE: reintroducing the wire types by merge would have
+# the sender emit packets no receiver handles.
+gone() {
+    local label="$1" pat="$2"; shift 2
+    local n
+    n=$(grep -rIl -e "$pat" "$@" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$n" -eq 0 ]; then
+        PASS=$((PASS+1)); printf '  %s %-46s absent\n' "$(green ok)" "$label"
+    else
+        FAIL=$((FAIL+1)); printf '  %s %-46s came back in %s file(s)  [%s]\n' \
+            "$(red FAIL)" "$label" "$n" "$pat"
+    fi
+}
+gone "damage rects stay removed (sender)" "TBDamageRects\|dpcmRects\|carriedDirty" TargetBridge-Sender/TBDisplaySender TargetBridge-Sender/TBDisplayShared
+gone "damage wire types stay removed"     "rawDamage\|rawDPCMRect"                 TargetBridge-Sender/TBDisplayShared
+gone "damage handlers stay removed (rx)"  "handle_raw_damage\|handle_raw_dpcm_rect" TargetBridge-Receiver/TBReceiverC/src
 
 echo "== diagnostics =============================================="
 want "receiver log shipping"            1 "tb_logship"             TargetBridge-Receiver/TBReceiverC/src
@@ -126,7 +141,7 @@ want "self-contained x86_64 bundle"     1 "build_x86_bundle"       TargetBridge-
 echo "== Xcode project still includes our sources ================"
 # A Swift file can survive a merge while dropping out of the target, which
 # compiles fine and silently removes the feature.
-for f in TBKeepWarm TBDamageRects TBDPCMAsyncEncode TBReceiverLogSink TBTelemetryReporter; do
+for f in TBKeepWarm TBDPCMAsyncEncode TBReceiverLogSink TBTelemetryReporter; do
     want "pbxproj lists $f" 1 "$f" TargetBridge-Sender/TargetBridge.xcodeproj/project.pbxproj
 done
 

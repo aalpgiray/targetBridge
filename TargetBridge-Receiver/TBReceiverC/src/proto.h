@@ -47,17 +47,6 @@
 #define TB_PKT_FRAME            0x21
 #define TB_PKT_RAW_FRAME        0x22  /* uncompressed NV12 planes (raw passthrough) */
 #define TB_PKT_AUDIO_FRAME      0x23
-/* Damage update: only the rectangles that changed since the previous frame.
- * ScreenCaptureKit hands the sender the WindowServer's own dirty rects, so
- * detection is free; this just avoids resending the ~98% of a 5K desktop that
- * is usually identical frame to frame.
- *   [1] format (2 = BGRA8888, 3 = ARGB2101010 — packed 32bpp only)
- *   [4] frame width   [4] frame height
- *   [2] rect count
- *   per rect: [4] x  [4] y  [4] w  [4] h  then w*h*4 bytes, rows packed tight
- * A full TB_PKT_RAW_FRAME must arrive first (and periodically after) so the
- * receiver has a complete base image to patch into. */
-#define TB_PKT_RAW_DAMAGE       0x24
 /* Full frame, losslessly compressed with tile-DPCM (TBD1; see tb_dpcm.h). The
  * payload is one TBD1 blob and nothing else — its own header carries the
  * dimensions, so none are repeated here.
@@ -125,32 +114,6 @@
  * not know this type ignores it, and a receiver whose sender never asks simply
  * keeps writing to its own console. */
 #define TB_PKT_LOG              0x41
-
-/* One tile-aligned RECTANGLE of a TBD2 frame: a 32-byte header then the blob.
- *
- * The same idea as a band (0x26) in both axes. A band is a full-width strip at a
- * row offset; a rect adds a column offset and a width, and the codec needs
- * nothing for either — an encoder handed (base + y*stride + x*4, stride, w, h)
- * produces a blob that decodes losslessly on its own, verified against the
- * reference encoder.
- *
- * Why it exists: with the pipeline fixed, the wire is the largest term left, and
- * a desktop changes a few percent of its pixels per frame while we send all of
- * them. It also deletes most of the host-side plan work, which is O(tiles).
- *
- *   [0]  capture_time  sender host clock, nanoseconds, at frame acquisition
- *   [8]  frame_id      increments per frame; all rects of a frame share it
- *   [12] frame_w       full surface, for validation
- *   [16] frame_h
- *   [20] x0            destination column, multiple of TB_DPCM_TILE
- *   [24] y0            destination row, multiple of TB_DPCM_TILE
- *   [28] index         which rect of this frame
- *   [30] count         how many rects the frame has; the last one presents
- *
- * Only sent to a receiver that advertised `supportsDPCMRects`; one that did not
- * keeps getting whole frames or bands, so an older receiver is unaffected. */
-#define TB_PKT_RAW_DPCM_RECT    0x27
-#define TB_DPCM_RECT_HEADER     32
 
 #define TB_HDR_BYTES        5   /* 4 length + 1 type */
 

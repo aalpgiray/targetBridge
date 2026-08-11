@@ -9,10 +9,6 @@ enum TBMonitorPacketType: UInt8 {
     case frame = 0x21
     case rawFrame = 0x22   // Uncompressed NV12 planes (raw passthrough mode)
     case audioFrame = 0x23
-    /// Only the rectangles that changed since the previous frame. Detection is
-    /// free — ScreenCaptureKit attaches the WindowServer's own dirty rects —
-    /// and a typical desktop changes a few percent of its pixels per frame.
-    case rawDamage = 0x24
     /// A whole frame, losslessly compressed with tile-DPCM (see tb_dpcm.h).
     ///
     /// Covers what damage rectangles cannot: fullscreen video and fast
@@ -46,17 +42,6 @@ enum TBMonitorPacketType: UInt8 {
     /// Receiver's microphone, receiver -> sender: raw 48 kHz stereo Int16.
     case micFrame = 0x39
     case testData = 0x40
-    /// One tile-aligned RECTANGLE of a TBD2 frame: a 32-byte header then the
-    /// blob. A band (0x26) in both axes.
-    ///
-    /// With the pipeline fixed the wire is the largest term left, and a desktop
-    /// changes a few percent of its pixels per frame while we send all of them.
-    /// It also deletes most of the host-side plan work, which is O(tiles).
-    ///
-    /// The codec needed nothing for this: an encoder handed
-    /// `(base + y*stride + x*4, stride, w, h)` produces a blob that decodes
-    /// losslessly on its own.
-    case rawDPCMRect = 0x27
     /// The receiver's stderr, raw UTF-8, no framing beyond the packet itself.
     ///
     /// The receiver runs on the other Mac, so every measurement used to mean
@@ -229,8 +214,6 @@ enum TBMonitorProtocol {
 
     /// Bytes of the TBD2 slice header, between the packet header and the blob.
     static let sliceHeaderSize = 28
-    /// Same, for a rect: the slice header plus a column offset.
-    static let rectHeaderSize = 32
 
     /// Write the slice header into space the encoder reserved ahead of the blob,
     /// then frame the whole thing. `base` points at the packet header, so the
@@ -262,38 +245,6 @@ enum TBMonitorProtocol {
         put16(count)
         return framedPacket(type: .rawDPCMSlice, base: base, totalCount: totalCount)
     }
-
-    /// Write the rect header into space the encoder reserved ahead of the blob,
-    /// then frame the whole thing — one contiguous buffer, one copy, exactly as
-    /// the band path does.
-    static func framedRectPacket(base: UnsafePointer<UInt8>,
-                                 totalCount: Int,
-                                 captureTimeNanos: UInt64,
-                                 frameID: UInt32,
-                                 frameW: UInt32, frameH: UInt32,
-                                 x0: UInt32, y0: UInt32,
-                                 index: UInt16, count: UInt16) -> Data {
-        let p = UnsafeMutablePointer(mutating: base) + headerSize
-        var o = 0
-        func put32(_ v: UInt32) {
-            p[o] = UInt8((v >> 24) & 0xFF); p[o+1] = UInt8((v >> 16) & 0xFF)
-            p[o+2] = UInt8((v >> 8) & 0xFF); p[o+3] = UInt8(v & 0xFF); o += 4
-        }
-        func put16(_ v: UInt16) {
-            p[o] = UInt8((v >> 8) & 0xFF); p[o+1] = UInt8(v & 0xFF); o += 2
-        }
-        put32(UInt32(truncatingIfNeeded: captureTimeNanos >> 32))
-        put32(UInt32(truncatingIfNeeded: captureTimeNanos))
-        put32(frameID)
-        put32(frameW)
-        put32(frameH)
-        put32(x0)
-        put32(y0)
-        put16(index)
-        put16(count)
-        return framedPacket(type: .rawDPCMRect, base: base, totalCount: totalCount)
-    }
-
     static func makePacket(type: TBMonitorPacketType, payload: Data) -> Data {
         var packet = Data()
         appendBE32(&packet, UInt32(1 + payload.count))

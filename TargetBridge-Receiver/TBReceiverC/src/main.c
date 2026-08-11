@@ -154,7 +154,7 @@ struct app {
         size_t         cap;
         const uint8_t *payload;   /* points into buf */
         size_t         len;
-        uint8_t        type;      /* RAW_FRAME, RAW_DAMAGE, RAW_DPCM[_SLICE] */
+        uint8_t        type;      /* RAW_FRAME, RAW_DPCM[_SLICE] */
     }                vq[TB_VIDEO_QUEUE];
     int              vq_head;
     int              vq_count;
@@ -212,14 +212,6 @@ struct app {
 
     struct tb_link_reader *reader1;
 
-    /* Base image for damage updates: TB_PKT_RAW_DAMAGE patches rectangles into
-     * this, so it must persist across frames. Rebuilt whenever a full
-     * TB_PKT_RAW_FRAME arrives. */
-    uint8_t *base_img;
-    size_t   base_cap;
-    uint32_t base_w, base_h;
-    uint8_t  base_format;      /* 2 = BGRA8888, 3 = ARGB2101010 */
-    int      base_valid;
 
     uint64_t frames;
     uint64_t last_fps_tick_ms;
@@ -1122,41 +1114,8 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
         tb_format_i18n(a->mode_text, sizeof(a->mode_text), "receiver.mode.receiving", pairs, 2);
     }
     if (format == 1) {
-        /* Snapshot both planes tightly packed (Y then interleaved UV) so damage
-         * packets can patch them. Chroma is half resolution in both axes. */
-        size_t y_sz = (size_t)w * h;
-        size_t need = y_sz + (size_t)w * (h / 2);
-        if (a->base_cap < need) {
-            uint8_t *nb = (uint8_t *)realloc(a->base_img, need);
-            if (nb) { a->base_img = nb; a->base_cap = need; }
-        }
-        if (a->base_img && a->base_cap >= need) {
-            for (uint32_t row = 0; row < h; ++row)
-                memcpy(a->base_img + (size_t)row * w, y + (size_t)row * ys, w);
-            for (uint32_t row = 0; row < h / 2; ++row)
-                memcpy(a->base_img + y_sz + (size_t)row * w, uv + (size_t)row * us, w);
-            a->base_w = w; a->base_h = h; a->base_format = 1; a->base_valid = 1;
-        } else {
-            a->base_valid = 0;
-        }
         tb_disp_render_nv12(a->disp, y, (int)ys, uv, (int)us, (int)w, (int)h);
     } else {
-        /* Snapshot as the base image so subsequent damage packets can patch it.
-         * Stored tightly packed (stride == w*4) regardless of the wire stride. */
-        size_t need = (size_t)w * h * 4;
-        if (a->base_cap < need) {
-            uint8_t *nb = (uint8_t *)realloc(a->base_img, need);
-            if (nb) { a->base_img = nb; a->base_cap = need; }
-        }
-        if (a->base_img && a->base_cap >= need) {
-            for (uint32_t row = 0; row < h; ++row) {
-                memcpy(a->base_img + (size_t)row * w * 4,
-                       rgba + (size_t)row * stride, (size_t)w * 4);
-            }
-            a->base_w = w; a->base_h = h; a->base_format = format; a->base_valid = 1;
-        } else {
-            a->base_valid = 0;
-        }
         tb_disp_render_packed32(a->disp, rgba, (int)stride, (int)w, (int)h, format == 3);
     }
     a->frames++;
@@ -1176,10 +1135,6 @@ static void handle_raw_dpcm(struct app *a, const uint8_t *payload, size_t len) {
         a->frames_dropped++;
         return;
     }
-    /* A DPCM frame leaves no CPU base image behind, so a damage packet arriving
-     * after one has nothing to patch. Saying so here means a sender that mixes
-     * the two gets refused rather than showing a frame built on stale pixels. */
-    a->base_valid = 0;
     a->have_video_frame = 1;
     tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
     a->frames++;
@@ -1198,60 +1153,6 @@ static inline uint32_t be32(const uint8_t *p) {
  * because the blob's own validation covers the blob, not the placement: a band
  * claiming the wrong y0 would be written to the wrong rows and still look like a
  * picture. */
-/* TB_PKT_RAW_DPCM_RECT — one tile-aligned rectangle. See proto.h.
- *
- * Deliberately a near-copy of the band handler rather than a shared one with
- * flags: the two differ only in header layout and the presence of x0, and the
- * band path is load-bearing enough that threading a mode through it is the more
- * dangerous edit. */
-static void handle_raw_dpcm_rect(struct app *a, const uint8_t *p, size_t len) {
-    if (len < TB_DPCM_RECT_HEADER) { a->frames_dropped++; return; }
-
-    const uint32_t frame_id = be32(p + 8);
-    const uint32_t frame_w  = be32(p + 12);
-    const uint32_t frame_h  = be32(p + 16);
-    const uint32_t x0       = be32(p + 20);
-    const uint32_t y0       = be32(p + 24);
-    const uint16_t index    = (uint16_t)((p[28] << 8) | p[29]);
-    const uint16_t count    = (uint16_t)((p[30] << 8) | p[31]);
-
-    if (count == 0 || index >= count) { a->frames_dropped++; return; }
-    if (frame_w == 0 || frame_h == 0 || frame_w > 16384 || frame_h > 16384) { a->frames_dropped++; return; }
-    if (x0 >= frame_w || y0 >= frame_h) { a->frames_dropped++; return; }
-    /* Both offsets must land on the tile grid or the shader writes a region
-     * shifted against the tiles it decoded. */
-    if ((x0 % 8u) || (y0 % 8u)) { a->frames_dropped++; return; }
-
-    if (frame_id != a->dpcm_frame_id) {
-        if (index != 0 && !a->dpcm_seq_warned) {
-            a->dpcm_seq_warned = 1;
-            fprintf(stderr, "[dpcm] frame %u started at rect %u of %u\n", frame_id, index, count);
-        }
-        a->dpcm_frame_id = frame_id;
-    }
-
-    const int is_last = (index + 1 == count);
-    if (tb_disp_render_dpcm_slice(a->disp, p + TB_DPCM_RECT_HEADER,
-                                  len - TB_DPCM_RECT_HEADER,
-                                  (int)frame_w, (int)frame_h,
-                                  (int)x0, (int)y0, is_last) != 0) {
-        a->frames_dropped++;
-    } else if (index < 32) {
-        a->dpcm_got_mask |= (1u << index);
-    }
-
-    if (is_last) {
-        const uint32_t want = (count >= 32) ? 0xFFFFFFFFu : ((1u << count) - 1u);
-        a->dpcm_frames_total++;
-        if ((a->dpcm_got_mask & want) != want) {
-            a->dpcm_frames_short++;
-            for (int b = 0; b < count && b < 32; ++b)
-                if (!(a->dpcm_got_mask & (1u << b))) a->dpcm_bands_lost++;
-        }
-        a->dpcm_got_mask = 0;
-    }
-    a->have_video_frame = 1;
-}
 
 static void handle_raw_dpcm_slice(struct app *a, const uint8_t *p, size_t len) {
     if (len < TB_DPCM_SLICE_HEADER) { a->frames_dropped++; return; }
@@ -1324,82 +1225,10 @@ static void handle_raw_dpcm_slice(struct app *a, const uint8_t *p, size_t len) {
 
     if (!is_last) return;
 
-    /* A DPCM frame leaves no CPU base image behind, so a damage packet arriving
-     * after one has nothing to patch. */
-    a->base_valid = 0;
     tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
     a->frames++;
 }
 
-/* TB_PKT_RAW_DAMAGE — patch changed rectangles into the base image, then
- * render it. Every bounds check matters here: the payload is attacker-shaped
- * data and a bad rect would write outside the frame buffer. */
-static void handle_raw_damage(struct app *a, const uint8_t *p, size_t len) {
-    if (len < 11) return;
-    uint8_t  format = p[0];
-    uint32_t w = ((uint32_t)p[1] << 24) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 8) | (uint32_t)p[4];
-    uint32_t h = ((uint32_t)p[5] << 24) | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 8) | (uint32_t)p[8];
-    uint16_t rects = (uint16_t)(((uint16_t)p[9] << 8) | (uint16_t)p[10]);
-
-    /* Without a matching base image there is nothing to patch; wait for the
-     * next full frame rather than rendering garbage. */
-    if (!a->base_valid || w != a->base_w || h != a->base_h || format != a->base_format) return;
-    if (format != 1 && format != 2 && format != 3) return;
-    const size_t y_plane = (size_t)w * h;   /* only meaningful for format 1 */
-
-    size_t off = 11;
-    for (uint16_t i = 0; i < rects; ++i) {
-        if (len - off < 16) return;
-        uint32_t rx = ((uint32_t)p[off]   << 24) | ((uint32_t)p[off+1] << 16) | ((uint32_t)p[off+2] << 8) | (uint32_t)p[off+3];
-        uint32_t ry = ((uint32_t)p[off+4] << 24) | ((uint32_t)p[off+5] << 16) | ((uint32_t)p[off+6] << 8) | (uint32_t)p[off+7];
-        uint32_t rw = ((uint32_t)p[off+8] << 24) | ((uint32_t)p[off+9] << 16) | ((uint32_t)p[off+10]<< 8) | (uint32_t)p[off+11];
-        uint32_t rh = ((uint32_t)p[off+12]<< 24) | ((uint32_t)p[off+13]<< 16) | ((uint32_t)p[off+14]<< 8) | (uint32_t)p[off+15];
-        off += 16;
-
-        if (rw == 0 || rh == 0) continue;
-        /* Reject anything that would land outside the frame, using 64-bit maths
-         * so the sum cannot wrap. */
-        if ((uint64_t)rx + rw > (uint64_t)w || (uint64_t)ry + rh > (uint64_t)h) return;
-
-        if (format == 1) {
-            /* Planar: rects are even-aligned by the sender so the half-resolution
-             * chroma rect is exact. Y is rw x rh; UV is rw bytes x rh/2 rows
-             * (rw/2 chroma pairs). */
-            if ((rx | ry | rw | rh) & 1u) return;    /* misaligned: refuse */
-            size_t y_bytes  = (size_t)rw * rh;
-            size_t uv_bytes = (size_t)rw * (rh / 2);
-            if (len - off < y_bytes + uv_bytes) return;
-
-            for (uint32_t row = 0; row < rh; ++row)
-                memcpy(a->base_img + (size_t)(ry + row) * w + rx,
-                       p + off + (size_t)row * rw, rw);
-            off += y_bytes;
-            for (uint32_t row = 0; row < rh / 2; ++row)
-                memcpy(a->base_img + y_plane + (size_t)(ry / 2 + row) * w + rx,
-                       p + off + (size_t)row * rw, rw);
-            off += uv_bytes;
-        } else {
-            size_t bytes = (size_t)rw * rh * 4;
-            if (len - off < bytes) return;
-            for (uint32_t row = 0; row < rh; ++row) {
-                memcpy(a->base_img + ((size_t)(ry + row) * w + rx) * 4,
-                       p + off + (size_t)row * rw * 4,
-                       (size_t)rw * 4);
-            }
-            off += bytes;
-        }
-    }
-
-    a->have_video_frame = 1;
-    tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
-    if (format == 1) {
-        tb_disp_render_nv12(a->disp, a->base_img, (int)w,
-                            a->base_img + y_plane, (int)w, (int)w, (int)h);
-    } else {
-        tb_disp_render_packed32(a->disp, a->base_img, (int)(w * 4), (int)w, (int)h, format == 3);
-    }
-    a->frames++;
-}
 
 static void ring_read(struct app *a, Uint8 *dst, int len) {
     int first = AUDIO_BUF_CAP - a->audio_buf_tail;
@@ -1555,9 +1384,6 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         break;
     case TB_PKT_RAW_FRAME:
         handle_raw_frame(a, payload, len);
-        break;
-    case TB_PKT_RAW_DAMAGE:
-        handle_raw_damage(a, payload, len);
         break;
     case TB_PKT_RAW_DPCM:
         handle_raw_dpcm(a, payload, len);
@@ -2327,9 +2153,8 @@ static void reader_on_packet(uint8_t type, const uint8_t *payload, size_t len, v
     struct tb_link_reader *r = (struct tb_link_reader *)ud;
     struct app *a = r->app;
 
-    if (type == TB_PKT_RAW_FRAME || type == TB_PKT_RAW_DAMAGE ||
-        type == TB_PKT_RAW_DPCM || type == TB_PKT_RAW_DPCM_SLICE ||
-        type == TB_PKT_RAW_DPCM_RECT) {
+    if (type == TB_PKT_RAW_FRAME ||
+        type == TB_PKT_RAW_DPCM || type == TB_PKT_RAW_DPCM_SLICE) {
         /* Keep this packet without copying it: ask the parser to yield its
          * buffer. The `payload` pointer stays valid inside that buffer, which
          * the reader loop collects and publishes right after commit returns. */
@@ -2411,10 +2236,10 @@ static void *link_reader_main(void *ud) {
                          * dropped and counted — the sender's ~1s resync repairs
                          * it, exactly as the old timeout path did, but without
                          * stalling the socket to get there. */
+                        // A whole frame supersedes anything queued; a BAND is an
+                        // increment, and discarding one loses those pixels for good.
                         const int is_increment =
-                            (r->pending_type == TB_PKT_RAW_DAMAGE ||
-                             r->pending_type == TB_PKT_RAW_DPCM_SLICE ||
-                             r->pending_type == TB_PKT_RAW_DPCM_RECT);
+                            (r->pending_type == TB_PKT_RAW_DPCM_SLICE);
 
                         if (!is_increment) {
                             while (a->vq_count > 0) {
@@ -2661,10 +2486,8 @@ static int pump_network(struct app *a) {
         /* Frames bypass on_packet, so mark the session live here — otherwise
          * the fullscreen gate never opens. */
         a->session_active = 1;
-        if (ptype == TB_PKT_RAW_DAMAGE)   handle_raw_damage(a, payload, plen);
-        else if (ptype == TB_PKT_RAW_DPCM) handle_raw_dpcm(a, payload, plen);
+        if (ptype == TB_PKT_RAW_DPCM)           handle_raw_dpcm(a, payload, plen);
         else if (ptype == TB_PKT_RAW_DPCM_SLICE) handle_raw_dpcm_slice(a, payload, plen);
-        else if (ptype == TB_PKT_RAW_DPCM_RECT)  handle_raw_dpcm_rect(a, payload, plen);
         else                              handle_raw_frame(a, payload, plen);
         worked = 1;
 

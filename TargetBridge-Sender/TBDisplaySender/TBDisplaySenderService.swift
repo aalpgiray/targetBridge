@@ -517,7 +517,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// just the changed rectangles otherwise.
     /// Send only changed rectangles instead of whole frames. Set from the
     /// session's user-facing toggle before start().
-    var damageEnabled = true
     /// Whether the receiver can decode tile-DPCM on its GPU, from its display
     /// profile. A receiver that says nothing is an older one and keeps getting
     /// uncompressed frames. Set before start().
@@ -530,37 +529,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// worth sending to a receiver that can overlap them; one that cannot keeps
     /// getting whole frames.
     var dpcmSlicesEnabled = false
-    /// Whether the receiver can place a region by column as well as row. Set
-    /// from its display profile before start().
-    var dpcmRectsEnabled = false
-    /// Send only the changed rectangles instead of whole frames.
-    ///
-    /// OFF by default. Damage is the largest remaining win on desktop content --
-    /// a typical frame plans to about 2% of the pixels, roughly 47x less to
-    /// encode and send, and it deletes most of the host-side plan work, which is
-    /// O(tiles). But unlike everything else measured here, a mistake shows up as
-    /// VISUAL ARTEFACTS on a link whose counters all read healthy: a stale patch
-    /// that nothing corrects until the next keyframe. Two such bugs were already
-    /// caught by the policy's own coverage test before any of this ran.
-    ///
-    /// So it ships behind a switch until it has been watched on real content:
-    ///   defaults write com.targetbridge.sender TBDamageRects -bool true
-    var dpcmRectsWanted = UserDefaults.standard.bool(forKey: "TBDamageRects")
-    /// Frames since the last whole frame. A rect stream is incremental, so a
-    /// lost or mis-placed rect persists; a periodic full frame bounds how long
-    /// any such error can survive.
-    private var framesSinceDPCMKey = 0
-    /// Whether the receiver has a complete frame to patch into.
-    ///
-    /// Rects are incremental: anything never covered by one keeps whatever was
-    /// on the surface before, so the first frame of a session — and the first
-    /// after any geometry change — must be whole.
-    ///
-    /// This is deliberately NOT `needsKeyframe`. That flag belongs to the
-    /// uncompressed damage path and the DPCM path sets it true on every frame,
-    /// so gating rects on `!needsKeyframe` meant they could never run at all:
-    /// `path: 0 rect / 240 whole` with everything else negotiated correctly.
-    private var dpcmHasKeyframe = false
 
     /// Cap on frames actually sent, independent of how fast we capture.
     ///
@@ -657,13 +625,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// Without this the only evidence was a once-per-session log line describing
     /// the FIRST frame, which is always a keyframe — so it said "whole frame"
     /// regardless of what followed.
-    private var pathRectFrames = 0
-    private var pathWholeFrames = 0
-    private var pathRectFraction = 0.0
     /// Why the rect path was skipped, counted per reason. Two guesses at this
     /// were wrong, so it reports rather than infers.
-    private var skipWanted = 0, skipCap = 0, skipNoKey = 0
-    private var skipKeyAge = 0, skipNoDirty = 0, skipTooMuch = 0
 
     private var stageProbeMax = 0.0     // depth/alpha probe
     private var stageLockMax = 0.0      // CVPixelBufferLockBaseAddress
@@ -710,15 +673,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
         // well only duplicated it in Console.
         TBTelemetryReporter.emit("video path: \(what)")
     }
-    private var framesSinceKeyframe = 0
-    /// Set whenever a frame is skipped (backpressure) or anything else could
-    /// have left the receiver's base image stale. Forces one full frame.
-    private var needsKeyframe = true
-    /// Dirty rects from frames we had to skip, folded into the next send.
-    private var carriedDirty: [TBDirtyRect] = []
-    private var lastDamageFormat: UInt8 = 0
-    private var lastDamageW = 0
-    private var lastDamageH = 0
 
     // Confined to `queue`.
     private var vtEncoder: VTCompressionSession?
@@ -1056,7 +1010,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
     }
 
     /// A new link starts with no base image on the far side.
-    func requestKeyframe() { needsKeyframe = true }
 
     /// Raw passthrough: package the two NV12 planes of the captured pixel buffer
     /// and send them uncompressed. The receiver blits them directly (no decode).
@@ -1126,22 +1079,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
         tbWakeShortSum = 0; tbWakeShortCount = 0
         tbWakeLongSum = 0; tbWakeLongMax = 0; tbWakeLongCount = 0
         tbWakeRejected = 0
-        if pathRectFrames > 0 || pathWholeFrames > 0 {
-            let total = pathRectFrames + pathWholeFrames
-            let avgPct = pathRectFrames > 0
-                ? 100.0 * pathRectFraction / Double(pathRectFrames) : 0
-            TBTelemetryReporter.emit("path: \(pathRectFrames) rect / \(pathWholeFrames) whole of \(total), rect avg \(String(format: "%.1f", avgPct))% of frame")
-        }
-        if oversampleSkips > 0 {
-            TBTelemetryReporter.emit("oversample: \(oversampleSkips) frames skipped by the send cap")
-        }
-        oversampleSkips = 0
-        if pathWholeFrames > 0 {
-            TBTelemetryReporter.emit("path skips: wanted \(skipWanted) cap \(skipCap) nokey \(skipNoKey) keyage \(skipKeyAge) nodirty \(skipNoDirty) toomuch \(skipTooMuch)")
-        }
-        skipWanted = 0; skipCap = 0; skipNoKey = 0
-        skipKeyAge = 0; skipNoDirty = 0; skipTooMuch = 0
-        pathRectFrames = 0; pathWholeFrames = 0; pathRectFraction = 0
         stageProbeMax = 0; stageLockMax = 0; stageCtxMax = 0; stageSubmitMax = 0
 
         TBTelemetryReporter.report(capBins: capBins, sendBins: sendBins,
@@ -1225,13 +1162,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
             // (Forcing a full frame here instead caused a feedback loop: 59 MB
             // takes longer than a frame period, producing more backpressure,
             // more drops and more full frames — it pinned the stream at 26 fps.)
-            if lastDamageW > 0,
-               let r = Self.dirtyRects(from: sampleBuffer, width: lastDamageW, height: lastDamageH) {
-                carriedDirty.append(contentsOf: r)
-                if carriedDirty.count > 64 { needsKeyframe = true; carriedDirty.removeAll() }
-            } else {
-                needsKeyframe = true
-            }
             cadenceDrops += 1
             return
         }
@@ -1264,71 +1194,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
             let uvHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)
             let ySize = yStride * height
             let uvSize = uvStride * uvHeight
-
-            // Damage path for NV12. Chroma is half resolution in both axes, so
-            // every rect is snapped outward to even coordinates — an odd edge
-            // would put the chroma rect off by half a sample and fringe the
-            // boundary of each updated region.
-            if damageEnabled,
-               !needsKeyframe,
-               lastDamageFormat == 1, width == lastDamageW, height == lastDamageH,
-               framesSinceKeyframe < 60,
-               let fresh = Self.dirtyRects(from: sampleBuffer, width: width, height: height),
-               case let rects = (carriedDirty + fresh).map({ r -> TBDirtyRect in
-                   let x0 = r.x & ~1, y0 = r.y & ~1
-                   let x1 = min(width,  (r.x + r.w + 1) & ~1)
-                   let y1 = min(height, (r.y + r.h + 1) & ~1)
-                   return TBDirtyRect(x: x0, y: y0, w: x1 - x0, h: y1 - y0)
-               }).filter({ $0.w > 0 && $0.h > 0 }),
-               !rects.isEmpty, rects.count <= 64,
-               rects.reduce(0, { $0 + $1.w * $1.h }) * 2 < width * height {
-
-                var d = Data(capacity: 11 + rects.reduce(0) { $0 + 16 + $1.w * $1.h * 3 / 2 })
-                d.append(1)
-                TBMonitorProtocol.appendBE32(&d, UInt32(width))
-                TBMonitorProtocol.appendBE32(&d, UInt32(height))
-                d.append(UInt8((rects.count >> 8) & 0xFF))
-                d.append(UInt8(rects.count & 0xFF))
-                let ySrc  = yBase.assumingMemoryBound(to: UInt8.self)
-                let uvSrc = uvBase.assumingMemoryBound(to: UInt8.self)
-                for r in rects {
-                    TBMonitorProtocol.appendBE32(&d, UInt32(r.x))
-                    TBMonitorProtocol.appendBE32(&d, UInt32(r.y))
-                    TBMonitorProtocol.appendBE32(&d, UInt32(r.w))
-                    TBMonitorProtocol.appendBE32(&d, UInt32(r.h))
-                    for row in 0..<r.h {
-                        d.append(UnsafeBufferPointer(start: ySrc + (r.y + row) * yStride + r.x,
-                                                     count: r.w))
-                    }
-                    // One UV row per two luma rows; r.w bytes covers r.w/2
-                    // chroma pairs, so the byte offset is r.x either way.
-                    for row in 0..<(r.h / 2) {
-                        d.append(UnsafeBufferPointer(start: uvSrc + (r.y / 2 + row) * uvStride + r.x,
-                                                     count: r.w))
-                    }
-                }
-                carriedDirty.removeAll(keepingCapacity: true)
-                framesSinceKeyframe += 1
-                let dmg = TBMonitorProtocol.makePacket(type: .rawDamage, payload: d)
-                pendingRetain()
-                connection.send(content: dmg, completion: .contentProcessed({ [weak self] _ in
-                    guard let self else { return }
-                    self.pendingRelease()
-                }))
-                lock.lock()
-                _sentFrames += 1
-                _rawFormatIsBGRA = false
-                _rawFormatIsTenBit = false
-                lock.unlock()
-                return
-            }
-
-            lastDamageFormat = 1
-            lastDamageW = width
-            lastDamageH = height
-            framesSinceKeyframe = 0
-            needsKeyframe = false
-            carriedDirty.removeAll(keepingCapacity: true)
 
             var p = Data(capacity: 17 + ySize + uvSize)
             p.append(1) // format: NV12 4:2:0
@@ -1402,98 +1267,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 // Bands must be whole 8-row tiles, so the count has to divide the
                 // frame that way; anything else falls back to one band rather
                 // than silently sending a geometry the receiver will reject.
-                // Damage first: if only part of the screen changed, send only
-                // that. Falls through to bands when the answer is "everything",
-                // which is what fullscreen video always answers.
-                var damagePlan: TBDamageRects.Plan = .wholeFrame
-                if !dpcmRectsWanted { skipWanted += 1 }
-                else if !dpcmRectsEnabled { skipCap += 1 }
-                else if !dpcmHasKeyframe { skipNoKey += 1 }
-                else if framesSinceDPCMKey >= 60 { skipKeyAge += 1 }
-                else if let fresh = Self.dirtyRects(from: sampleBuffer, width: width, height: height) {
-                    damagePlan = TBDamageRects.plan(
-                        dirty: fresh.map { TBDamageRects.Rect(x: $0.x, y: $0.y, w: $0.w, h: $0.h) },
-                        frameW: width, frameH: height)
-                    if case .wholeFrame = damagePlan { skipTooMuch += 1 }
-                } else {
-                    skipNoDirty += 1
-                }
-
-                if case .rects(let rects) = damagePlan, !rects.isEmpty {
-                    dpcmFrameID &+= 1
-                    framesSinceDPCMKey += 1
-                    let captureNanos = UInt64(max(0, CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds) * 1_000_000_000)
-                    let reserve = TBMonitorProtocol.headerSize + TBMonitorProtocol.rectHeaderSize
-                    var sentAny = false
-
-                    for (i, r) in rects.enumerated() {
-                        // The encoder already handles a rect: same stride, a base
-                        // pointer at the rect's origin. No codec change was
-                        // needed for this, verified against the reference.
-                        let ctx = TBDPCMFrameContext(
-                            sampleBuffer: sampleBuffer,
-                            pixelBuffer: pixelBuffer,
-                            captureNanos: captureNanos,
-                            frameID: dpcmFrameID,
-                            sliceCount: 1,
-                            rowsPerBand: r.h,
-                            width: width,
-                            height: height,
-                            rect: (x: r.x, y: r.y, index: i, count: rects.count),
-                            send: { [weak self] packet in
-                                guard let self else { return }
-                                self.pendingRetain()
-                                connection.send(content: packet, completion: .contentProcessed({ [weak self] _ in
-                                    guard let self else { return }
-                                    self.pendingRelease()
-                                }))
-                            },
-                            finished: { _, _ in
-                                if i + 1 == rects.count { TBTelemetryReporter.noteEmit() }
-                            })
-
-                        let origin = base.assumingMemoryBound(to: UInt8.self)
-                            .advanced(by: r.y * stride + r.x * 4)
-                        let opaque = Unmanaged.passRetained(ctx).toOpaque()
-                        let rc = dpcmGPU.map { enc in
-                            tb_dpcm_gpu_encode_bands_async(
-                                enc, origin, Int32(stride), Int32(r.w), Int32(r.h),
-                                1, isTenBit ? 1 : 0, reserve, tbDPCMAsyncDone, opaque)
-                        } ?? -1
-                        if rc != 0 {
-                            Unmanaged<TBDPCMFrameContext>.fromOpaque(opaque).release()
-                        } else {
-                            sentAny = true
-                        }
-                    }
-
-                    if sentAny {
-                        pathRectFrames += 1
-                        pathRectFraction += Double(rects.reduce(0) { $0 + $1.w * $1.h })
-                            / Double(width * height)
-                        let process = (Self.hostNow() - frameEnteredAt) * 1000.0
-                        if process >= 0, process < 500 {
-                            latProcessSum += process
-                            latProcessMax = max(latProcessMax, process)
-                            latSamples += 1
-                        }
-                        lock.lock()
-                        _sentFrames += 1
-                        _rawFormatIsBGRA = true
-                        _rawFormatIsTenBit = isTenBit
-                        lock.unlock()
-                        return
-                    }
-                    // Every rect was refused; fall through to a whole frame
-                    // rather than show a frame's worth of nothing.
-                }
-
-                // Whole frame (as bands). Also the keyframe that bounds how long
-                // any mis-placed rect can persist.
-                pathWholeFrames += 1
-                framesSinceDPCMKey = 0
-                // The receiver now has a complete surface, so rects may patch it.
-                dpcmHasKeyframe = true
+                // Every frame is a whole frame, sent as bands.
                 let wantSlices = dpcmSlicesEnabled ? max(1, dpcmSliceCount) : 1
                 let bandRows = height / wantSlices
                 let sliceCount = (wantSlices > 1 && bandRows % Int(TB_DPCM_TILE) == 0
@@ -1593,12 +1367,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
                         latSamples += 1
                     }
 
-                    // Nothing incremental is in flight, so a later fall back to
-                    // the uncompressed path must start from a full frame.
-                    needsKeyframe = true
-                    lastDamageW = 0
-                    lastDamageH = 0
-                    carriedDirty.removeAll(keepingCapacity: true)
 
                     lock.lock()
                     _sentFrames += 1
@@ -1619,63 +1387,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 // Encoder refused (only possible on a bad size or capacity):
                 // fall through and send the frame uncompressed.
             }
-
-            // Damage path: resend only what the WindowServer says changed.
-            // A full frame is still required on the first frame, on any format
-            // or size change, periodically as a resync, and when the damaged
-            // area is big enough that per-rect overhead outweighs the saving.
-            if damageEnabled,
-               !needsKeyframe,
-               fmt == lastDamageFormat, width == lastDamageW, height == lastDamageH,
-               // ~1s resync. A 59 MB full frame takes longer than a frame
-               // period to transmit, so sending them too often is itself a
-               // source of backpressure — 0.5s measurably hurt.
-               framesSinceKeyframe < 60,
-               let fresh = Self.dirtyRects(from: sampleBuffer, width: width, height: height),
-               case let rects = (carriedDirty + fresh),
-               !rects.isEmpty, rects.count <= 64,
-               rects.reduce(0, { $0 + $1.w * $1.h }) * 2 < width * height {
-
-                var d = Data(capacity: 11 + rects.reduce(0) { $0 + 16 + $1.w * $1.h * 4 })
-                d.append(fmt)
-                TBMonitorProtocol.appendBE32(&d, UInt32(width))
-                TBMonitorProtocol.appendBE32(&d, UInt32(height))
-                d.append(UInt8((rects.count >> 8) & 0xFF))
-                d.append(UInt8(rects.count & 0xFF))
-                let src = base.assumingMemoryBound(to: UInt8.self)
-                for r in rects {
-                    TBMonitorProtocol.appendBE32(&d, UInt32(r.x))
-                    TBMonitorProtocol.appendBE32(&d, UInt32(r.y))
-                    TBMonitorProtocol.appendBE32(&d, UInt32(r.w))
-                    TBMonitorProtocol.appendBE32(&d, UInt32(r.h))
-                    // Rows packed tight — the source stride's padding is not sent.
-                    for row in 0..<r.h {
-                        d.append(UnsafeBufferPointer(start: src + (r.y + row) * stride + r.x * 4,
-                                                     count: r.w * 4))
-                    }
-                }
-                carriedDirty.removeAll(keepingCapacity: true)
-                framesSinceKeyframe += 1
-                let dmg = TBMonitorProtocol.makePacket(type: .rawDamage, payload: d)
-                pendingRetain()
-                connection.send(content: dmg, completion: .contentProcessed({ [weak self] _ in
-                    guard let self else { return }
-                    self.pendingRelease()
-                }))
-                lock.lock()
-                _sentFrames += 1
-                _rawFormatIsBGRA = true
-                _rawFormatIsTenBit = isTenBit
-                lock.unlock()
-                return
-            }
-
-            lastDamageFormat = fmt
-            lastDamageW = width
-            lastDamageH = height
-            framesSinceKeyframe = 0
-            needsKeyframe = false
-            carriedDirty.removeAll(keepingCapacity: true)
 
             var p = Data(capacity: 13 + size)
             p.append(fmt) // format: ARGB2101010 / BGRA8888, both 4:4:4
@@ -1825,35 +1536,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
     }
 
 
-    struct TBDirtyRect { let x: Int; let y: Int; let w: Int; let h: Int }
-
-    /// Pull the WindowServer's dirty rectangles off the sample buffer. This is
-    /// why damage detection costs nothing: the compositor already computed the
-    /// changed regions to draw the frame, and ScreenCaptureKit attaches them.
-    /// Returns nil when unavailable, which forces a full frame.
-    private static func dirtyRects(from sb: CMSampleBuffer, width: Int, height: Int) -> [TBDirtyRect]? {
-        guard let arr = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false)
-                as? [[SCStreamFrameInfo: Any]],
-              let info = arr.first,
-              let raw = info[.dirtyRects] as? [[String: Any]]
-        else { return nil }
-
-        var out: [TBDirtyRect] = []
-        out.reserveCapacity(raw.count)
-        for entry in raw {
-            guard let r = CGRect(dictionaryRepresentation: entry as CFDictionary) else { return nil }
-            // Clamp into the frame and round outward, so a fractional rect can
-            // never leave a stale sliver behind.
-            let x0 = max(0, Int(r.minX.rounded(.down)))
-            let y0 = max(0, Int(r.minY.rounded(.down)))
-            let x1 = min(width,  Int(r.maxX.rounded(.up)))
-            let y1 = min(height, Int(r.maxY.rounded(.up)))
-            if x1 <= x0 || y1 <= y0 { continue }
-            out.append(TBDirtyRect(x: x0, y: y0, w: x1 - x0, h: y1 - y0))
-        }
-        // A great many small rects costs more in overhead than it saves.
-        return out.count <= 64 ? out : nil
-    }
 
     private func buildParamSetsPacket(from format: CMVideoFormatDescription, codecType: CMVideoCodecType) -> Data? {
         if codecType == kCMVideoCodecType_HEVC {
@@ -1964,7 +1646,6 @@ private final class TBOnceFlag: @unchecked Sendable {
 @MainActor
 final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @unchecked Sendable {
     private static let receiverIPDefaultsKey = "fd.tbdisplaysender.receiverIP"
-    private static let damageRectsDefaultsKey = "fd.tbdisplaysender.damageRects"
     private struct SavedExtendedDisplayArrangement {
         let x: Int32
         let y: Int32
@@ -2103,12 +1784,6 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     // Full-color 4:4:4: capture 8-bit BGRA instead of 4:2:0 NV12 — no chroma
     // subsampling, so colored edges/text are crisp. ~28 Gb/s at 5K@60, so it
     // realistically needs dual-cable. Raw presets only.
-    /// Send only the rectangles that changed. Big win for static/desktop work;
-    /// no help when the whole screen changes every frame (video, scrolling),
-    /// where it adds per-rect overhead on top of a full frame. Default on.
-    @Published var damageRects: Bool = UserDefaults.standard.object(forKey: damageRectsDefaultsKey) as? Bool ?? true {
-        didSet { UserDefaults.standard.set(damageRects, forKey: Self.damageRectsDefaultsKey) }
-    }
     @Published var selectedReceiverID = "" {
         didSet {
             if selectedReceiverID.isEmpty {
@@ -2308,7 +1983,6 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var receiverSupportsFloat32Audio = false
     private var receiverSupportsDPCM = false
     private var receiverSupportsDPCMSlices = false
-    private var receiverSupportsDPCMRects = false
     private var activeProfile: TBMonitorDisplayProfile?
     private var activeCodecType: CMVideoCodecType?
     private var activeCodecName: String?
@@ -3507,11 +3181,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // covers a profile that turns up on an already-running pipeline.
         receiverSupportsDPCM = profile.supportsDPCM ?? false
         receiverSupportsDPCMSlices = profile.supportsDPCMSlices ?? false
-        receiverSupportsDPCMRects = profile.supportsDPCMRects ?? false
         pipeline?.dpcmEnabled = receiverSupportsDPCM
         pipeline?.dpcmSlicesEnabled = receiverSupportsDPCMSlices
-        pipeline?.dpcmRectsEnabled = receiverSupportsDPCMRects
-        TBLog.connection.info("receiver caps: dpcm=\(self.receiverSupportsDPCM, privacy: .public) slices=\(self.receiverSupportsDPCMSlices, privacy: .public) rects=\(self.receiverSupportsDPCMRects, privacy: .public) float32Audio=\(self.receiverSupportsFloat32Audio, privacy: .public)")
+        TBLog.connection.info("receiver caps: dpcm=\(self.receiverSupportsDPCM, privacy: .public) slices=\(self.receiverSupportsDPCMSlices, privacy: .public) float32Audio=\(self.receiverSupportsFloat32Audio, privacy: .public)")
         // The shipped-log file is a rolling record across sessions, so mark
         // where this one starts; without it a reader cannot tell one run's
         // output from the next.
@@ -3639,10 +3311,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     Task { @MainActor in self?.handleFirstEncodedFrame() }
                 }
             )
-            pipeline.damageEnabled = damageRects
             pipeline.dpcmEnabled = receiverSupportsDPCM
             pipeline.dpcmSlicesEnabled = receiverSupportsDPCMSlices
-            pipeline.dpcmRectsEnabled = receiverSupportsDPCMRects
             guard pipeline.start() else { return false }
             startAudioDeviceCaptureIfNeeded()
             self.pipeline = pipeline
