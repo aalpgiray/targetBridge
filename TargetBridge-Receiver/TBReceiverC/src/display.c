@@ -499,13 +499,17 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
 static void tb_disp_refresh_window_mode(struct tb_display *d) {
     if (!d || !d->win) return;
 
-    if ((d->is_connected || d->is_connecting) && d->preferred_fullscreen) {
+    const int monitor_shield_active =
+        (d->is_connected || d->is_connecting) && d->preferred_fullscreen;
+
+    if (monitor_shield_active) {
         SDL_SetWindowFullscreen(d->win, SDL_WINDOW_FULLSCREEN_DESKTOP);
     } else {
         SDL_SetWindowFullscreen(d->win, 0);
         SDL_SetWindowSize(d->win, 980, 620);
         SDL_SetWindowPosition(d->win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     }
+    tb_receiver_set_monitor_shield(monitor_shield_active);
 
     const int should_hide_cursor =
         ((d->is_connected || d->is_connecting) && d->preferred_fullscreen) ||
@@ -1479,12 +1483,14 @@ unsigned int tb_disp_poll_actions(struct tb_display *d) {
                 if (ev.button.button == SDL_BUTTON_LEFT) input_event.kind = TB_INPUT_EVENT_LEFT_DOWN;
                 else if (ev.button.button == SDL_BUTTON_RIGHT) input_event.kind = TB_INPUT_EVENT_RIGHT_DOWN;
                 else input_event.kind = TB_INPUT_EVENT_OTHER_DOWN;
+                input_event.click_count = ev.button.clicks;
                 tb_disp_queue_input_event(d, &input_event);
                 break;
             case SDL_MOUSEBUTTONUP:
                 if (ev.button.button == SDL_BUTTON_LEFT) input_event.kind = TB_INPUT_EVENT_LEFT_UP;
                 else if (ev.button.button == SDL_BUTTON_RIGHT) input_event.kind = TB_INPUT_EVENT_RIGHT_UP;
                 else input_event.kind = TB_INPUT_EVENT_OTHER_UP;
+                input_event.click_count = ev.button.clicks;
                 tb_disp_queue_input_event(d, &input_event);
                 break;
             case SDL_KEYDOWN:

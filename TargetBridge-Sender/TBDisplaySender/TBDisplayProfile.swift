@@ -4,7 +4,10 @@ struct TBDisplayProfileSettings: Equatable {
     let captureSource: TBDisplayCaptureSource
     let capturePreset: TBDisplayCapturePreset
     let matchRenderToStream: Bool
-    let audioEnabled: Bool
+    /// `nil` keeps the user's existing audio preference when a display profile
+    /// is applied. A display profile should tune video without silently
+    /// disabling audio for future sessions.
+    let audioEnabled: Bool?
 }
 
 enum TBDisplayProfile: String, CaseIterable, Identifiable, Codable {
@@ -21,14 +24,14 @@ enum TBDisplayProfile: String, CaseIterable, Identifiable, Codable {
                 captureSource: .extendedDesktop,
                 capturePreset: .native5k,
                 matchRenderToStream: true,
-                audioEnabled: false
+                audioEnabled: nil
             )
         case .lowLatency:
             return TBDisplayProfileSettings(
                 captureSource: .desktopMirror,
                 capturePreset: .smooth1440p60,
                 matchRenderToStream: false,
-                audioEnabled: false
+                audioEnabled: nil
             )
         case .presentation:
             return TBDisplayProfileSettings(

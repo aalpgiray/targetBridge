@@ -158,7 +158,8 @@ clang -arch x86_64 -mmacosx-version-min=$MIN_MACOS -o "$OBJ/tbreceiver" "${objs[
     -framework CoreGraphics -framework CoreText -framework VideoToolbox \
     -framework CoreMedia -framework CoreVideo -framework IOSurface \
     -framework CoreServices -framework CoreAudio -framework AVFoundation \
-    -framework Metal -framework QuartzCore -framework IOKit
+    -framework Metal -framework QuartzCore -framework IOKit \
+    -framework SystemConfiguration
 
 # ---------------------------------------------------------------- bundle
 echo "==> assembling bundle"

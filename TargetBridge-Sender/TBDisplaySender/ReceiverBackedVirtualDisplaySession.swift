@@ -132,17 +132,26 @@ final class ReceiverBackedVirtualDisplaySession {
         descriptor.maxPixelsWide = UInt32(profile.panelWidth)
         descriptor.maxPixelsHigh = UInt32(profile.panelHeight)
 
-        // Declare Display P3 primaries + D65. Left unset, the virtual display
-        // advertises no colour characteristics and macOS appears to give it a
-        // plain 8-bit sRGB framebuffer — mirroring shows the same behaviour,
-        // where the framebuffer is 10-bit only when optimised for a display
-        // that declares deep colour. These are the only capability knobs the
-        // private CGVirtualDisplayDescriptor exposes (verified by runtime
-        // introspection: it has no depth or pixel-format property at all).
-        descriptor.redPrimary   = NSPoint(x: 0.680,  y: 0.320)
-        descriptor.greenPrimary = NSPoint(x: 0.265,  y: 0.690)
-        descriptor.bluePrimary  = NSPoint(x: 0.150,  y: 0.060)
-        descriptor.whitePoint   = NSPoint(x: 0.3127, y: 0.3290)
+        // Advertise the iMac's wide-gamut SDR space explicitly. Two independent
+        // reasons, both real:
+        //
+        //  - Without chromaticity metadata the display can be handed a generic
+        //    ColorSync profile, and in mirror mode macOS then renders the same
+        //    desktop differently from the built-in Display P3 panel.
+        //  - Declaring colour characteristics at all is part of what stops macOS
+        //    giving this display a plain 8-bit sRGB framebuffer. Mirroring shows
+        //    the same behaviour: the framebuffer is deep only when the display
+        //    it is optimised for declares deep colour. There is no depth or
+        //    pixel-format property on the private descriptor to ask for it
+        //    directly (verified by runtime introspection) — the transfer
+        //    function set on the MODE below is the other half of that.
+        //
+        // Values are the panel's measured primaries rather than the theoretical
+        // Display P3 corners.
+        descriptor.whitePoint = CGPoint(x: 0.3125, y: 0.3291) // D65
+        descriptor.redPrimary = CGPoint(x: 0.6797, y: 0.3203)
+        descriptor.greenPrimary = CGPoint(x: 0.2559, y: 0.6983)
+        descriptor.bluePrimary = CGPoint(x: 0.1494, y: 0.0557)
 
         let ppi = 218.0
         descriptor.sizeInMillimeters = CGSize(

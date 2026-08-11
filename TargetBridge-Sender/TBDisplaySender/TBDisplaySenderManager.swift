@@ -102,6 +102,7 @@ final class TBDisplaySenderService: ObservableObject {
             objectWillChange.send()
         }
     }
+    private var userQuitPending = false
     private var sessionCancellables: [UUID: AnyCancellable] = [:]
     private let receiverDiscovery = TBReceiverDiscovery()
     private let addonStore = TBAddonStore.shared
@@ -116,6 +117,7 @@ final class TBDisplaySenderService: ObservableObject {
         discoveryCancellable = receiverDiscovery.$receivers.sink { [weak self] receivers in
             guard let self else { return }
             discoveredReceivers = receivers
+            reconcileDiscoveredReceivers(receivers)
             pushLanguageUpdateToDiscoveredReceivers()
             objectWillChange.send()
         }
@@ -184,9 +186,6 @@ final class TBDisplaySenderService: ObservableObject {
         isAddonCapabilityEnabled(.audioRelay)
     }
 
-    /// The virtual audio driver. Separate from Audio Relay because it installs a
-    /// system component rather than just streaming: off by default, and worth an
-    /// explicit decision.
     var audioDriverAvailable: Bool {
         isAddonCapabilityEnabled(.audioDriver)
     }
@@ -265,8 +264,7 @@ final class TBDisplaySenderService: ObservableObject {
             session.audioEnabled = previous.audioEnabled
             session.inputGestureMode = previous.inputGestureMode
         }
-        session.audioAddonAvailable = audioTransportAvailable
-        session.audioDriverAvailable = audioDriverAvailable
+        session.audioAddonAvailable = audioRelayAvailable
         if let suggestedInterface = suggestedInterfaceForNewSession(transportKind: session.transportKind) {
             session.localInterfaceIP = suggestedInterface.ip
         }
@@ -287,25 +285,54 @@ final class TBDisplaySenderService: ObservableObject {
         objectWillChange.send()
     }
 
-    func stopAll() {
-        sessions.forEach { $0.persistExtendedDisplayArrangementSnapshot() }
-        sessions.forEach { $0.stop(persistArrangement: false) }
+    func stopAll(completion: (@MainActor @Sendable () -> Void)? = nil) {
+        // A manual stop is an operator decision, not a transient disconnect.
+        TBSenderAutomation.suspendAutomaticReconnectAfterUserStop()
+        let sessionsToStop = sessions
+        sessionsToStop.forEach { $0.persistExtendedDisplayArrangementSnapshot() }
+        guard !sessionsToStop.isEmpty else {
+            completion?()
+            return
+        }
+
+        var remaining = sessionsToStop.count
+        sessionsToStop.forEach { session in
+            session.stop(persistArrangement: false) {
+                remaining -= 1
+                if remaining == 0 {
+                    completion?()
+                }
+            }
+        }
+    }
+
+    func quitAfterUserRequest() {
+        guard !userQuitPending else { return }
+        userQuitPending = true
+
+        // Allow the final teardown reason to reach the Receiver before quitting.
+        stopAll { [weak self] in
+            self?.finishUserRequestedQuit()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.finishUserRequestedQuit()
+        }
+    }
+
+    private func finishUserRequestedQuit() {
+        guard userQuitPending else { return }
+        userQuitPending = false
+        NSApp.terminate(nil)
     }
 
     // MARK: - Session persistence
 
     private static let persistedSessionsKey = "fd.tbdisplaysender.sessions.v1"
     private static let receiverDisplayProfilesKey = "fd.tbdisplaysender.receiverDisplayProfiles.v1"
-    /// One-shot repair for state the audio latch corrupted.
-    ///
-    /// `normalizeAddonState` used to write availability into the persisted
-    /// `audioEnabled`, so a single launch where the addon had not loaded turned
-    /// audio off permanently. That write is gone, but a session saved while the
-    /// bug was live still carries `audioEnabled: false` and would keep it
-    /// forever. Any false written by the latch is indistinguishable from a
-    /// deliberate one, so this restores audio ONCE on sessions whose transport
-    /// is available, and never runs again.
-    private static let audioLatchRepairKey = "fd.tbdisplaysender.audioLatchRepaired.v1"
+    /// Earlier builds persisted `false` when the audio addon had not finished
+    /// loading. Repair that ambiguous state exactly once without making future
+    /// deliberate choices reversible.
+    private static let audioPreferenceRepairKey = "fd.tbdisplaysender.audioPreferenceRepaired.v2"
 
     /// Snapshot of the user-configurable settings for a single session. Transient
     /// runtime state (connection, FPS, …) is intentionally excluded — only the
@@ -380,6 +407,7 @@ final class TBDisplaySenderService: ObservableObject {
             return
         }
 
+        let repairPending = !UserDefaults.standard.bool(forKey: Self.audioPreferenceRepairKey)
         lastPersistedData = data
         for config in configs {
             let session = TBDisplaySenderSession(
@@ -391,14 +419,18 @@ final class TBDisplaySenderService: ObservableObject {
                 verboseDisplayLogging: verboseDisplayLogging
             )
             apply(config, to: session)
-            session.audioAddonAvailable = audioTransportAvailable
-            session.audioDriverAvailable = audioDriverAvailable
+            session.audioAddonAvailable = audioRelayAvailable
             attachSession(session)
             sessions.append(session)
         }
-        // Mark the latch repair done whether or not it changed anything, so a
-        // later deliberate "audio off" is never second-guessed.
-        UserDefaults.standard.set(true, forKey: Self.audioLatchRepairKey)
+        if repairPending {
+            UserDefaults.standard.set(true, forKey: Self.audioPreferenceRepairKey)
+            // The repaired value was applied before the session observer was
+            // attached, so persist it explicitly rather than waiting for a
+            // later user action or letting the next launch restore `false`.
+            lastPersistedData = nil
+            persistSessions()
+        }
         // Enforce the single-master invariant: only one session may hold a
         // non-`off` input role. (Persisted data should already satisfy this, but
         // restore sets roles directly, so guard against stale/edited defaults.)
@@ -437,13 +469,10 @@ final class TBDisplaySenderService: ObservableObject {
         session.receiverIP = config.receiverIP
         session.selectedReceiverID = config.selectedReceiverID
         session.localInterfaceIP = config.localInterfaceIP
-        if !UserDefaults.standard.bool(forKey: Self.audioLatchRepairKey),
-           audioTransportAvailable,
-           !config.audioEnabled {
-            session.audioEnabled = true
-        } else {
-            session.audioEnabled = config.audioEnabled
-        }
+        session.audioEnabled = Self.restoredAudioEnabled(
+            from: config.audioEnabled,
+            repairPending: !UserDefaults.standard.bool(forKey: Self.audioPreferenceRepairKey)
+        )
         session.brightness = config.brightness
         session.volume = config.volume ?? 0.5
         session.matchRenderToStream = config.matchRenderToStream ?? false
@@ -468,6 +497,29 @@ final class TBDisplaySenderService: ObservableObject {
         objectWillChange.send()
     }
 
+    /// Bonjour can rediscover the same receiver with a new address after a
+    /// cable reconnect or wake. Keep selected receivers on their active
+    /// transport address, while leaving manually entered addresses untouched.
+    private func reconcileDiscoveredReceivers(_ receivers: [TBDiscoveredReceiver]) {
+        for session in sessions where
+            !session.selectedReceiverID.isEmpty &&
+            !session.isConnected &&
+            !session.isStreaming {
+            let savedServiceName = String(
+                session.selectedReceiverID.split(separator: "|", maxSplits: 1).first ?? ""
+            )
+            guard let receiver = receivers.first(where: {
+                $0.id == session.selectedReceiverID || $0.serviceName == savedServiceName
+            }) else {
+                continue
+            }
+
+            session.selectedReceiverID = receiver.id
+            session.receiverIP = receiver.ip(for: session.transportKind)
+            session.receiverSupportsHEVCDecodeHint = receiver.supportsHEVCDecode
+        }
+    }
+
     func applyDisplayProfile(_ profile: TBDisplayProfile, to session: TBDisplaySenderSession) {
         guard !session.isConnected, !session.isStreaming else { return }
 
@@ -475,7 +527,9 @@ final class TBDisplaySenderService: ObservableObject {
         session.captureSource = settings.captureSource
         session.capturePreset = settings.capturePreset
         session.matchRenderToStream = settings.matchRenderToStream
-        session.audioEnabled = settings.audioEnabled
+        if let audioEnabled = settings.audioEnabled {
+            session.audioEnabled = audioEnabled
+        }
 
         guard let receiverKey = receiverProfileKey(for: session) else { return }
         var profiles = persistedDisplayProfiles
@@ -571,8 +625,7 @@ final class TBDisplaySenderService: ObservableObject {
     }
 
     private func attachSession(_ session: TBDisplaySenderSession) {
-        session.audioAddonAvailable = audioTransportAvailable
-        session.audioDriverAvailable = audioDriverAvailable
+        session.audioAddonAvailable = audioRelayAvailable
         session.onRemoteSwitchRequest = { [weak self, weak session] direction in
             guard let self, let session else { return }
             self.switchReceiverMasterTarget(from: session, direction: direction)
@@ -652,24 +705,10 @@ final class TBDisplaySenderService: ObservableObject {
 
     private func normalizeAddonState() {
         let networkLinkEnabled = isAddonCapabilityEnabled(.networkLink)
-        let audioEnabled = audioTransportAvailable
+        let audioEnabled = audioRelayAvailable
         let inputEnabled = inputDockstationAvailable
 
         for session in sessions {
-            // Availability is reported, never written into the user's choice.
-            //
-            // This used to do `if !audioEnabled { session.audioEnabled = false }`,
-            // and since `audioEnabled` is the PERSISTED field that latched audio
-            // off for good: one launch where the addon had not loaded yet turned
-            // the preference off, and the addon coming back could not turn it on
-            // again. Observed as `audioEnabled: false` in the saved session with
-            // the addon plainly enabled, which left the sender never binding its
-            // audio port, so the driver's liveness probe found nothing and
-            // withdrew the device from the whole system.
-            //
-            // Nothing needs this write: both places that act on audio check
-            // availability themselves at the point of use, and the UI greys the
-            // control off `audioAddonAvailable`.
             session.audioAddonAvailable = audioEnabled
             if !networkLinkEnabled, session.transportKind == .networkLink {
                 session.transportKind = .thunderboltBridge
@@ -683,6 +722,10 @@ final class TBDisplaySenderService: ObservableObject {
         normalizeSessionInterfaces()
         updateInputRelayController()
         sessions.forEach { $0.updateInputControlMode() }
+    }
+
+    nonisolated static func restoredAudioEnabled(from persistedValue: Bool, repairPending: Bool) -> Bool {
+        repairPending && !persistedValue ? true : persistedValue
     }
 
     private func updateInputRelayController() {

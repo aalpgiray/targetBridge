@@ -2,14 +2,21 @@ name: CI Build Verification
 
 on:
   push:
-    branches: [ main, 3.1-maint, 3.2-dev, dev-3.3.0 ]
+    branches: [ main, 3.1-maint, 3.2-dev, dev-3.3.0, dev-3.4.0 ]
   pull_request:
-    branches: [ main, 3.1-maint, 3.2-dev, dev-3.3.0 ]
+    branches: [ main, 3.1-maint, 3.2-dev, dev-3.3.0, dev-3.4.0 ]
 
 jobs:
   build-sender:
-    name: Build Sender (macOS 15 - Apple Silicon)
-    runs-on: macos-15
+    name: Build Sender (${{ matrix.os }} - ${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: x86_64
+          - os: macos-15
+            arch: arm64
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v6
@@ -26,6 +33,7 @@ jobs:
         run: |
           cd TargetBridge-Sender
           ./scripts/build_targetbridge_sender_app.sh
+          file ../build/TargetBridge.app/Contents/MacOS/TargetBridge | grep -q "${{ matrix.arch }}"
 
       - name: Run Sender Unit Tests
         run: |

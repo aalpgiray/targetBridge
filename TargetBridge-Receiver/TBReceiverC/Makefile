@@ -16,7 +16,7 @@
 
 CC       ?= clang
 PKG      ?= pkgconf
-APP_VERSION ?= 3.2.0
+APP_VERSION ?= 3.5.0
 APP_BUILD   ?= dev
 
 MACOSX_DEPLOYMENT_TARGET ?= 11.0
@@ -37,7 +37,7 @@ LDFLAGS  += $(shell $(PKG) --libs libavcodec libavutil sdl2)
 
 UNAME_S  := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
-LDFLAGS  += -framework ApplicationServices -framework AppKit -framework CoreFoundation -framework CoreGraphics -framework CoreText -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework CoreServices -framework CoreAudio -framework AVFoundation -framework Metal -framework QuartzCore -framework IOKit
+LDFLAGS  += -framework ApplicationServices -framework AppKit -framework CoreFoundation -framework CoreGraphics -framework CoreText -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework CoreServices -framework CoreAudio -framework AVFoundation -framework Metal -framework QuartzCore -framework IOKit -framework SystemConfiguration
 endif
 
 C_SRC = src/main.c src/net.c src/decoder.c src/display.c src/tb_i18n.c src/tb_logship.c
@@ -65,11 +65,15 @@ clean:
 # Unit tests. net.c and tb_dpcm.c are pure POSIX/libc, so these need no
 # ffmpeg/SDL/pkgconf — they run anywhere, including CI, with no hardware.
 TEST_CFLAGS = -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11
+TEST_LDFLAGS =
+ifeq ($(UNAME_S),Darwin)
+TEST_LDFLAGS += -framework CoreFoundation -framework SystemConfiguration
+endif
 TEST_BIN = test_net_parser
 TEST_DPCM_BIN = test_dpcm
 
 $(TEST_BIN): tests/test_net_parser.c src/net.c src/net.h src/proto.h
-	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_parser.c src/net.c -o $@
+	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_parser.c src/net.c $(TEST_LDFLAGS) -o $@
 
 $(TEST_DPCM_BIN): tests/test_dpcm.c $(CODEC)/tb_dpcm.c $(CODEC)/tb_dpcm.h
 	$(CC) $(TEST_CFLAGS) -I$(CODEC) tests/test_dpcm.c $(CODEC)/tb_dpcm.c -o $@

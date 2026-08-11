@@ -6,6 +6,7 @@ import Darwin
 import Foundation
 import AVFoundation
 import IOSurface
+import IOKit.pwr_mgt
 import Network
 import os
 @preconcurrency import ScreenCaptureKit
@@ -108,6 +109,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     case smooth1440p60
     case smooth1800p60
     case crisp2160p60
+    case retina4k60
     case native5k
     case native5kRaw60
     case native5k60Experimental
@@ -136,6 +138,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "Smooth+"
         case .crisp2160p60:
             return "Crisp"
+        case .retina4k60:
+            return "Retina 4K"
         case .native5k:
             return "5K"
         case .native5kRaw60:
@@ -155,6 +159,8 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return "3200 × 1800 @ 60"
         case .crisp2160p60:
             return "3840 × 2160 @ 60"
+        case .retina4k60:
+            return "4096 × 2304 @ 60"
         case .native5k:
             return "5120 × 2880 @ 48"
         case .native5kRaw60:
@@ -172,7 +178,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 3200
         case .crisp2160p60:
             return 3840
-        case .native5k, .native5kRaw60, .native5k60Experimental:
+        case .retina4k60, .native5k, .native5kRaw60, .native5k60Experimental:
             return 5120
         }
     }
@@ -185,7 +191,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 1800
         case .crisp2160p60:
             return 2160
-        case .native5k, .native5kRaw60, .native5k60Experimental:
+        case .retina4k60, .native5k, .native5kRaw60, .native5k60Experimental:
             return 2880
         }
     }
@@ -200,7 +206,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 78_000_000
         case .crisp2160p60:
             return 105_000_000
-        case .native5k, .native5kRaw60:
+        case .retina4k60, .native5k, .native5kRaw60:
             return 120_000_000
         case .native5k60Experimental:
             return 150_000_000
@@ -211,7 +217,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
             return "H.264"
-        case .crisp2160p60, .native5k, .native5k60Experimental:
+        case .crisp2160p60, .retina4k60, .native5k, .native5k60Experimental:
             return "HEVC"
         case .native5kRaw60:
             return "RAW NV12"
@@ -222,7 +228,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
             return kCMVideoCodecType_H264
-        case .crisp2160p60, .native5k, .native5kRaw60, .native5k60Experimental:
+        case .crisp2160p60, .retina4k60, .native5k, .native5kRaw60, .native5k60Experimental:
             return kCMVideoCodecType_HEVC
         }
     }
@@ -245,7 +251,20 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         if let envVal = ProcessInfo.processInfo.environment["QD"], let parsed = Int(envVal) {
             return parsed
         }
-        return 8
+        switch self {
+        case .standard1440p:
+            return 3
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60:
+            // Upstream's tuning for 4K: five surfaces keep WindowServer fed
+            // without letting an application-side backlog build.
+            return 5
+        case .native5k, .native5kRaw60, .native5k60Experimental:
+            // Apple's default, and measured. At 5K the capture callback ran
+            // 10-14 ms against a 16.7 ms period, so a shallower queue left SCK
+            // with nowhere to put the next frame -- which reads as "macOS did
+            // not draw it" and was misattributed that way for a long time.
+            return 8
+        }
     }
 
     var expectedFrameRate: Int {
@@ -256,13 +275,20 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .smooth1800p60:
             return 60
-        case .crisp2160p60:
+        case .crisp2160p60, .retina4k60:
             return 60
         case .native5k:
             return 48
         case .native5kRaw60, .native5k60Experimental:
             return 60
         }
+    }
+
+    /// ScreenCaptureKit treats `minimumFrameInterval` as a throttle rather than
+    /// a target cadence. Requesting headroom avoids losing refreshes to scheduler
+    /// tolerance; `TBFrameRatePacer` applies the exact output ceiling later.
+    var captureRequestFrameRate: Int {
+        expectedFrameRate >= 48 ? expectedFrameRate * 2 : expectedFrameRate
     }
 
     var maxKeyFrameInterval: Int {
@@ -273,7 +299,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .smooth1800p60:
             return 60
-        case .crisp2160p60:
+        case .crisp2160p60, .retina4k60:
             return 60
         case .native5k:
             return 48
@@ -288,7 +314,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 2
         case .smooth1440p60:
             return 1
-        case .smooth1800p60, .crisp2160p60:
+        case .smooth1800p60, .crisp2160p60, .retina4k60:
             return 1
         case .native5k, .native5kRaw60, .native5k60Experimental:
             return 1
@@ -299,7 +325,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return false
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5kRaw60, .native5k60Experimental:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .native5k, .native5kRaw60, .native5k60Experimental:
             return true
         }
     }
@@ -315,7 +341,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return 1
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5kRaw60, .native5k60Experimental:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .native5k, .native5kRaw60, .native5k60Experimental:
             return 0
         }
     }
@@ -324,7 +350,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p:
             return false
-        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .native5k, .native5kRaw60, .native5k60Experimental:
+        case .smooth1440p60, .smooth1800p60, .crisp2160p60, .retina4k60, .native5k, .native5kRaw60, .native5k60Experimental:
             return true
         }
     }
@@ -340,7 +366,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         switch self {
         case .standard1440p, .smooth1440p60, .smooth1800p60:
             return .nominal
-        case .crisp2160p60, .native5k, .native5kRaw60, .native5k60Experimental:
+        case .crisp2160p60, .retina4k60, .native5k, .native5kRaw60, .native5k60Experimental:
             return .best
         }
     }
@@ -351,7 +377,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
             return 60
         case .smooth1440p60, .smooth1800p60:
             return 60
-        case .crisp2160p60:
+        case .crisp2160p60, .retina4k60:
             return 60
         case .native5k:
             return 48
@@ -373,6 +399,47 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     /// Logical desktop size the user ends up with under render matching.
     var renderMatchedDesktopDescription: String {
         "\(width / 2) × \(height / 2)"
+    }
+}
+
+/// A zero-buffer frame-rate ceiling for capture callbacks. Deadlines advance on
+/// the ideal output timeline, allowing 75 Hz input to be sampled evenly at 60 Hz.
+/// Long idle gaps reset the cadence instead of accumulating burst credit.
+struct TBFrameRatePacer {
+    private let frameInterval: CMTime
+    private let deadlineTolerance = CMTime(value: 1, timescale: 10_000)
+    private var nextDeadline: CMTime?
+
+    init(maximumFrameRate: Int) {
+        frameInterval = maximumFrameRate > 0
+            ? CMTime(value: 1, timescale: CMTimeScale(maximumFrameRate))
+            : .invalid
+    }
+
+    mutating func shouldEmit(presentationTime: CMTime) -> Bool {
+        guard frameInterval.isValid, presentationTime.isValid,
+              !presentationTime.isIndefinite else { return true }
+
+        guard let deadline = nextDeadline else {
+            nextDeadline = CMTimeAdd(presentationTime, frameInterval)
+            return true
+        }
+
+        if CMTimeCompare(presentationTime, CMTimeSubtract(deadline, frameInterval)) < 0 {
+            nextDeadline = CMTimeAdd(presentationTime, frameInterval)
+            return true
+        }
+
+        guard CMTimeCompare(CMTimeAdd(presentationTime, deadlineTolerance), deadline) >= 0 else {
+            return false
+        }
+
+        if CMTimeCompare(CMTimeSubtract(presentationTime, deadline), frameInterval) > 0 {
+            nextDeadline = CMTimeAdd(presentationTime, frameInterval)
+        } else {
+            nextDeadline = CMTimeAdd(deadline, frameInterval)
+        }
+        return true
     }
 }
 
@@ -713,6 +780,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
     private var inFlightEncodeFrames = 0
     private var displayStreamFrameSequence: CMTimeValue = 0
     private var lastEncodedDisplayPTS: CMTime?
+    private var frameRatePacer: TBFrameRatePacer
     private var ackSent: Bool
     private var running = false
 
@@ -730,6 +798,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
     // Read from the main thread (fps timer / watchdog); guarded by `lock`.
     private let lock = NSLock()
     private var _sentFrames = 0
+    private var capturedFrames = 0
+    private var droppedByFrameRatePacer = 0
+    private var droppedBeforeEncodeFrames = 0
+    private var droppedAfterEncodeFrames = 0
     private var _lastCaptureFrameAt = Date()
 
     init(preset: TBDisplayCapturePreset,
@@ -746,6 +818,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         self.displayName = displayName
         self.displayID = displayID
         self.usesRawNV12 = usesRawNV12
+        self.frameRatePacer = TBFrameRatePacer(maximumFrameRate: preset.expectedFrameRate)
         self.ackSent = ackAlreadySent
         self.onFirstFrame = onFirstFrame
     }
@@ -798,11 +871,22 @@ private final class TBVideoPipeline: @unchecked Sendable {
         return _lastCaptureFrameAt
     }
 
-    func diagnosticsSnapshot() -> (pending: Int, inFlight: Int, ptsSeq: CMTimeValue) {
-        queue.sync { (pending: pendingCount(), inFlight: inFlightEncodeFrames, ptsSeq: displayStreamFrameSequence) }
+    func diagnosticsSnapshot() -> (pending: Int, inFlight: Int, ptsSeq: CMTimeValue, captured: Int, droppedPacing: Int, droppedPre: Int, droppedPost: Int) {
+        queue.sync {
+            (
+                pending: pendingCount(),
+                inFlight: inFlightEncodeFrames,
+                ptsSeq: displayStreamFrameSequence,
+                captured: capturedFrames,
+                droppedPacing: droppedByFrameRatePacer,
+                droppedPre: droppedBeforeEncodeFrames,
+                droppedPost: droppedAfterEncodeFrames
+            )
+        }
     }
 
     private func markCaptureFrame() {
+        capturedFrames += 1
         lock.lock(); _lastCaptureFrameAt = Date(); lock.unlock()
     }
 
@@ -901,7 +985,12 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// SCStream capture path. Must be dispatched onto `queue` by the caller.
     func encode(_ sampleBuffer: CMSampleBuffer) {
         markCaptureFrame()
-        if rawEnabled {
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        guard frameRatePacer.shouldEmit(presentationTime: pts) else {
+            droppedByFrameRatePacer += 1
+            return
+        }
+        if usesRawNV12 {
             sendRawFrame(sampleBuffer)
             return
         }
@@ -911,9 +1000,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
         if preset.dropsBeforeEncodeWhenBacklogged,
            (pendingCount() >= preset.maxPendingVideoPackets ||
             inFlightEncodeFrames >= preset.maxInFlightEncodeFrames) {
+            droppedBeforeEncodeFrames += 1
             return
         }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         encode(pixelBuffer: pixelBuffer, presentationTimeStamp: pts, using: encoder)
     }
 
@@ -922,9 +1011,22 @@ private final class TBVideoPipeline: @unchecked Sendable {
     func encodeDisplaySurface(_ surface: IOSurfaceRef, displayTime: UInt64) {
         markCaptureFrame()
         guard running, let encoder = vtEncoder else { return }
+
+        var pts = displayTime != 0
+            ? CMClockMakeHostTimeFromSystemUnits(displayTime)
+            : CMClockGetTime(CMClockGetHostTimeClock())
+        if let last = lastEncodedDisplayPTS, CMTimeCompare(pts, last) <= 0 {
+            // VTCompressionSession requires strictly increasing PTS.
+            pts = CMTimeAdd(last, CMTime(value: 1, timescale: 600))
+        }
+        guard frameRatePacer.shouldEmit(presentationTime: pts) else {
+            droppedByFrameRatePacer += 1
+            return
+        }
         if preset.dropsBeforeEncodeWhenBacklogged,
            (pendingCount() >= preset.maxPendingVideoPackets ||
             inFlightEncodeFrames >= preset.maxInFlightEncodeFrames) {
+            droppedBeforeEncodeFrames += 1
             return
         }
 
@@ -951,13 +1053,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
         // frame-counter PTS would drift away from real wall-clock time over a
         // long session and pace the receiver progressively wrong. displayTime is
         // in mach-absolute units, the same host clock the SCStream path uses.
-        var pts = displayTime != 0
-            ? CMClockMakeHostTimeFromSystemUnits(displayTime)
-            : CMClockGetTime(CMClockGetHostTimeClock())
-        if let last = lastEncodedDisplayPTS, CMTimeCompare(pts, last) <= 0 {
-            // VTCompressionSession requires strictly increasing PTS.
-            pts = CMTimeAdd(last, CMTime(value: 1, timescale: 600))
-        }
         lastEncodedDisplayPTS = pts
         encode(pixelBuffer: pixelBuffer, presentationTimeStamp: pts, using: encoder)
     }
@@ -1140,6 +1235,12 @@ private final class TBVideoPipeline: @unchecked Sendable {
         guard running,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
+        // Backpressure: never pile frames on top of a network that can't keep up.
+        if pendingCount() >= preset.maxPendingVideoPackets {
+            droppedBeforeEncodeFrames += 1
+            return
+        }
+        guard CVPixelBufferGetPlaneCount(pixelBuffer) >= 2 else { return }
         noteCapture(sampleBuffer)
 
         // Deliberate decimation, before any work is done on this frame.
@@ -2274,6 +2375,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
     private var sentSnapshot = 0
     private var sessionAckSent = false
+    private var captureBlockedByScreenRecordingPermission = false
     private var fpsTimer: Timer?
     private var heartbeatTimer: Timer?
     private var firstFrameTimer: Timer?
@@ -2289,6 +2391,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var heartbeatSequence: UInt64 = 0
     private var statusState: TBDisplaySenderStatusState = .ready
     private var streamingActivity: NSObjectProtocol?
+    private var displayWakeAssertionID = IOPMAssertionID(0)
     private var lastCheckedCursor: NSCursor?
     private var lastCheckedCursorType: Int = 0
     private var baselineDisplayIDs = Set<CGDirectDisplayID>()
@@ -2464,7 +2567,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return kCMVideoCodecType_HEVC
             }
             return kCMVideoCodecType_H264
-        case .crisp2160p60, .native5k, .native5kRaw60, .native5k60Experimental:
+        case .crisp2160p60, .retina4k60, .native5k, .native5kRaw60, .native5k60Experimental:
             return preset.codecType
         }
     }
@@ -2763,19 +2866,43 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
     }
 
-    func stop(persistArrangement: Bool = true) {
-        stop(resetStatusTo: .stopped, persistArrangement: persistArrangement)
+    func stop(
+        persistArrangement: Bool = true,
+        completion: (@MainActor @Sendable () -> Void)? = nil
+    ) {
+        TBSenderAutomation.suspendAutomaticReconnectAfterUserStop()
+        stop(
+            resetStatusTo: .stopped,
+            persistArrangement: persistArrangement,
+            teardownReason: "sender_user_stop",
+            teardownCompletion: completion
+        )
+    }
+
+    /// Internal retry stop. Unlike a GUI Stop, this must not disable the
+    /// LaunchAgent marker that represents the user's monitor-mode choice.
+    func stopForAutomaticReconnect() {
+        stop(
+            resetStatusTo: .stopped,
+            persistArrangement: false,
+            teardownReason: "sender_internal_stop"
+        )
     }
 
     func persistExtendedDisplayArrangementSnapshot() {
         persistExtendedDisplayArrangementIfNeeded()
     }
 
-    private func stop(resetStatusTo status: TBDisplaySenderStatusState?, persistArrangement: Bool = true) {
+    private func stop(
+        resetStatusTo status: TBDisplaySenderStatusState?,
+        persistArrangement: Bool = true,
+        teardownReason: String = "sender_internal_stop",
+        teardownCompletion: (@MainActor @Sendable () -> Void)? = nil
+    ) {
+        let connectionToClose = connection
         if persistArrangement {
             persistExtendedDisplayArrangementIfNeeded()
         }
-        sendTeardown(reason: "sender_stop")
         connectTimeoutWorkItem?.cancel()
         connectTimeoutWorkItem = nil
         heartbeatTimer?.invalidate()
@@ -2800,21 +2927,20 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             scStream = nil
         }
         captureDelegate = nil
-        if let activity = streamingActivity {
-            ProcessInfo.processInfo.endActivity(activity)
-            streamingActivity = nil
-        }
-        stopAudioDeviceCapture()
-        keepWarm.stop()
+        endCaptureActivity()
         pipeline?.stop()
         pipeline = nil
         releaseInjectedModifiersIfNeeded()
         remoteHeldModifierKeyCodes.removeAll()
         injectedLeftClickTracker.reset()
         suppressedTriggerKeyCode = nil
-        connection?.stateUpdateHandler = nil
-        connection?.cancel()
+        connectionToClose?.stateUpdateHandler = nil
         connection = nil
+        sendTeardownAndClose(
+            reason: teardownReason,
+            over: connectionToClose,
+            completion: teardownCompletion
+        )
         let currentSession = session
         Task { @MainActor in
             currentSession.destroy()
@@ -2844,8 +2970,35 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// (distinct per machine even when two identical iMacs report the same SDL
     /// display name), falling back to the receiver-reported name.
     private func receiverIdentityDiscriminator(for profile: TBMonitorDisplayProfile) -> String {
-        let trimmedIP = receiverIP.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmedIP.isEmpty ? profile.receiverName : trimmedIP
+        // Bonjour keeps the service name stable across Thunderbolt link-local IP
+        // changes. Using the address here made macOS forget a receiver's virtual
+        // display identity and saved placement after a wake or reconnect.
+        if let receiver = TBDisplaySenderService.shared.discoveredReceivers.first(where: {
+            $0.id == selectedReceiverID ||
+            $0.preferredIP == receiverIP ||
+            $0.thunderboltIP == receiverIP ||
+            $0.networkIP == receiverIP
+        }) {
+            return receiver.stableIdentity
+        }
+
+        let selectedID = selectedReceiverID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let serviceName = selectedID.split(separator: "|", maxSplits: 1).first,
+           !serviceName.isEmpty {
+            return "service:\(serviceName)"
+        }
+
+        if let host = shortHostName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !host.isEmpty {
+            return "host:\(host)"
+        }
+
+        let receiverName = profile.receiverName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !receiverName.isEmpty {
+            return "receiver:\(receiverName)"
+        }
+
+        return "address:\(receiverIP.trimmingCharacters(in: .whitespacesAndNewlines))"
     }
 
     /// Key used to derive the extended-desktop virtual display identity. Shares
@@ -2993,12 +3146,39 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         send(packet)
     }
 
-    private func sendTeardown(reason: String) {
+    private func sendTeardownAndClose(
+        reason: String,
+        over connection: NWConnection?,
+        completion: (@MainActor @Sendable () -> Void)? = nil
+    ) {
+        guard let connection else {
+            completion?()
+            return
+        }
         guard let packet = TBMonitorProtocol.makeJSONPacket(
             type: .teardown,
             value: TBMonitorTeardown(reason: reason)
-        ) else { return }
-        send(packet)
+        ) else {
+            connection.cancel()
+            completion?()
+            return
+        }
+
+        // Preserve the explicit user/internal reason before closing the socket.
+        // Otherwise the Receiver cannot distinguish Stop from a dropped cable.
+        connection.send(
+            content: packet,
+            contentContext: .finalMessage,
+            isComplete: true,
+            completion: .contentProcessed { _ in
+                connection.cancel()
+                guard let completion else { return }
+                Task { @MainActor in completion() }
+            }
+        )
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0) {
+            connection.cancel()
+        }
     }
 
     private func receiveLoop(on connection: NWConnection) {
@@ -3066,7 +3246,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                         releaseInjectedModifiersIfNeeded()
                         onRemoteDeactivateInputRequest?()
                     } else {
-                        applyIncomingInputEvent(event)
+                        applyIncomingInputEvent(event, payload: payload)
                     }
                 }
             case .heartbeat:
@@ -3188,11 +3368,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
     }
 
-    private func postLocalMouseButton(type: CGEventType, button: CGMouseButton) {
+    private func postLocalMouseButton(type: CGEventType, button: CGMouseButton, clickCount: Int? = nil) {
         logLocalInputInjectionStateIfNeeded(context: "mouseButton")
         guard let current = injectedRemoteMouseLocation ?? currentLocalMouseLocation() else { return }
         guard let event = CGEvent(mouseEventSource: localInputEventSource(), mouseType: type, mouseCursorPosition: current, mouseButton: button) else { return }
-        if button == .left {
+        if let clickCount {
+            event.setIntegerValueField(.mouseEventClickState, value: Int64(min(max(clickCount, 1), 3)))
+        } else if button == .left {
             let clickState: Int
             if type == .leftMouseDown {
                 clickState = injectedLeftClickTracker.registerClick(
@@ -3304,7 +3486,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         controlUp.post(tap: .cghidEventTap)
     }
 
-    private func applyIncomingInputEvent(_ event: TBMonitorInputEvent) {
+    private func applyIncomingInputEvent(_ event: TBMonitorInputEvent, payload: Data) {
         TBInputDebugLog.log("sender applying incoming event kind=\(event.kind)")
         switch event.kind {
         case "move":
@@ -3316,17 +3498,23 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         case "otherDrag":
             postLocalMouseMove(dx: event.dx ?? 0, dy: event.dy ?? 0, type: .otherMouseDragged, button: .center)
         case "leftDown":
-            postLocalMouseButton(type: .leftMouseDown, button: .left)
+            let buttonEvent = TBMonitorProtocol.decodeJSON(TBMonitorInputButtonEvent.self, from: payload)
+            postLocalMouseButton(type: .leftMouseDown, button: .left, clickCount: buttonEvent?.clickCount)
         case "leftUp":
-            postLocalMouseButton(type: .leftMouseUp, button: .left)
+            let buttonEvent = TBMonitorProtocol.decodeJSON(TBMonitorInputButtonEvent.self, from: payload)
+            postLocalMouseButton(type: .leftMouseUp, button: .left, clickCount: buttonEvent?.clickCount)
         case "rightDown":
-            postLocalMouseButton(type: .rightMouseDown, button: .right)
+            let buttonEvent = TBMonitorProtocol.decodeJSON(TBMonitorInputButtonEvent.self, from: payload)
+            postLocalMouseButton(type: .rightMouseDown, button: .right, clickCount: buttonEvent?.clickCount)
         case "rightUp":
-            postLocalMouseButton(type: .rightMouseUp, button: .right)
+            let buttonEvent = TBMonitorProtocol.decodeJSON(TBMonitorInputButtonEvent.self, from: payload)
+            postLocalMouseButton(type: .rightMouseUp, button: .right, clickCount: buttonEvent?.clickCount)
         case "otherDown":
-            postLocalMouseButton(type: .otherMouseDown, button: .center)
+            let buttonEvent = TBMonitorProtocol.decodeJSON(TBMonitorInputButtonEvent.self, from: payload)
+            postLocalMouseButton(type: .otherMouseDown, button: .center, clickCount: buttonEvent?.clickCount)
         case "otherUp":
-            postLocalMouseButton(type: .otherMouseUp, button: .center)
+            let buttonEvent = TBMonitorProtocol.decodeJSON(TBMonitorInputButtonEvent.self, from: payload)
+            postLocalMouseButton(type: .otherMouseUp, button: .center, clickCount: buttonEvent?.clickCount)
         case "scroll":
             postLocalScroll(scrollX: event.scrollX ?? 0, scrollY: event.scrollY ?? 0)
         case "keyDown":
@@ -3495,8 +3683,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return
             }
 
+            // A headless Sender may still expose a sleeping physical display.
+            // Wake and hold the graphical session before virtual display setup.
+            self.beginCaptureActivity()
             self.setStatus(.creatingVirtualDisplay)
-            self.baselineDisplayIDs = await self.fetchShareableDisplayIDs()
+            self.baselineDisplayIDs = self.captureSource == .extendedDesktop
+                ? await self.fetchShareableDisplayIDs()
+                : []
             let receiverKey = self.extendedDisplayIdentityKey(for: profile)
             let modeOverride: TBVirtualDisplayModeSize? = (self.matchRenderToStream && self.captureSource == .extendedDesktop)
                 ? self.capturePreset.renderMatchedDisplayMode
@@ -3521,13 +3714,15 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return
             }
             if self.captureSource == .desktopMirror {
-                let displayReady = await self.waitForOnlineDisplay(self.session.displayID)
-                let mirrorConfigured = displayReady && self.configureDesktopMirror(for: self.session.displayID)
-                if !mirrorConfigured {
-                    NSLog(
-                        "TargetBridge: unable to enable mirror mode for virtual display %u on first attempt; scheduling retry",
-                        self.session.displayID
-                    )
+                if CGDisplayIsInMirrorSet(self.session.displayID) == 0 {
+                    let displayReady = await self.waitForOnlineDisplay(self.session.displayID)
+                    let mirrorConfigured = displayReady && self.configureDesktopMirror(for: self.session.displayID)
+                    if !mirrorConfigured {
+                        NSLog(
+                            "TargetBridge: unable to enable mirror mode for virtual display %u on first attempt; scheduling retry",
+                            self.session.displayID
+                        )
+                    }
                 }
             }
             self.virtualDisplayText = TBDisplaySenderL10n.virtualDisplaySummary(
@@ -3544,10 +3739,21 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             // armed against a session that has already delivered frames — it then
             // tears down a healthy stream ~4s in. See onFirstFrame wiring below.
             self.sessionAckSent = false
+            self.captureBlockedByScreenRecordingPermission = false
             self.setStatus(.startingCapture(self.capturePreset.description, self.captureSource))
             let started = await self.startCapture(for: profile)
             guard started else {
-                self.stop(resetStatusTo: nil)
+                if self.captureBlockedByScreenRecordingPermission {
+                    self.captureBlockedByScreenRecordingPermission = false
+                    TBSenderAutomation.suspendAutomaticReconnectForRequiredPermission()
+                    self.stop(
+                        resetStatusTo: nil,
+                        persistArrangement: false,
+                        teardownReason: "sender_user_stop"
+                    )
+                } else {
+                    self.stop(resetStatusTo: nil)
+                }
                 return
             }
 
@@ -3564,6 +3770,16 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
     private func startCapture(for profile: TBMonitorDisplayProfile) async -> Bool {
         do {
+            guard CGPreflightScreenCaptureAccess() else {
+                captureBlockedByScreenRecordingPermission = true
+                _ = CGRequestScreenCaptureAccess()
+                setStatus(.captureDesktopError(
+                    TBDisplaySenderL10n.missingScreenRecordingPermission(language: language)
+                ))
+                TBLog.connection.error("capture: screen recording permission missing; automatic reconnect suspended")
+                return false
+            }
+
             let preset = capturePreset
             let usesRawNV12 = rawNV12Enabled(for: profile)
             let codecType = resolvedCodecType(for: preset, profile: profile)
@@ -3600,11 +3816,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
             let display: SCDisplay
             if captureSource == .desktopMirror {
-                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-                guard let mainDisplay = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) else {
+                if let mirrorDisplay = try await resolveMirrorCaptureDisplay() {
+                    display = mirrorDisplay
+                } else if let fallbackDisplayID = directMirrorFallbackDisplayID() {
+                    TBLog.connection.warning("capture: no virtual ScreenCaptureKit display; using direct fallback id=\(fallbackDisplayID, privacy: .public)")
+                    return startDirectDisplayStream(displayID: fallbackDisplayID, preset: preset)
+                } else {
                     return false
                 }
-                display = mainDisplay
             } else {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
                 if session.displayID != kCGNullDirectDisplay,
@@ -3660,12 +3879,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             } else {
                 configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
             }
+            configuration.shouldBeOpaque = true
             configuration.showsCursor = !largeCursor
             configuration.scalesToFit = true
             configuration.captureResolution = preset.captureResolution
             // A selected input device supersedes system capture; capturing both
             // would send two copies of the same sound.
-            configuration.capturesAudio = !audioDriverAvailable
+            configuration.capturesAudio = shouldRelayAudio
             configuration.excludesCurrentProcessAudio = true
             configuration.sampleRate = 48000
             configuration.channelCount = 2
@@ -3679,7 +3899,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
             let delegate = CaptureDelegate()
             delegate.onFrame = { sampleBuffer in
-                pipeline.queue.async { pipeline.encode(sampleBuffer) }
+                // ScreenCaptureKit already invokes this closure on pipeline.queue.
+                // Encode immediately so its IOSurface returns to WindowServer
+                // without an extra dispatch hop.
+                pipeline.encode(sampleBuffer)
             }
             delegate.onAudio = { [weak self] sampleBuffer in
                 self?.processAudio(sampleBuffer)
@@ -3699,21 +3922,20 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             try stream.addStreamOutput(
                 delegate,
                 type: .screen,
-                sampleHandlerQueue: DispatchQueue(label: "fd.tbmonitor.sender.capture", qos: .userInteractive)
+                sampleHandlerQueue: pipeline.queue
             )
-            try stream.addStreamOutput(
-                delegate,
-                type: .audio,
-                sampleHandlerQueue: DispatchQueue(label: "fd.tbmonitor.sender.audio", qos: .userInteractive)
-            )
+            if shouldRelayAudio {
+                try stream.addStreamOutput(
+                    delegate,
+                    type: .audio,
+                    sampleHandlerQueue: DispatchQueue(label: "fd.tbmonitor.sender.audio", qos: .userInteractive)
+                )
+            }
             try await stream.startCapture()
             scStream = stream
             isStreaming = true
             if largeCursor { startCursorUpdates(displayID: display.displayID) }
-            streamingActivity = ProcessInfo.processInfo.beginActivity(
-                options: activityOptions(),
-                reason: "TargetBridge streaming active"
-            )
+            beginCaptureActivity(wakeDisplay: false)
             startFPSTimer()
             startCaptureWatchdog()
             return true
@@ -3725,6 +3947,39 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             }
             return false
         }
+    }
+
+    /// Waking a headless graphical session is asynchronous. Poll briefly for a
+    /// receiver-native ScreenCaptureKit surface before using the direct fallback.
+    private func resolveMirrorCaptureDisplay() async throws -> SCDisplay? {
+        for attempt in 0..<30 {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            if session.displayID != kCGNullDirectDisplay,
+               let virtualDisplay = content.displays.first(where: { $0.displayID == session.displayID }) {
+                TBLog.connection.info("capture: using receiver-native mirrored display id=\(virtualDisplay.displayID, privacy: .public)")
+                return virtualDisplay
+            }
+            if let mainDisplay = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) {
+                TBLog.connection.info("capture: using main display id=\(mainDisplay.displayID, privacy: .public)")
+                return mainDisplay
+            }
+            if attempt == 0 {
+                TBLog.connection.info("capture: graphical session is waking; waiting for a shareable display")
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return nil
+    }
+
+    private func directMirrorFallbackDisplayID() -> CGDirectDisplayID? {
+        if session.displayID != kCGNullDirectDisplay, CGDisplayIsOnline(session.displayID) != 0 {
+            return session.displayID
+        }
+        let mainDisplayID = CGMainDisplayID()
+        if mainDisplayID != kCGNullDirectDisplay, CGDisplayIsOnline(mainDisplayID) != 0 {
+            return mainDisplayID
+        }
+        return nil
     }
 
     private func startDirectDisplayStream(displayID: CGDirectDisplayID, preset: TBDisplayCapturePreset) -> Bool {
@@ -3748,10 +4003,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         captureDisplayText = TBDisplaySenderL10n.captureDisplayCGDisplayStream(language, id: displayID)
         isStreaming = true
         if largeCursor { startCursorUpdates(displayID: displayID) }
-        streamingActivity = ProcessInfo.processInfo.beginActivity(
-            options: activityOptions(),
-            reason: "TargetBridge streaming active"
-        )
+        beginCaptureActivity(wakeDisplay: false)
         startFPSTimer()
         startCaptureWatchdog()
         return true
@@ -3765,8 +4017,42 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         return options
     }
 
+    private func beginCaptureActivity(wakeDisplay: Bool = true) {
+        if streamingActivity == nil {
+            streamingActivity = ProcessInfo.processInfo.beginActivity(
+                options: activityOptions(),
+                reason: "TargetBridge streaming active"
+            )
+        }
+        guard wakeDisplay, preventDisplaySleep else { return }
+
+        let result = IOPMAssertionDeclareUserActivity(
+            "TargetBridge capture requested" as CFString,
+            kIOPMUserActiveLocal,
+            &displayWakeAssertionID
+        )
+        if result == kIOReturnSuccess {
+            TBLog.connection.info("capture: requested graphical-session wake")
+        } else {
+            TBLog.connection.error("capture: unable to wake graphical session result=\(result, privacy: .public)")
+        }
+    }
+
+    private func endCaptureActivity() {
+        if displayWakeAssertionID != 0 {
+            IOPMAssertionRelease(displayWakeAssertionID)
+            displayWakeAssertionID = 0
+        }
+        if let activity = streamingActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            streamingActivity = nil
+        }
+    }
+
     private func waitForCaptureDisplay() async throws -> SCDisplay {
-        let targetDisplayID = (captureSource == .desktopMirror) ? CGMainDisplayID() : session.displayID
+        let targetDisplayID = session.displayID != kCGNullDirectDisplay
+            ? session.displayID
+            : CGMainDisplayID()
         return try await waitForVirtualDisplay(
             matching: targetDisplayID,
             baselineDisplayIDs: baselineDisplayIDs
@@ -4297,16 +4583,28 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         guard verboseDisplayLogging else { return }
         let online = onlineDisplayIDs()
         let virtualOnline = online.contains(session.displayID)
-        let diag = pipeline?.diagnosticsSnapshot() ?? (pending: 0, inFlight: 0, ptsSeq: 0)
+        let diag = pipeline?.diagnosticsSnapshot() ?? (
+            pending: 0,
+            inFlight: 0,
+            ptsSeq: 0,
+            captured: 0,
+            droppedPacing: 0,
+            droppedPre: 0,
+            droppedPost: 0
+        )
         NSLog(
-            "TargetBridge: stream snapshot streaming=%@ fps=%d virtualID=%u online=%@ pendingPackets=%d inFlightEncode=%d ptsSeq=%lld",
+            "TargetBridge: stream snapshot streaming=%@ fps=%d virtualID=%u online=%@ pendingPackets=%d inFlightEncode=%d ptsSeq=%lld captured=%d droppedPacing=%d droppedPre=%d droppedPost=%d",
             isStreaming ? "yes" : "no",
             liveMetrics.senderFPS,
             session.displayID,
             virtualOnline ? "yes" : "no",
             diag.pending,
             diag.inFlight,
-            diag.ptsSeq
+            diag.ptsSeq,
+            diag.captured,
+            diag.droppedPacing,
+            diag.droppedPre,
+            diag.droppedPost
         )
     }
 
@@ -4363,12 +4661,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             scStream = nil
         }
         captureDelegate = nil
-        if let activity = streamingActivity {
-            ProcessInfo.processInfo.endActivity(activity)
-            streamingActivity = nil
-        }
-        stopAudioDeviceCapture()
-        keepWarm.stop()
+        endCaptureActivity()
         pipeline?.stop()
         pipeline = nil
         isStreaming = false
@@ -4381,6 +4674,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         cursorDisplayID = kCGNullDirectDisplay
         lastCursorPacket = nil
 
+        beginCaptureActivity()
         let started = await startCapture(for: profile)
         if !started {
             NSLog("TargetBridge: soft restart after wake failed — falling back to full stop")
@@ -4439,12 +4733,17 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 guard isStreaming, !sessionAckSent else { return }
                 let sentFrames = self.pipeline?.sentFramesSnapshot ?? 0
                 TBLog.connection.error("capture: first-frame timeout preset=\(self.capturePreset.rawValue, privacy: .public) source=\(String(describing: self.captureSource), privacy: .public) connected=\(self.isConnected, privacy: .public) sentFrames=\(sentFrames, privacy: .public)")
-                if self.capturePreset == .native5k || self.capturePreset == .native5k60Experimental {
+                if self.capturePreset == .retina4k60 || self.capturePreset == .native5k || self.capturePreset == .native5k60Experimental {
                     setStatus(.hevcNoFrames)
                 } else {
                     setStatus(.noFirstFrame)
                 }
-                stop(resetStatusTo: nil)
+                TBSenderAutomation.suspendAutomaticReconnectAfterCaptureFailure()
+                stop(
+                    resetStatusTo: nil,
+                    persistArrangement: false,
+                    teardownReason: "sender_user_stop"
+                )
             }
         }
     }
@@ -4569,10 +4868,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func processAudio(_ sampleBuffer: CMSampleBuffer) {
-        guard audioEnabled else { return }
+        guard shouldRelayAudio else { return }
         guard let data = audioConverter.convert(sampleBuffer: sampleBuffer) else { return }
         let packet = TBMonitorProtocol.makePacket(type: .audioFrame, payload: data)
         send(packet)
+    }
+
+    private var shouldRelayAudio: Bool {
+        audioEnabled && audioAddonAvailable
     }
 
     private func send(_ packet: Data) {
@@ -4682,17 +4985,26 @@ private final class SBAudioConverter: Sendable {
 
             guard status == noErr else { return nil }
 
-            let firstBufferPtr = withUnsafeMutablePointer(to: &ablPointer.pointee.mBuffers) { $0 }
-            let buffers = UnsafeBufferPointer(start: firstBufferPtr, count: channelCount)
+            let sourceBuffers = UnsafeMutableAudioBufferListPointer(ablPointer)
+            let destinationBuffers = UnsafeMutableAudioBufferListPointer(inputBuffer.mutableAudioBufferList)
+            guard sourceBuffers.count == destinationBuffers.count else { return nil }
 
-            if inFormat.isInterleaved {
-                assertionFailure("SBAudioConverter: unexpected interleaved input format from ScreenCaptureKit")
-                return nil
-            } else {
-                for i in 0..<channelCount {
-                    if let dest = inputBuffer.floatChannelData?[i], let src = buffers[i].mData {
-                        memcpy(dest, src, Int(buffers[i].mDataByteSize))
-                    }
+            // ScreenCaptureKit may supply either one interleaved buffer or one
+            // buffer per channel. Copy the actual AudioBufferList layout rather
+            // than assuming a non-interleaved Float32 input.
+            for index in 0..<sourceBuffers.count {
+                let source = sourceBuffers[index]
+                let destination = destinationBuffers[index]
+                guard let sourceData = source.mData, let destinationData = destination.mData else {
+                    return nil
+                }
+
+                let destinationByteCount = Int(destination.mDataByteSize)
+                let byteCount = min(Int(source.mDataByteSize), destinationByteCount)
+                guard byteCount > 0 else { return nil }
+                memcpy(destinationData, sourceData, byteCount)
+                if byteCount < destinationByteCount {
+                    memset(destinationData.advanced(by: byteCount), 0, destinationByteCount - byteCount)
                 }
             }
 

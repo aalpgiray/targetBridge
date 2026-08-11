@@ -57,6 +57,7 @@
 		C1A77120267A12D9E355DCEA /* network-link.json in Resources */ = {isa = PBXBuildFile; fileRef = 6579B499CBC11196966318EA /* network-link.json */; };
 		C2CCAB017BC3CAB1DCFA5CCC /* TBMonitorProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA01317B43B46B1B323A7008 /* TBMonitorProtocol.swift */; };
 		CBA7C2F0FA57CC475E2307AF /* TBInputRelayController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E3DC447E3E8E522565E725B /* TBInputRelayController.swift */; };
+		CCB0ACF737372D2CC3F85F83 /* verify_features.sh in Resources */ = {isa = PBXBuildFile; fileRef = CC4E03EDE4E808ACFDE87EEC /* verify_features.sh */; };
 		D09EC25DE2C5CA70787BCEB3 /* TBDefaultOutputGuard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D82666B6BF195612AC4F18D /* TBDefaultOutputGuard.swift */; };
 		D5E6B5B7B49E740C92010C6F /* TBInputDebugLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 80543A7A5A3B583C1543ABC7 /* TBInputDebugLog.swift */; };
 		D81394631056BA19B9032116 /* TBDisplayProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4E4C95A1820A99E5DAED17DE /* TBDisplayProfile.swift */; };
@@ -130,6 +131,7 @@
 		C3658E86F5BE2168F4591491 /* de.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = de.json; sourceTree = "<group>"; };
 		C9583EB47BCD79FA719EEA77 /* TBMonitorProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBMonitorProtocolTests.swift; sourceTree = "<group>"; };
 		C9AA5BB4EE39D2C6FB37B90F /* zh.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = zh.json; sourceTree = "<group>"; };
+		CC4E03EDE4E808ACFDE87EEC /* verify_features.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = verify_features.sh; sourceTree = "<group>"; };
 		CD235429FA67D231F565C93E /* TBDisplaySenderApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBDisplaySenderApp.swift; sourceTree = "<group>"; };
 		CEB4DF6C72B5C50C29AE6E45 /* TBDisplaySenderBuildInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBDisplaySenderBuildInfo.swift; sourceTree = "<group>"; };
 		D386D0FCD0F93494220CC3DC /* en.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = en.json; sourceTree = "<group>"; };
@@ -250,6 +252,7 @@
 			isa = PBXGroup;
 			children = (
 				10E53D6EF9DCC519EEBFA5A2 /* check_localizations.sh */,
+				CC4E03EDE4E808ACFDE87EEC /* verify_features.sh */,
 			);
 			path = scripts;
 			sourceTree = "<group>";
@@ -384,6 +387,7 @@
 				233BAEE5ABED3F316F9D3D12 /* input-dockstation.json in Resources */,
 				7FB34AA1E75B01E7D1EC3E21 /* it.json in Resources */,
 				C1A77120267A12D9E355DCEA /* network-link.json in Resources */,
+				CCB0ACF737372D2CC3F85F83 /* verify_features.sh in Resources */,
 				E6A3663426721C75734F5BC5 /* zh.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -407,7 +411,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\nSTAMP=\"$(date +%Y%m%d%H%M%S)\"\ncat > \"${SRCROOT}/TBDisplaySender/TBDisplaySenderBuildInfo.swift\" <<EOI\nenum TBDisplaySenderBuildInfo {\n    static let marketingVersion = \"3.3.0\"\n    static let buildNumber = \"${STAMP}\"\n    static let versionDisplay = \"\\\\(marketingVersion) + build \\\\(buildNumber)\"\n}\nEOI\n";
+			shellScript = "set -euo pipefail\nSTAMP=\"$(date +%Y%m%d%H%M%S)\"\ncat > \"${SRCROOT}/TBDisplaySender/TBDisplaySenderBuildInfo.swift\" <<EOI\nenum TBDisplaySenderBuildInfo {\n    static let marketingVersion = \"3.5.0\"\n    static let buildNumber = \"${STAMP}\"\n    static let versionDisplay = \"\\\\(marketingVersion) + build \\\\(buildNumber)\"\n}\nEOI\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -500,7 +504,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 3.3.0;
+				MARKETING_VERSION = 3.5.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.targetbridge.sender;
 				PRODUCT_NAME = TargetBridge;
 				SDKROOT = macosx;
@@ -524,7 +528,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 3.3.0;
+				MARKETING_VERSION = 3.5.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.targetbridge.sender;
 				PRODUCT_NAME = TargetBridge;
 				SDKROOT = macosx;
