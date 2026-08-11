@@ -294,6 +294,8 @@ private struct TBDisplaySenderSessionCard: View {
                             TBDisplaySenderL10n.videoPathValue(isRaw: session.videoPathIsRaw,
                                                                isBGRA: session.videoPathIsBGRA,
                                                                isTenBit: session.videoPathIsTenBit,
+                                                               isLossless: session.videoPathIsLossless,
+                                                               ratio: session.videoPathRatio,
                                                                service.language))
                     infoRow(TBDisplaySenderL10n.fpsLabel(service.language), "\(session.senderFPS)")
                 }

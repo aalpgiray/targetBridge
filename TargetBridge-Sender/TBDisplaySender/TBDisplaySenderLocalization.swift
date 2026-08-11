@@ -322,6 +322,8 @@ enum TBDisplaySenderL10n {
         isRaw: Bool,
         isBGRA: Bool,
         isTenBit: Bool,
+        isLossless: Bool = false,
+        ratio: Double = 0,
         _ language: TBDisplaySenderLanguage
     ) -> String {
         guard isRaw else { return text("sender.video_path.hevc", language) }
@@ -329,6 +331,15 @@ enum TBDisplaySenderL10n {
         if isTenBit      { format = "10-bit 4:4:4" }
         else if isBGRA   { format = "BGRA 4:4:4" }
         else             { format = "NV12 4:2:0" }
+        // "uncompressed" was wrong the moment the lossless codec landed: the
+        // panel claimed uncompressed while the log reported 4.71x on the same
+        // frames. Lossless and uncompressed are not synonyms, and the difference
+        // is the entire point of the codec.
+        if isLossless {
+            return text("sender.video_path.lossless", language,
+                        ["format": format,
+                         "ratio": String(format: "%.1f×", ratio)])
+        }
         return text("sender.video_path.raw_fmt", language, ["format": format])
     }
 

@@ -139,7 +139,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         case .native5k:
             return "5K"
         case .native5kRaw60:
-            return "5K RAW"
+            return "5K Lossless"
         case .native5k60Experimental:
             return "5K 60 Experimental"
         }
@@ -158,7 +158,7 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         case .native5k:
             return "5120 × 2880 @ 48"
         case .native5kRaw60:
-            return "5120 × 2880 @ 60 (RAW)"
+            return "5120 × 2880 @ 60 · lossless 10-bit"
         case .native5k60Experimental:
             return "5120 × 2880 @ 60"
         }
@@ -214,7 +214,11 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         case .crisp2160p60, .native5k, .native5k60Experimental:
             return "HEVC"
         case .native5kRaw60:
-            return "RAW NV12"
+            // Not "HEVC" — this preset never touches the hardware encoder — and
+            // not "RAW NV12" either, which was true only before the lossless
+            // codec existed. The panel showed "(5K, HEVC)" for a session sending
+            // bit-exact 10-bit 4:4:4.
+            return "Lossless"
         }
     }
 
@@ -918,6 +922,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// from configuration. A 4:4:4 session that silently fell back to one cable
     /// is indistinguishable from a bandwidth fault unless the UI reports what
     /// actually went out, so these are recorded in `sendRawFrame` itself.
+    private var _dpcmRatio: Double = 0
+    /// Compression achieved by the lossless codec, or 0 when it did not run.
+    /// Guarded by `lock` like the other fields the UI reads off this thread.
+    var dpcmRatio: Double { lock.lock(); defer { lock.unlock() }; return _dpcmRatio }
     private var _rawFormatIsBGRA = false
     private var _rawFormatIsTenBit = false
     var rawFormatIsBGRA: Bool { lock.lock(); defer { lock.unlock() }; return _rawFormatIsBGRA }
@@ -1539,6 +1547,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
                             self.dpcmLogged = true
                             let raw = stride * height
                             TBLog.connection.info("dpcm: \(width, privacy: .public)x\(height, privacy: .public) \(isTenBit ? 10 : 8, privacy: .public)-bit \(raw / 1_000_000, privacy: .public) MB -> \(written / 1_000_000, privacy: .public) MB (\(String(format: "%.2fx", Double(raw) / Double(written)), privacy: .public)) \(sliceCount, privacy: .public) slice(s) async")
+                            self.lock.lock()
+                            self._dpcmRatio = Double(raw) / Double(written)
+                            self.lock.unlock()
                             self.noteResolvedPath("lossless DPCM · \(width)x\(height) \(isTenBit ? 10 : 8)-bit · \(sliceCount) slice(s) · \(String(format: "%.2fx", Double(raw) / Double(written)))")
                         }
                     })
@@ -2203,6 +2214,15 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// Both observed from the pipeline, not from config — see `rawFormatIsBGRA`.
     @Published var videoPathIsBGRA = false
     @Published var videoPathIsTenBit = false
+    /// Whether the LOSSLESS codec carried the frame, and at what ratio.
+    ///
+    /// Reported separately from `videoPathIsRaw` because they answer different
+    /// questions. Raw means "bypassed the hardware encoder"; this means "the
+    /// bytes were compressed losslessly rather than sent whole". The panel used
+    /// to say "RAW · uncompressed 10-bit 4:4:4" while the log said 4.71x — both
+    /// describing the same frames.
+    @Published var videoPathIsLossless = false
+    @Published var videoPathRatio: Double = 0
     // Live FPS readout. Kept on a dedicated observable so its once-per-second
     // update only re-renders the small FPS subview — not the whole session card
     // or (via the manager's objectWillChange bubble-up) the entire window.
@@ -4409,6 +4429,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         videoPathIsRaw = false
         videoPathIsBGRA = false
         videoPathIsTenBit = false
+        videoPathIsLossless = false
+        videoPathRatio = 0
         sentSnapshot = 0
         cursorDisplayID = kCGNullDirectDisplay
         lastCursorPacket = nil
@@ -4446,6 +4468,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 // be seen once an odd frame has actually gone out.
                 videoPathIsBGRA = pipeline?.rawFormatIsBGRA ?? false
                 videoPathIsTenBit = pipeline?.rawFormatIsTenBit ?? false
+                let ratio = pipeline?.dpcmRatio ?? 0
+                videoPathIsLossless = ratio > 1
+                videoPathRatio = ratio
             }
         }
     }

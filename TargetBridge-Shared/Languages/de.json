@@ -34,6 +34,7 @@
   "sender.label.video_path": "Videopfad",
   "sender.video_path.raw": "RAW · unkomprimiertes NV12",
   "sender.video_path.raw_fmt": "RAW · unkomprimiertes %{format}",
+  "sender.video_path.lossless": "Verlustfrei · %{format} · %{ratio}",
   "sender.video_path.hevc": "HEVC (codiert)",
   "sender.label.state": "Status",
   "sender.option.manual_entry": "Manuelle Eingabe",

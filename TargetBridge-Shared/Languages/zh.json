@@ -34,6 +34,7 @@
   "sender.label.video_path": "视频通道",
   "sender.video_path.raw": "RAW · 未压缩 NV12",
   "sender.video_path.raw_fmt": "RAW · 未压缩 %{format}",
+  "sender.video_path.lossless": "无损 · %{format} · %{ratio}",
   "sender.video_path.hevc": "HEVC（已编码）",
   "sender.label.state": "状态",
   "sender.option.manual_entry": "手动输入",
