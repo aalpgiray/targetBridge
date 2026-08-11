@@ -158,7 +158,11 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
         case .native5k:
             return "5120 × 2880 @ 48"
         case .native5kRaw60:
-            return "5120 × 2880 @ 60"
+            // The picker shows "title · description", so depth belongs here: it
+            // makes the preset self-describing at the point of choice, which is
+            // where someone decides whether this one is better than the others.
+            // "Lossless" stays in the title so the pair never repeats a word.
+            return "5120 × 2880 @ 60 · 10-bit"
         case .native5k60Experimental:
             return "5120 × 2880 @ 60"
         }
