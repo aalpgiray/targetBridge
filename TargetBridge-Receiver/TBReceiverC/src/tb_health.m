@@ -14,10 +14,14 @@
 
 #define TB_HEALTH_INTERVAL_MS 5000.0
 
+/* CLOCK_MONOTONIC, matching main.c and tb_metal_plane.m. Only ever used for
+ * differences here, so gettimeofday was not wrong — but three files timing the
+ * same session on two different epochs is a trap, and it already caught us once
+ * when a cross-file subtraction produced a 1.7e12 ms latency. */
 static double tb_health_now_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
 
 /* Total CPU time this process has burned, across every thread, in seconds.
@@ -141,13 +145,20 @@ void tb_health_note_cursor_latency(double ms) {
     g_curlat_n++;
 }
 
+/* Gaps longer than this are the user not moving the mouse, not us gating
+ * anything — the sender only sends on movement. Counting them made `max` read
+ * 3878ms, which says nothing about the cursor path. */
+#define TB_CURSOR_IDLE_GAP_MS 100.0
+
 void tb_health_note_cursor_commit(void) {
     const double now = tb_health_now_ms();
     if (g_cur_last_ms > 0.0) {
         const double gap = now - g_cur_last_ms;
-        g_cur_gap_sum += gap;
-        if (gap > g_cur_gap_max) g_cur_gap_max = gap;
-        g_cur_n++;
+        if (gap <= TB_CURSOR_IDLE_GAP_MS) {
+            g_cur_gap_sum += gap;
+            if (gap > g_cur_gap_max) g_cur_gap_max = gap;
+            g_cur_n++;
+        }
     }
     g_cur_last_ms = now;
 }

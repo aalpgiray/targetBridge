@@ -47,9 +47,15 @@
 #include <stdatomic.h>
 
 #include <sys/time.h>
+/* MUST be CLOCK_MONOTONIC, and must stay the same clock main.c's now_ms_f uses.
+ * This was gettimeofday, whose epoch differs by decades from a monotonic one, so
+ * subtracting a timestamp taken in main.c produced a cursor "latency" of
+ * 1786464339519 ms. Monotonic is also the right choice on its own merits: a
+ * wall-clock adjustment cannot make a duration negative. */
 static double tb_mp_now_ms(void) {
-    struct timeval tv; gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
 
 #include <SDL.h>
