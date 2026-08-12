@@ -84,6 +84,12 @@ void tb_health_note_submit(double ms);
 void tb_health_note_drawable_wait(double ms);
 void tb_health_note_cursor_commit(void);
 
+/* Arrival-to-commit for one cursor position: off the socket to on the
+ * compositor, including any wait in the control queue. Excludes the network hop
+ * by design — the sender's clock is on another machine and unsynchronised, so
+ * adding it would be a guess dressed as a measurement. */
+void tb_health_note_cursor_latency(double ms);
+
 #ifdef __cplusplus
 }
 #endif

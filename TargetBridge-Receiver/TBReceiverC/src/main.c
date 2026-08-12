@@ -99,6 +99,11 @@ struct tb_ctrl_msg {
     uint8_t  type;
     uint8_t *payload;
     size_t   len;
+    /* When this packet was pulled off the socket, so a handler can report how
+     * long it then waited to be processed. That wait is not hypothetical: the
+     * main loop used to park on a vblank while arming a frame, and everything
+     * queued here waited with it. */
+    double   recv_ms;
 };
 
 struct app;
@@ -1303,6 +1308,16 @@ static void tb_set_system_volume(double level) {
 
 /* ---- Callbacks: parser → decoder ------------------------------------- */
 
+/* Arrival time of the packet on_packet is currently handling.
+ *
+ * on_packet is a parser callback with a fixed signature, so this cannot be an
+ * argument. Set by the queue drain, where a packet CAN have waited; left at 0 on
+ * the direct parser path, where it cannot have, and read as "now" there. */
+static double g_pkt_recv_ms = 0.0;
+
+/* Defined further down; needed here for the direct-parser path's "now". */
+static double now_ms_f(void);
+
 static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud) {
     struct app *a = (struct app *)ud;
     switch (type) {
@@ -1393,6 +1408,12 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         handle_raw_dpcm_slice(a, payload, len);
         break;
     case TB_PKT_CURSOR:
+        /* Latency of the half we own: off the socket to on the compositor,
+         * queue wait included. The sender's clock is on another machine and not
+         * synchronised, so this deliberately excludes the network hop rather
+         * than pretending to measure it. */
+        tb_metal_plane_note_cursor_arrival(g_pkt_recv_ms > 0.0 ? g_pkt_recv_ms
+                                                               : now_ms_f());
         {
             int x = 0;
             int y = 0;
@@ -2192,6 +2213,7 @@ static void reader_on_packet(uint8_t type, const uint8_t *payload, size_t len, v
             a->ctrl_q[slot].type    = type;
             a->ctrl_q[slot].payload = copy;
             a->ctrl_q[slot].len     = len;
+            a->ctrl_q[slot].recv_ms = now_ms_f();
             a->ctrl_count++;
         }
     }
@@ -2414,7 +2436,9 @@ static int pump_network(struct app *a) {
         a->ctrl_count--;
         pthread_mutex_unlock(&a->net_lock);
 
+        g_pkt_recv_ms = msg.recv_ms;
         on_packet(msg.type, msg.payload, msg.len, a);
+        g_pkt_recv_ms = 0.0;
         free(msg.payload);
         worked = 1;
     }

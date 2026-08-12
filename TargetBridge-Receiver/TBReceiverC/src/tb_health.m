@@ -132,6 +132,15 @@ void tb_health_note_drawable_wait(double ms) {
     g_draw_n++;
 }
 
+static volatile double g_curlat_sum = 0, g_curlat_max = 0;
+static volatile long   g_curlat_n = 0;
+
+void tb_health_note_cursor_latency(double ms) {
+    g_curlat_sum += ms;
+    if (ms > g_curlat_max) g_curlat_max = ms;
+    g_curlat_n++;
+}
+
 void tb_health_note_cursor_commit(void) {
     const double now = tb_health_now_ms();
     if (g_cur_last_ms > 0.0) {
@@ -166,13 +175,17 @@ static void tb_health_sample(double span_ms, double *last_cpu_s) {
     const double csum = g_cur_gap_sum, cmax = g_cur_gap_max; const long cn = g_cur_n;
     g_draw_sum = g_draw_max = 0; g_draw_n = 0;
     g_cur_gap_sum = g_cur_gap_max = 0; g_cur_n = 0;
+    const double lsum = g_curlat_sum, lmax = g_curlat_max; const long ln = g_curlat_n;
+    g_curlat_sum = g_curlat_max = 0; g_curlat_n = 0;
 
     char latbuf[160];
     snprintf(latbuf, sizeof(latbuf),
-             " || drawable %.1f/%.1fms n=%ld | cursor gap %.1f/%.1fms %.0f/s",
+             " || drawable %.1f/%.1fms n=%ld | cursor gap %.1f/%.1fms %.0f/s"
+             " | cursor lat %.2f/%.2fms n=%ld",
              dn ? dsum / (double)dn : 0.0, dmax, dn,
              cn ? csum / (double)cn : 0.0, cmax,
-             cn ? (double)cn * 1000.0 / span_ms : 0.0);
+             cn ? (double)cn * 1000.0 / span_ms : 0.0,
+             ln ? lsum / (double)ln : 0.0, lmax, ln);
 
     fprintf(stderr,
             "[health] thermal %s | cpu %.0f%% | gpu %s | load %.2f"

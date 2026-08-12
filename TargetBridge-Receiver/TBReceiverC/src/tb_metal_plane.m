@@ -166,6 +166,8 @@ static struct {
     CALayer              *cursorLayer;
     int                   cur_layer_w, cur_layer_h;
     float                 cur_layer_scale;
+    /* Arrival time of the cursor packet being applied, 0 when unknown. */
+    double                cur_arrival_ms;
     /* The sender's real cursor bitmap, once it has sent one. */
     CGImageRef            cursorImage;
     int                   cur_img_w, cur_img_h, cur_img_hot_x, cur_img_hot_y;
@@ -350,6 +352,10 @@ static void tb_cursor_build(float scale) {
  * own action dictionary AND per update, is deliberate belt-and-braces.
  */
 
+void tb_metal_plane_note_cursor_arrival(double recv_ms) {
+    g.cur_arrival_ms = recv_ms;
+}
+
 void tb_metal_plane_set_cursor_image(const uint8_t *rgba, int w, int h,
                                      int hot_x, int hot_y) {
     if (!rgba || w <= 0 || h <= 0 || w > 512 || h > 512) return;
@@ -470,6 +476,10 @@ static void tb_cursor_layer_place(void) {
      * ~8ms between commits means positions flow; ~17ms means something is
      * gating them to the display refresh. */
     tb_health_note_cursor_commit();
+    if (g.cur_arrival_ms > 0.0) {
+        tb_health_note_cursor_latency(tb_mp_now_ms() - g.cur_arrival_ms);
+        g.cur_arrival_ms = 0.0;   /* one report per packet, not per placement */
+    }
 }
 
 static void tb_cursor_layer_attach(void) {

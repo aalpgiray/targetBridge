@@ -62,6 +62,11 @@ void tb_metal_plane_set_cursor(int x, int y, int source_w, int source_h,
 void tb_metal_plane_set_cursor_image(const uint8_t *rgba, int w, int h,
                                      int hot_x, int hot_y);
 
+/* Arrival time (ms, same clock as the receiver's now_ms_f) of the cursor packet
+ * about to be applied. Call immediately before set_cursor; the plane reports
+ * arrival-to-commit so we can see the queue wait, not just our own work. */
+void tb_metal_plane_note_cursor_arrival(double recv_ms);
+
 /* Present one packed 32-bit frame straight from CPU memory. `ten_bit` selects
  * ARGB2101010 ('l10r') over 8-bit BGRA; both are 4 bytes per pixel. Used for
  * uncompressed frames, including the ones a damage packet has just been patched
