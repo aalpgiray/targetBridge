@@ -106,6 +106,10 @@
  * no JSON wrapper. The sender feeds it into the virtual audio device's input
  * stream so the receiver's mic appears as an input on the sender Mac. */
 #define TB_PKT_MIC_FRAME        0x39
+/* The real cursor bitmap, sent only when the cursor changes shape. Little
+ * endian: uint16 w, uint16 h, int16 hotX, int16 hotY, then premultiplied RGBA8.
+ * See TBMonitorPacketType.cursorImage for why an image and not geometry. */
+#define TB_PKT_CURSOR_IMAGE     0x42
 #define TB_PKT_TEST_DATA        0x40
 /* The receiver's stderr, flowing receiver -> sender: raw UTF-8 text, no JSON
  * wrapper and no line framing — a packet is whatever bytes were pending, which

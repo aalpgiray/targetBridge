@@ -1496,6 +1496,22 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
             free(widened);
         }
         break;
+    case TB_PKT_CURSOR_IMAGE: {
+        /* uint16 w, uint16 h, int16 hotX, int16 hotY, then RGBA8 rows. Every
+         * field is checked against the actual length: this is the only packet
+         * whose payload size is derived from its own header, so a truncated or
+         * hostile one would otherwise read past the buffer. */
+        if (len < 8) break;
+        const uint16_t iw = (uint16_t)(payload[0] | (payload[1] << 8));
+        const uint16_t ih = (uint16_t)(payload[2] | (payload[3] << 8));
+        const int16_t  hx = (int16_t)(payload[4] | (payload[5] << 8));
+        const int16_t  hy = (int16_t)(payload[6] | (payload[7] << 8));
+        if (iw == 0 || ih == 0 || iw > 512 || ih > 512) break;
+        const size_t need = (size_t)iw * (size_t)ih * 4u;
+        if (len - 8 < need) break;
+        tb_metal_plane_set_cursor_image(payload + 8, iw, ih, hx, hy);
+        break;
+    }
     case TB_PKT_INPUT_EVENT:
         tb_receiver_apply_input_event(payload, len);
         break;

@@ -2048,6 +2048,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var heartbeatSequence: UInt64 = 0
     private var statusState: TBDisplaySenderStatusState = .ready
     private var streamingActivity: NSObjectProtocol?
+    /// Identity of the last cursor bitmap shipped, so we resend only on change.
+    private var lastSentCursorImage: NSImage?
     private var lastCheckedCursor: NSCursor?
     private var lastCheckedCursorType: Int = 0
     private var baselineDisplayIDs = Set<CGDirectDisplayID>()
@@ -3499,7 +3501,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             } else {
                 configuration.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
             }
-            configuration.showsCursor = !largeCursor
+            // Never let ScreenCaptureKit draw the cursor into the frame.
+            //
+            // While it did, the cursor WAS the video: it carried the whole
+            // pipeline cost — capture, encode, transfer, decode, present, vblank
+            // — which is why vsync visibly affected the pointer. The receiver
+            // now composites it on its own CALayer instead, so a position
+            // reaches the panel without waiting for a frame.
+            configuration.showsCursor = false
             configuration.scalesToFit = true
             configuration.captureResolution = preset.captureResolution
             // A selected input device supersedes system capture; capturing both
@@ -3937,8 +3946,61 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             return
         }
 
-        guard largeCursor, isStreaming, cursorDisplayID != kCGNullDirectDisplay else { return }
+        // No longer gated on largeCursor. That flag used to be the only thing
+        // that turned the separate cursor path on, so for everyone else the
+        // pointer was pixels in the video. It now selects sprite SIZE only.
+        guard isStreaming, cursorDisplayID != kCGNullDirectDisplay else { return }
         startCursorUpdates(displayID: cursorDisplayID)
+    }
+
+    /// Ships the actual cursor bitmap, but only when it changes.
+    ///
+    /// The alternative was drawing each cursor from geometry on the receiver.
+    /// That already exists for eight types in the SDL path — ~300 lines that
+    /// would need a second copy in the Metal path and would then have to be kept
+    /// in step with it. Sending the image is less code, always correct, and
+    /// covers cursors we could never enumerate, application-custom ones included.
+    ///
+    /// Keyed on the NSCursor image identity rather than a pixel hash: AppKit
+    /// returns the same object for the same cursor, so the common case is a
+    /// pointer comparison and no work. This runs at 120 Hz; anything more
+    /// expensive would be felt.
+    private func sendCursorImageIfChanged() {
+        guard let cursor = NSCursor.currentSystem else { return }
+        let image = cursor.image
+        if let last = lastSentCursorImage, last === image { return }
+
+        var rect = CGRect(origin: .zero, size: image.size)
+        guard let cg = image.cgImage(forProposedRect: &rect, context: nil, hints: nil),
+              cg.width > 0, cg.height > 0, cg.width <= 512, cg.height <= 512
+        else { return }
+
+        let w = cg.width, h = cg.height
+        var pixels = [UInt8](repeating: 0, count: w * h * 4)
+        guard let ctx = CGContext(data: &pixels, width: w, height: h,
+                                  bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        else { return }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+
+        // The hot spot is in the image's POINT size while the bitmap may be 2x,
+        // so it has to be scaled or the pointer sits half a cursor off on Retina.
+        let sx = image.size.width  > 0 ? Double(w) / Double(image.size.width)  : 1
+        let sy = image.size.height > 0 ? Double(h) / Double(image.size.height) : 1
+        let hotX = Int16(clamping: Int(cursor.hotSpot.x * sx))
+        let hotY = Int16(clamping: Int(cursor.hotSpot.y * sy))
+
+        var payload = Data(capacity: 8 + pixels.count)
+        withUnsafeBytes(of: UInt16(w).littleEndian) { payload.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt16(h).littleEndian) { payload.append(contentsOf: $0) }
+        withUnsafeBytes(of: hotX.littleEndian)      { payload.append(contentsOf: $0) }
+        withUnsafeBytes(of: hotY.littleEndian)      { payload.append(contentsOf: $0) }
+        payload.append(contentsOf: pixels)
+
+        send(TBMonitorProtocol.makePacket(type: .cursorImage, payload: payload))
+        lastSentCursorImage = image
+        TBLog.connection.info("cursor image sent: \(w)x\(h) hot \(hotX),\(hotY)")
     }
 
     private func getCurrentCursorType() -> Int {
@@ -4015,6 +4077,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return
             }
         }
+
+        // Shape before position: a position arriving first would place the
+        // previous bitmap for one frame.
+        sendCursorImageIfChanged()
 
         lastCursorPacket = cursor
         if let packet = TBMonitorProtocol.makeJSONPacket(type: .cursor, value: cursor) {

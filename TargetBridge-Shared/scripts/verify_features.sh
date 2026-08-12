@@ -131,6 +131,12 @@ echo "== latency work ============================================"
 # without waiting for a video frame or for vsync. Composited into the frame
 # again if this goes, which silently restores the old latency.
 want "cursor has its own plane"         1 "tb_cursor_layer_attach"  TargetBridge-Receiver/TBReceiverC/src
+# The cursor is no longer drawn into the capture, so these two are what put a
+# pointer on screen at all. If showsCursor goes back to true the cursor silently
+# rejoins the video and inherits its whole latency again.
+want "cursor kept out of the capture"   1 "showsCursor = false"     TargetBridge-Sender/TBDisplaySender
+want "real cursor bitmap on the wire"   1 "cursorImage"             TargetBridge-Sender/TBDisplayShared
+want "receiver adopts the bitmap"       1 "tb_metal_plane_set_cursor_image" TargetBridge-Receiver/TBReceiverC/src
 want "cursor plane escape hatch"        1 "TB_CURSOR_PLANE"         TargetBridge-Receiver/TBReceiverC/src
 want "cursor moves without a frame"     1 "tb_cursor_layer_place"   TargetBridge-Receiver/TBReceiverC/src
 want "keep-warm implementation"         1 "TBKeepWarm"             TargetBridge-Sender/TBDisplaySender

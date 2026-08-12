@@ -55,6 +55,13 @@ void tb_metal_plane_set_hidden(int hidden);
 void tb_metal_plane_set_cursor(int x, int y, int source_w, int source_h,
                                int visible, int type);
 
+/* Adopt the sender's actual cursor bitmap. Premultiplied RGBA8, `w`*`h` pixels,
+ * with the hot spot in the same pixel space. Replaces the drawn arrow for every
+ * subsequent placement; the arrow stays as the fallback until the first one
+ * arrives, so there is never a moment with no pointer. */
+void tb_metal_plane_set_cursor_image(const uint8_t *rgba, int w, int h,
+                                     int hot_x, int hot_y);
+
 /* Present one packed 32-bit frame straight from CPU memory. `ten_bit` selects
  * ARGB2101010 ('l10r') over 8-bit BGRA; both are 4 bytes per pixel. Used for
  * uncompressed frames, including the ones a damage packet has just been patched

@@ -166,6 +166,9 @@ static struct {
     CALayer              *cursorLayer;
     int                   cur_layer_w, cur_layer_h;
     float                 cur_layer_scale;
+    /* The sender's real cursor bitmap, once it has sent one. */
+    CGImageRef            cursorImage;
+    int                   cur_img_w, cur_img_h, cur_img_hot_x, cur_img_hot_y;
     int                   cursor_layer_flipped;
     float                 cur_tex_scale;      /* what curTex was built for */
     int                   cur_x, cur_y, cur_sw, cur_sh, cur_visible, cur_type;
@@ -347,7 +350,45 @@ static void tb_cursor_build(float scale) {
  * own action dictionary AND per update, is deliberate belt-and-braces.
  */
 
+void tb_metal_plane_set_cursor_image(const uint8_t *rgba, int w, int h,
+                                     int hot_x, int hot_y) {
+    if (!rgba || w <= 0 || h <= 0 || w > 512 || h > 512) return;
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    /* The sender writes premultipliedLast (RGBA); saying so here rather than
+     * swizzling keeps the two ends describing the same bytes. */
+    CGContextRef ctx = CGBitmapContextCreate((void *)rgba, (size_t)w, (size_t)h, 8,
+                                             (size_t)w * 4, cs,
+                                             kCGImageAlphaPremultipliedLast |
+                                             kCGBitmapByteOrder32Big);
+    CGImageRef img = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
+    if (img) {
+        if (g.cursorImage) CGImageRelease(g.cursorImage);
+        g.cursorImage = img;            /* retained; released on replace/detach */
+        g.cur_img_w = w;
+        g.cur_img_h = h;
+        g.cur_img_hot_x = hot_x;
+        g.cur_img_hot_y = hot_y;
+
+        if (g.cursorLayer) {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            g.cursorLayer.contents = (__bridge id)img;
+            [CATransaction commit];
+        }
+        /* Force the next placement to recompute size from the new bitmap. */
+        g.cur_layer_w = w;
+        g.cur_layer_h = h;
+        g.cur_layer_scale = -1.f;
+        tb_cursor_layer_place();
+    }
+    if (ctx) CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+}
+
 static void tb_cursor_layer_sync_image(float scale) {
+    /* A real cursor bitmap from the sender always wins over the drawn arrow. */
+    if (g.cursorImage) return;
     if (!g.cursorLayer || g.cur_layer_scale == scale) return;
 
     int w = 0, h = 0;
@@ -402,10 +443,14 @@ static void tb_cursor_layer_place(void) {
     /* Cursor arrives in the sender's source-frame space; express everything as a
      * fraction of the frame, then multiply by the layer's size in points. That
      * keeps it correct whatever the window size is. */
+    /* The drawn arrow is offset by its padding; a real bitmap is offset by its
+     * own hot spot, which is the pixel the user is actually pointing with. */
+    const double offx = g.cursorImage ? (double)g.cur_img_hot_x : (double)TB_CUR_PAD;
+    const double offy = g.cursorImage ? (double)g.cur_img_hot_y : (double)TB_CUR_PAD;
     const double fx = ((double)g.cur_x / (double)g.cur_sw)
-                    - ((double)TB_CUR_PAD / (double)g.frame_w);
+                    - (offx / (double)g.frame_w);
     const double fy = ((double)g.cur_y / (double)g.cur_sh)
-                    - ((double)TB_CUR_PAD / (double)g.frame_h);
+                    - (offy / (double)g.frame_h);
     const double wPts = (double)g.cur_layer_w / (double)g.frame_w * b.size.width;
     const double hPts = (double)g.cur_layer_h / (double)g.frame_h * b.size.height;
     const double xPts = fx * b.size.width;
@@ -454,6 +499,11 @@ static void tb_cursor_layer_attach(void) {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     [host addSublayer:cur];
+    /* Re-apply a bitmap we already hold: the plane is torn down and rebuilt on
+     * resolution changes, and the sender only resends on a SHAPE change, so
+     * without this the pointer would revert to the drawn arrow until the user
+     * happened to move over something with a different cursor. */
+    if (g.cursorImage) cur.contents = (__bridge id)g.cursorImage;
     [CATransaction commit];
 
     g.cursorLayer = cur;
@@ -475,6 +525,7 @@ static void tb_cursor_layer_detach(void) {
     g.cursorLayer = nil;
     g.cur_layer_scale = 0.f;
     g.cur_layer_w = g.cur_layer_h = 0;
+    if (g.cursorImage) { CGImageRelease(g.cursorImage); g.cursorImage = NULL; }
 }
 
 /* ------------------------------------------------------------------- shaders */

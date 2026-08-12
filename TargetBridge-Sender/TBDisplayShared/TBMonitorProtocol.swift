@@ -50,6 +50,22 @@ enum TBMonitorPacketType: UInt8 {
     /// hours to theories a single log would have killed in a minute. The sender
     /// appends these to a file so both sides can be read from one machine.
     case receiverLog = 0x41
+
+    /// The real cursor bitmap, sent only when the cursor CHANGES shape.
+    ///
+    /// The alternative was to draw each cursor from geometry on the receiver,
+    /// which already exists for eight types in the SDL path and is ~300 lines
+    /// that must be kept in step with a second copy in the Metal path. Sending
+    /// the actual image is less code, always correct, and covers cursors we
+    /// could never enumerate — application-custom ones included.
+    ///
+    /// Cost is nil in the steady state: a cursor bitmap is a few KB and changes
+    /// only when you move between a text field and a button, while positions
+    /// keep flowing on `cursor` (0x32) at 120 Hz.
+    ///
+    /// Payload is little-endian, header then premultiplied RGBA8 rows:
+    ///   uint16 width, uint16 height, int16 hotspotX, int16 hotspotY, pixels…
+    case cursorImage = 0x42
 }
 
 struct TBMonitorHelloReceiver: Codable {
