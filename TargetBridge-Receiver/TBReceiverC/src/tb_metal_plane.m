@@ -43,6 +43,7 @@
 #include "tb_metal_plane.h"
 #include "tb_dpcm.h"
 #include "tb_health.h"
+#include <pthread.h>
 #include <stdatomic.h>
 
 #include <sys/time.h>
@@ -152,7 +153,7 @@ static struct {
     int                   async_present;
     dispatch_queue_t      presentQ;
     _Atomic int           bands_inflight;  /* committed, not yet completed */
-    int                   present_armed;   /* presentQ only */
+    int                   present_armed;   /* guarded by g_present_lock */
     int                   present_idx;
     int                   present_ten_bit;
     size_t                frame_bpr;
@@ -174,6 +175,18 @@ static struct {
     int                   vsync;
     int                   vsync_initialised;
 } g;
+
+/* Guards g.present_idx / present_ten_bit / present_armed.
+ *
+ * File scope with a static initialiser on purpose: `g` is zero-initialised, and
+ * an all-zero pthread_mutex_t is not a valid mutex on macOS — the initialiser
+ * carries a signature. Keeping it out of the struct also means no ordering
+ * question about when it becomes usable.
+ *
+ * A mutex rather than serialising on presentQ, because presentQ blocks inside
+ * nextDrawable waiting for a vblank and the arming thread must never wait for
+ * that. See the arming site for what it cost. */
+static pthread_mutex_t g_present_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void tb_metal_plane_set_vsync(int enabled) {
     const int want = enabled ? 1 : 0;
@@ -1099,11 +1112,18 @@ static int tb_frame_ensure(void) {
  * the tail of the synchronous path exactly — same ring-slot bookkeeping, same
  * failure handling — just off the render thread. */
 static void tb_present_armed_frame(void) {
-    if (!g.present_armed) return;
+    /* Take the arming state under the lock and RELEASE IT before presenting.
+     * Holding it across tb_present would put the render thread back to sleep on
+     * a vblank, which is the entire thing this lock exists to avoid. */
+    pthread_mutex_lock(&g_present_lock);
+    const int armed = g.present_armed;
+    const int idx   = g.present_idx;
+    const int ten   = g.present_ten_bit;
     g.present_armed = 0;
+    pthread_mutex_unlock(&g_present_lock);
 
-    const int idx = g.present_idx;
-    const int ten = g.present_ten_bit;
+    if (!armed) return;
+
     dispatch_semaphore_t frames = g.frames_free;
 
     @autoreleasepool {
@@ -1244,11 +1264,25 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
              * could run first and find nothing to do — after which no other
              * band would ever take the count to zero again. */
             if (is_last) {
-                dispatch_sync(g.presentQ, ^{
-                    g.present_idx     = g.frame_widx;
-                    g.present_ten_bit = in.ten_bit ? 1 : 0;
-                    g.present_armed   = 1;
-                });
+                /* A mutex, NOT dispatch_sync onto presentQ.
+                 *
+                 * presentQ is serial and spends most of its life inside
+                 * nextDrawable, which blocks until a drawable frees — that is
+                 * what vsync is. dispatch_sync onto a busy serial queue waits
+                 * for it, so arming here used to park THIS thread on a vblank.
+                 * This is the main thread: it also drains the control queue, so
+                 * cursor packets stopped being processed for the duration.
+                 *
+                 * The cursor has its own compositing plane now and still moved
+                 * in steps with vsync on, because the plane was never the
+                 * problem — nothing was delivering positions to it. A lock held
+                 * for three assignments costs nanoseconds and cannot wait on a
+                 * display refresh. */
+                pthread_mutex_lock(&g_present_lock);
+                g.present_idx     = g.frame_widx;
+                g.present_ten_bit = in.ten_bit ? 1 : 0;
+                g.present_armed   = 1;
+                pthread_mutex_unlock(&g_present_lock);
                 g.frame_widx = (g.frame_widx + 1) % TB_FRAME_RING;
                 g.frame_open = 0;
             }
