@@ -34,6 +34,10 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+/* Not pulled in by CAMetalLayer.h: the cursor plane needs CALayer and, above
+ * all, CATransaction — every geometry change it makes has to disable implicit
+ * animation. */
+#import <QuartzCore/QuartzCore.h>
 #import <Cocoa/Cocoa.h>
 
 #include "tb_metal_plane.h"
@@ -157,6 +161,11 @@ static struct {
 
     id<MTLTexture>        curTex;
     int                   cur_tex_w, cur_tex_h;
+    /* The cursor's own compositing plane — see the cursor-plane section. */
+    CALayer              *cursorLayer;
+    int                   cur_layer_w, cur_layer_h;
+    float                 cur_layer_scale;
+    int                   cursor_layer_flipped;
     float                 cur_tex_scale;      /* what curTex was built for */
     int                   cur_x, cur_y, cur_sw, cur_sh, cur_visible, cur_type;
 
@@ -176,6 +185,9 @@ void tb_metal_plane_set_vsync(int enabled) {
     fprintf(stderr, "[metal] vsync %s\n", want ? "on" : "off (lower latency, may tear)");
 }
 
+/* Defined with the cursor-plane code further down. */
+static void tb_cursor_layer_place(void);
+
 void tb_metal_plane_set_cursor(int x, int y, int source_w, int source_h,
                                int visible, int type) {
     g.cur_x = x; g.cur_y = y;
@@ -183,6 +195,16 @@ void tb_metal_plane_set_cursor(int x, int y, int source_w, int source_h,
     g.cur_sh = source_h > 0 ? source_h : 1;
     g.cur_visible = visible;
     g.cur_type = type;
+
+    /* Move the plane NOW rather than waiting for a frame — the entire point.
+     * Inline when we are already on the main thread (the packet loop is),
+     * because hopping through the queue would add back a slice of the latency
+     * this exists to remove. */
+    if ([NSThread isMainThread]) {
+        tb_cursor_layer_place();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{ tb_cursor_layer_place(); });
+    }
 }
 
 /* ------------------------------------------------------------- cursor sprite */
@@ -229,13 +251,14 @@ static const float kArrowY[7] = { 0.f, 17.f, 13.f, 20.f, 19.f,  12.f, 12.f };
  * white so it stays legible on any background — the same reason the SDL path
  * outlines it. Alpha is zero everywhere the arrow is not, so the render pass can
  * blend it over the video without touching the frame. */
-static void tb_cursor_build(float scale) {
-    if (g.curTex && g.cur_tex_scale == scale) return;
-
+/* Rasterise the arrow into a fresh BGRA buffer. Shared by the Metal texture and
+ * the CALayer overlay so the two can never draw a different cursor. Caller
+ * frees. */
+static uint32_t *tb_cursor_raster(float scale, int *out_w, int *out_h) {
     const int w = (int)(12.f * scale) + 2 * TB_CUR_PAD + 2;
     const int h = (int)(20.f * scale) + 2 * TB_CUR_PAD + 2;
     uint32_t *px = calloc((size_t)w * h, 4);
-    if (!px) return;
+    if (!px) return NULL;
 
     float bx[7], by[7];
     const int off[8][2] = {{-2,0},{2,0},{0,-2},{0,2},{-2,-2},{2,-2},{-2,2},{2,2}};
@@ -251,6 +274,18 @@ static void tb_cursor_build(float scale) {
         by[i] = TB_CUR_PAD + kArrowY[i] * scale;
     }
     tb_fill_poly(px, w, h, w, bx, by, 7, 0xFFFFFFFFu);
+
+    *out_w = w;
+    *out_h = h;
+    return px;
+}
+
+static void tb_cursor_build(float scale) {
+    if (g.curTex && g.cur_tex_scale == scale) return;
+
+    int w = 0, h = 0;
+    uint32_t *px = tb_cursor_raster(scale, &w, &h);
+    if (!px) return;
 
     MTLTextureDescriptor *td =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
@@ -270,6 +305,159 @@ static void tb_cursor_build(float scale) {
         g.cur_tex_scale = scale;
     }
     free(px);
+}
+
+/* ------------------------------------------------- cursor as a separate plane
+ *
+ * WHY THIS EXISTS
+ *
+ * The cursor already travels on its own channel — a tiny 0x32 packet, not baked
+ * into the video — but until now it had no independent path to the panel: the
+ * sprite was composited into the same Metal drawable as the frame, so it only
+ * appeared when a frame did. That made cursor latency inherit the whole present
+ * cadence, including displaySyncEnabled. Moving the mouse over a still screen
+ * moved nothing until something else caused a frame.
+ *
+ * A sibling CALayer above the CAMetalLayer is composited by WindowServer, not by
+ * us. Setting its position is a compositor-level move that reaches the screen on
+ * the next refresh regardless of whether a video frame ever arrives — which is
+ * exactly how the local cursor on any Mac behaves, and why it feels instant.
+ *
+ * THE ANIMATION TRAP
+ *
+ * Every position change MUST be inside a transaction with actions disabled.
+ * Implicit animation is the default for CALayer geometry, so without this each
+ * move would spawn an animation, sixty or more a second would overlap, and the
+ * cursor would both lag and smear. This project has already lost a day to the
+ * NSWindow flavour of the same mistake (see TBKeepWarm) — that one released an
+ * animation twice and segfaulted. Disabling actions twice over, in the layer's
+ * own action dictionary AND per update, is deliberate belt-and-braces.
+ */
+
+static void tb_cursor_layer_sync_image(float scale) {
+    if (!g.cursorLayer || g.cur_layer_scale == scale) return;
+
+    int w = 0, h = 0;
+    uint32_t *px = tb_cursor_raster(scale, &w, &h);
+    if (!px) return;
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(px, (size_t)w, (size_t)h, 8, (size_t)w * 4, cs,
+                                             kCGImageAlphaPremultipliedFirst |
+                                             kCGBitmapByteOrder32Little);
+    CGImageRef img = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
+    if (img) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        g.cursorLayer.contents = (__bridge id)img;
+        [CATransaction commit];
+        CGImageRelease(img);
+        g.cur_layer_w = w;
+        g.cur_layer_h = h;
+        g.cur_layer_scale = scale;
+    }
+    if (ctx) CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+    free(px);
+}
+
+/* Place the sprite from the last known cursor state. Cheap enough to call on
+ * every packet: it is two float assignments and a compositor notification, with
+ * no drawing and no frame involved. */
+static void tb_cursor_layer_place(void) {
+    if (!g.cursorLayer) return;
+
+    CALayer *host = g.cursorLayer.superlayer;
+    if (!host) return;
+    const CGRect b = host.bounds;
+    if (b.size.width <= 0 || b.size.height <= 0) return;
+
+    if (!g.cur_visible || g.cur_sw <= 0 || g.cur_sh <= 0) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        g.cursorLayer.hidden = YES;
+        [CATransaction commit];
+        return;
+    }
+
+    /* Same sizing rule as the Metal path, so switching between them cannot
+     * change how big the arrow looks. */
+    const float scale = ((g.frame_w >= 5000) ? 58.f : 44.f) / 24.f;
+    tb_cursor_layer_sync_image(scale);
+    if (g.cur_layer_w <= 0 || g.frame_w <= 0 || g.frame_h <= 0) return;
+
+    /* Cursor arrives in the sender's source-frame space; express everything as a
+     * fraction of the frame, then multiply by the layer's size in points. That
+     * keeps it correct whatever the window size is. */
+    const double fx = ((double)g.cur_x / (double)g.cur_sw)
+                    - ((double)TB_CUR_PAD / (double)g.frame_w);
+    const double fy = ((double)g.cur_y / (double)g.cur_sh)
+                    - ((double)TB_CUR_PAD / (double)g.frame_h);
+    const double wPts = (double)g.cur_layer_w / (double)g.frame_w * b.size.width;
+    const double hPts = (double)g.cur_layer_h / (double)g.frame_h * b.size.height;
+    const double xPts = fx * b.size.width;
+    const double yTop = fy * b.size.height;
+
+    /* AppKit layers are bottom-left origin unless the view says otherwise, and
+     * SDL's view has been both over the years — so ask rather than assume. */
+    const double yPts = g.cursor_layer_flipped ? yTop
+                                               : (b.size.height - yTop - hPts);
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    g.cursorLayer.hidden = NO;
+    g.cursorLayer.frame = CGRectMake(xPts, yPts, wPts, hPts);
+    [CATransaction commit];
+}
+
+static void tb_cursor_layer_attach(void) {
+    if (g.cursorLayer || !g.layer) return;
+
+    /* Escape hatch. If the plane ever misbehaves — wrong place, wrong size, a
+     * compositor quirk on some macOS version — TB_CURSOR_PLANE=0 falls straight
+     * back to compositing the cursor into the frame, which is what shipped
+     * before and is known to be correct if slower. */
+    const char *env = getenv("TB_CURSOR_PLANE");
+    if (env && env[0] == '0') {
+        fprintf(stderr, "[metal] cursor plane disabled by TB_CURSOR_PLANE=0; "
+                        "cursor will ride the video frames again\n");
+        return;
+    }
+    CALayer *host = g.layer.superlayer ?: g.layer;
+
+    CALayer *cur = [CALayer layer];
+    cur.contentsScale = g.layer.contentsScale > 0 ? g.layer.contentsScale : 2.0;
+    cur.zPosition = 1000;              /* above the video, always */
+    cur.hidden = YES;
+    /* Belt: kill implicit animation at the source as well as per update. */
+    cur.actions = @{ @"position": [NSNull null], @"bounds": [NSNull null],
+                     @"frame":    [NSNull null], @"contents": [NSNull null],
+                     @"hidden":   [NSNull null] };
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [host addSublayer:cur];
+    [CATransaction commit];
+
+    g.cursorLayer = cur;
+    /* SDL_MetalView is an opaque void*; it is the NSView underneath. Asking it
+     * rather than assuming, because a flipped view would put the cursor exactly
+     * as far wrong as it is from the top of the screen. */
+    NSView *nsView = (__bridge NSView *)g.view;
+    g.cursor_layer_flipped = [nsView isKindOfClass:[NSView class]] && nsView.isFlipped ? 1 : 0;
+    fprintf(stderr, "[metal] cursor plane attached (flipped=%d) — cursor no longer waits for a frame\n",
+            g.cursor_layer_flipped);
+}
+
+static void tb_cursor_layer_detach(void) {
+    if (!g.cursorLayer) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [g.cursorLayer removeFromSuperlayer];
+    [CATransaction commit];
+    g.cursorLayer = nil;
+    g.cur_layer_scale = 0.f;
+    g.cur_layer_w = g.cur_layer_h = 0;
 }
 
 /* ------------------------------------------------------------------- shaders */
@@ -487,6 +675,8 @@ int tb_metal_plane_init(SDL_Window *win) {
     g.layer.opaque = YES;
     g.layer.maximumDrawableCount = TB_METAL_RING;
     g.layer.displaySyncEnabled = g.vsync ? YES : NO;
+    tb_cursor_layer_attach();
+    tb_cursor_layer_place();
     /* Tag the layer with the space the pixels are actually in, which is what
      * the sender captures: Display P3.
      *
@@ -674,6 +864,7 @@ void tb_metal_plane_shutdown(void) {
     for (int i = 0; i < TB_UPLOAD_RING; ++i) { g.ring[i] = nil; g.ring_cap[i] = 0; }
     for (int i = 0; i < TB_FRAME_RING; ++i) { g.frame[i] = nil; g.frame_cap[i] = 0; }
     g.frame_open = 0; g.frame_widx = 0;
+    tb_cursor_layer_detach();
     g.curTex = nil; g.cur_tex_scale = 0.f;
     g.pipe = nil; g.cursorPipe = nil; g.dpcmPipe = nil;
     g.queue = nil;
@@ -827,7 +1018,10 @@ static int tb_present(id<MTLCommandBuffer> cb, id<MTLBuffer> src,
     [enc setFragmentBytes:&dither length:sizeof(dither) atIndex:0];
     [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 
-    if (g.cur_visible && g.cursorPipe) {
+    /* Only composite the cursor into the frame when it has no plane of its own.
+     * With the plane attached this would be a second, staler arrow drawn on top
+     * of the live one. */
+    if (g.cur_visible && g.cursorPipe && !g.cursorLayer) {
         const float scale = ((g.frame_w >= 5000) ? 58.f : 44.f) / 24.f;
         tb_cursor_build(scale);
         if (g.curTex) {

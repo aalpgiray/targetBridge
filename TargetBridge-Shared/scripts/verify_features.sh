@@ -127,6 +127,12 @@ want "auto-cast matches a typed address"  1 "rememberedReceiverIP" TargetBridge-
 want "local interface choice survives unplug" 1 "preferredLocalInterfaceIP" TargetBridge-Sender/TBDisplaySender
 
 echo "== latency work ============================================"
+# The cursor gets its own CALayer above the Metal layer, so it reaches the panel
+# without waiting for a video frame or for vsync. Composited into the frame
+# again if this goes, which silently restores the old latency.
+want "cursor has its own plane"         1 "tb_cursor_layer_attach"  TargetBridge-Receiver/TBReceiverC/src
+want "cursor plane escape hatch"        1 "TB_CURSOR_PLANE"         TargetBridge-Receiver/TBReceiverC/src
+want "cursor moves without a frame"     1 "tb_cursor_layer_place"   TargetBridge-Receiver/TBReceiverC/src
 want "keep-warm implementation"         1 "TBKeepWarm"             TargetBridge-Sender/TBDisplaySender
 want "keep-warm actually started"       1 "keepWarm.start"         TargetBridge-Sender/TBDisplaySender
 # One deleted line reinstates a double-release that segfaults on every teardown
