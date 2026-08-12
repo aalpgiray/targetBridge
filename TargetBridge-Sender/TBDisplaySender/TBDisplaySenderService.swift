@@ -2004,6 +2004,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     @Published var inputBindings: [TBInputBinding] = []
 
     private var connection: NWConnection?
+    /// Pending confirmation that a non-viable path is a real disconnection
+    /// rather than a flap. Non-nil only while that timer is armed.
+    private var pendingViabilityTeardown: DispatchWorkItem?
+    /// How long a path must stay non-viable before we believe it. Long enough
+    /// to outlast route churn, far short of TCP's own ~10s surrender.
+    private static let viabilityGrace: TimeInterval = 2.5
     /// Holds the virtual display at a full compositing rate — see TBKeepWarm.
     private let keepWarm = TBKeepWarm()
     private let connectionQueue = DispatchQueue(label: "fd.tbmonitor.sender.connection", qos: .userInteractive)
@@ -2353,13 +2359,44 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // this link it is: the transport is a cable, and the interface it was
         // pinned to no longer exists. Treating it as the end is right here and
         // still safe elsewhere, because reconnecting is cheap.
+        // MUST be debounced. Viability is not a cable-detector: it flaps for
+        // route churn, interface reconfiguration and transient conditions that
+        // recover on their own in well under a second. Treating the first
+        // `false` as fatal tore down healthy sessions several times in ten
+        // minutes — a far worse bug than the ten-second teardown it replaced.
+        //
+        // So: a real unplug is a path that is STILL non-viable a moment later.
+        // A flap is one that has already recovered. Waiting costs a couple of
+        // seconds on genuine unplug and remains much faster than TCP's ~10s.
         conn.viabilityUpdateHandler = { [weak self, weak conn] viable in
-            guard !viable else { return }
             Task { @MainActor [weak self, weak conn] in
                 guard let self, let conn, self.connection === conn else { return }
                 guard self.isConnected || self.isStreaming else { return }
-                TBLog.connection.notice("connect: path went non-viable (cable or interface gone); tearing down")
-                self.stop(resetStatusTo: .connectionFailed("Link lost — cable or interface went away"))
+
+                guard !viable else {
+                    // Recovered — cancel any pending teardown and say so, since
+                    // a flap that never becomes a drop is otherwise invisible.
+                    if self.pendingViabilityTeardown != nil {
+                        self.pendingViabilityTeardown?.cancel()
+                        self.pendingViabilityTeardown = nil
+                        TBLog.connection.notice("connect: path recovered; teardown cancelled (flap, not a drop)")
+                    }
+                    return
+                }
+
+                guard self.pendingViabilityTeardown == nil else { return }
+                TBLog.connection.notice("connect: path non-viable; confirming over \(Self.viabilityGrace, privacy: .public)s before tearing down")
+                let work = DispatchWorkItem { [weak self, weak conn] in
+                    MainActor.assumeIsolated {
+                        guard let self, let conn, self.connection === conn else { return }
+                        self.pendingViabilityTeardown = nil
+                        guard self.isConnected || self.isStreaming else { return }
+                        TBLog.connection.notice("connect: still non-viable; link is gone, tearing down")
+                        self.stop(resetStatusTo: .connectionFailed("Link lost — cable or interface went away"))
+                    }
+                }
+                self.pendingViabilityTeardown = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.viabilityGrace, execute: work)
             }
         }
 
@@ -2602,6 +2639,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // path non-viable on its way down, and a live handler would re-enter
         // teardown from inside teardown.
         connection?.viabilityUpdateHandler = nil
+        pendingViabilityTeardown?.cancel()
+        pendingViabilityTeardown = nil
         connection?.cancel()
         connection = nil
         let currentSession = session
