@@ -116,6 +116,33 @@ void tb_health_note_read(double ms)        { g_read_ms   += ms; }
 void tb_health_note_upload_copy(double ms) { g_copy_ms   += ms; }
 void tb_health_note_submit(double ms)      { g_submit_ms += ms; }
 
+/* Latency samples: count/sum/max rather than a running share, so the report can
+ * show a mean and the worst case. Plain doubles under no lock — these are
+ * statistics, and a torn sample costs a slightly wrong average once an hour,
+ * which is not worth a mutex on the present path. */
+static volatile double g_draw_sum = 0, g_draw_max = 0;
+static volatile long   g_draw_n   = 0;
+static volatile double g_cur_gap_sum = 0, g_cur_gap_max = 0;
+static volatile long   g_cur_n = 0;
+static double          g_cur_last_ms = 0;
+
+void tb_health_note_drawable_wait(double ms) {
+    g_draw_sum += ms;
+    if (ms > g_draw_max) g_draw_max = ms;
+    g_draw_n++;
+}
+
+void tb_health_note_cursor_commit(void) {
+    const double now = tb_health_now_ms();
+    if (g_cur_last_ms > 0.0) {
+        const double gap = now - g_cur_last_ms;
+        g_cur_gap_sum += gap;
+        if (gap > g_cur_gap_max) g_cur_gap_max = gap;
+        g_cur_n++;
+    }
+    g_cur_last_ms = now;
+}
+
 static void tb_health_sample(double span_ms, double *last_cpu_s) {
     double cpu_s = tb_health_cpu_seconds();
     double cpu_pct = -1.0;
@@ -135,11 +162,24 @@ static void tb_health_sample(double span_ms, double *last_cpu_s) {
     double rd = g_read_ms, cp = g_copy_ms, sb = g_submit_ms;
     g_read_ms = g_copy_ms = g_submit_ms = 0;
 
+    const double dsum = g_draw_sum, dmax = g_draw_max; const long dn = g_draw_n;
+    const double csum = g_cur_gap_sum, cmax = g_cur_gap_max; const long cn = g_cur_n;
+    g_draw_sum = g_draw_max = 0; g_draw_n = 0;
+    g_cur_gap_sum = g_cur_gap_max = 0; g_cur_n = 0;
+
+    char latbuf[160];
+    snprintf(latbuf, sizeof(latbuf),
+             " || drawable %.1f/%.1fms n=%ld | cursor gap %.1f/%.1fms %.0f/s",
+             dn ? dsum / (double)dn : 0.0, dmax, dn,
+             cn ? csum / (double)cn : 0.0, cmax,
+             cn ? (double)cn * 1000.0 / span_ms : 0.0);
+
     fprintf(stderr,
             "[health] thermal %s | cpu %.0f%% | gpu %s | load %.2f"
-            " || read %.0f%% | uploadcopy %.0f%% | submit %.0f%%\n",
+            " || read %.0f%% | uploadcopy %.0f%% | submit %.0f%%%s\n",
             tb_health_thermal(), cpu_pct < 0 ? 0.0 : cpu_pct, gpubuf, load[0],
-            rd / span_ms * 100.0, cp / span_ms * 100.0, sb / span_ms * 100.0);
+            rd / span_ms * 100.0, cp / span_ms * 100.0, sb / span_ms * 100.0,
+            latbuf);
 }
 
 static void *tb_health_main(void *unused) {

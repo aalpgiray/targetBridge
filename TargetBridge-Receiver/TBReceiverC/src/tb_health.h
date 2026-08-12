@@ -63,6 +63,27 @@ void tb_health_note_read(double ms);
 void tb_health_note_upload_copy(double ms);
 void tb_health_note_submit(double ms);
 
+/* Latency samples, as opposed to the occupancy figures above.
+ *
+ * The three note_* calls above accumulate a SHARE of wall clock, which answers
+ * "is this stage busy". Neither of the questions below is about busyness:
+ *
+ *   drawable_wait — how long [layer nextDrawable] blocked. Under vsync this is
+ *   the wait for a free drawable, so it is the direct cost of
+ *   maximumDrawableCount. If it is near zero the drawable count is not what is
+ *   adding latency and lowering it would only risk throughput.
+ *
+ *   cursor_commit — the moment a cursor position reached the compositor. Only
+ *   the CADENCE is recorded, not an absolute latency: the sender samples at
+ *   120 Hz on a different machine, so without clock sync the gap between our own
+ *   commits is the honest measurement. ~8ms means positions flow freely; ~17ms
+ *   means something is gating them to the refresh rate.
+ *
+ * Reported as mean and max, because a mean alone hides exactly the stalls that
+ * make a cursor feel bad. */
+void tb_health_note_drawable_wait(double ms);
+void tb_health_note_cursor_commit(void);
+
 #ifdef __cplusplus
 }
 #endif

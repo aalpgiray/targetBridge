@@ -421,6 +421,10 @@ static void tb_cursor_layer_place(void) {
     g.cursorLayer.hidden = NO;
     g.cursorLayer.frame = CGRectMake(xPts, yPts, wPts, hPts);
     [CATransaction commit];
+    /* Cadence, not latency — the sender's 120 Hz clock is on another machine.
+     * ~8ms between commits means positions flow; ~17ms means something is
+     * gating them to the display refresh. */
+    tb_health_note_cursor_commit();
 }
 
 static void tb_cursor_layer_attach(void) {
@@ -986,7 +990,13 @@ static id<MTLBuffer> tb_upload_take(size_t bytes) {
  * bytes in place. */
 static int tb_present(id<MTLCommandBuffer> cb, id<MTLBuffer> src,
                       MTLStorageMode mode, int ten_bit) {
+    /* Timed because this is where vsync actually costs us: with
+     * displaySyncEnabled the call blocks until a drawable frees. The mean tells
+     * us whether maximumDrawableCount is worth lowering, or whether doing so
+     * would trade throughput for nothing. */
+    const double draw_t0 = tb_mp_now_ms();
     id<CAMetalDrawable> drawable = [g.layer nextDrawable];
+    tb_health_note_drawable_wait(tb_mp_now_ms() - draw_t0);
     if (!drawable) { dispatch_semaphore_signal(g.inflight); return -1; }
 
     MTLTextureDescriptor *td =
