@@ -3557,7 +3557,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             try await stream.startCapture()
             scStream = stream
             isStreaming = true
-            if largeCursor { startCursorUpdates(displayID: display.displayID) }
+            // NOT gated on largeCursor. showsCursor is false now, so the
+            // capture contains no pointer at all — if this does not start, the
+            // receiver has nothing to draw and the screen has no cursor.
+            // largeCursor selects sprite SIZE, it does not enable the feature.
+            startCursorUpdates(displayID: display.displayID)
             streamingActivity = ProcessInfo.processInfo.beginActivity(
                 options: activityOptions(),
                 reason: "TargetBridge streaming active"
@@ -3595,7 +3599,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         directDisplayStream = directCapture
         captureDisplayText = TBDisplaySenderL10n.captureDisplayCGDisplayStream(language, id: displayID)
         isStreaming = true
-        if largeCursor { startCursorUpdates(displayID: displayID) }
+        // Not gated on largeCursor — see the SCStream path above.
+        startCursorUpdates(displayID: displayID)
         streamingActivity = ProcessInfo.processInfo.beginActivity(
             options: activityOptions(),
             reason: "TargetBridge streaming active"
