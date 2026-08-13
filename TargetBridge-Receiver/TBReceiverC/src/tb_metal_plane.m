@@ -62,7 +62,29 @@ static double tb_mp_now_ms(void) {
 #include <stdio.h>
 #include <string.h>
 
-/* Drawables the layer may hand out. Three is plenty for presenting once a frame. */
+/* Drawables the layer may hand out. Only 2 or 3 are legal — CAMetalLayer clamps,
+ * and double buffering is the floor for a compositor: one buffer is scanned out
+ * while the other is drawn.
+ *
+ * THREE. Two was tried, measured, and reverted — the note is here so it is not
+ * tried again on the strength of the latency number alone.
+ *
+ * Two looked excellent on paper. With vsync on, `drawable` (time blocked in
+ * nextDrawable) fell from 11.7ms mean to ~0.1ms, and cursor latency improved
+ * with it, from ~2.0ms to ~1.0ms: the pool had been exhausted at every present,
+ * so all three buffers sat queued ahead of the panel.
+ *
+ * What it cost was slack. Late frames went from ~0.3% to ~1% of a 240-frame
+ * window, worst-case gaps grew from ~22-31ms to ~26-33ms, and in use the CURSOR
+ * began skipping — which it should not care about at all, being on its own
+ * layer. The mechanism is the synchronous present path further down, which calls
+ * tb_present on the calling thread rather than presentQ: with one buffer fewer,
+ * nextDrawable blocks there often enough to stall the main loop, and the main
+ * loop is what delivers cursor positions. The stall then persisted until a vsync
+ * toggle rebuilt the drawable queue.
+ *
+ * So: ~11ms of latency is not worth a visible stutter, and the real fix is to
+ * remove that synchronous present path, not to starve the pool. */
 #define TB_METAL_RING 3
 
 /* Upload staging slots.
