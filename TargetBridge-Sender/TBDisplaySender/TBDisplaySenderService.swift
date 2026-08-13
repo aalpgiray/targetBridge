@@ -2314,7 +2314,20 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         let params = NWParameters(tls: nil, tcp: tcpOptions)
         params.allowLocalEndpointReuse = true
         params.serviceClass = .interactiveVideo
-        if let localPort = NWEndpoint.Port(rawValue: 0) {
+        // Pin the source address ONLY for link-local peers.
+        //
+        // The pin exists because 169.254/16 has no specific route, so the table
+        // sends it out the primary interface (usually Wi-Fi) and a dial to a
+        // Thunderbolt Bridge peer leaves by the wrong link. A routable address
+        // like 10.0.1.2 has its own route — `route get 10.0.1.2` names en1 — so
+        // the pin adds nothing there.
+        //
+        // And it can cost something: with the pin, Network.framework rejected
+        // this exact dial in 29ms with ENETDOWN while `nc` from the same host to
+        // the same address over the same interface connected fine. Not pinning
+        // when there is nothing to fix is both simpler and strictly safer.
+        let needsSourcePin = receiverIP.hasPrefix("169.254.")
+        if needsSourcePin, let localPort = NWEndpoint.Port(rawValue: 0) {
             params.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(localInterfaceIP), port: localPort)
         }
 
