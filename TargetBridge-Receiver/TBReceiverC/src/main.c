@@ -2895,6 +2895,10 @@ int main(int argc, char **argv) {
             tb_receiver_send_display_tweaks_if_changed(&a);
         }
 
+        /* Apply any cursor position that arrived since the last pass. Off the
+         * packet path on purpose — see tb_metal_plane_flush_cursor. */
+        tb_metal_plane_flush_cursor();
+
         /* The same status the on-screen panel carries, for whoever is standing
          * at the iMac now that there is no window between sessions. Called every
          * iteration on purpose: it only touches AppKit when the text changes, and

@@ -231,6 +231,10 @@ void tb_metal_plane_set_vsync(int enabled) {
     fprintf(stderr, "[metal] vsync %s\n", want ? "on" : "off (lower latency, may tear)");
 }
 
+/* Set by set_cursor, cleared by the flush. Atomic because positions can arrive
+ * on the reader thread while the loop flushes on main. */
+static atomic_int g_cursor_dirty = 0;
+
 /* Defined with the cursor-plane code further down. */
 static void tb_cursor_layer_place(void);
 
@@ -242,15 +246,18 @@ void tb_metal_plane_set_cursor(int x, int y, int source_w, int source_h,
     g.cur_visible = visible;
     g.cur_type = type;
 
-    /* Move the plane NOW rather than waiting for a frame — the entire point.
-     * Inline when we are already on the main thread (the packet loop is),
-     * because hopping through the queue would add back a slice of the latency
-     * this exists to remove. */
-    if ([NSThread isMainThread]) {
-        tb_cursor_layer_place();
-    } else {
-        dispatch_async(dispatch_get_main_queue(), ^{ tb_cursor_layer_place(); });
-    }
+    /* Only mark it dirty. Placement happens once per run-loop pass via
+     * tb_metal_plane_flush_cursor().
+     *
+     * This used to place inline, to save a queue hop. That put CATransaction —
+     * and therefore a window-server round trip — directly in the packet handler,
+     * up to 120 times a second, on the same thread that drains video. Under load
+     * the loop stalled behind AppKit, the socket stopped being read, and the
+     * sender's send queue grew to megabytes: the receiver appeared frozen.
+     *
+     * Coalescing costs at most one pass of latency and keeps the cursor entirely
+     * off the frame pipeline, which was the point. */
+    atomic_store(&g_cursor_dirty, 1);
 }
 
 /* ------------------------------------------------------------- cursor sprite */
@@ -379,6 +386,11 @@ static void tb_cursor_build(float scale) {
  * animation twice and segfaulted. Disabling actions twice over, in the layer's
  * own action dictionary AND per update, is deliberate belt-and-braces.
  */
+
+void tb_metal_plane_flush_cursor(void) {
+    if (!atomic_exchange(&g_cursor_dirty, 0)) return;
+    tb_cursor_layer_place();
+}
 
 void tb_metal_plane_note_cursor_arrival(double recv_ms) {
     g.cur_arrival_ms = recv_ms;
@@ -1098,7 +1110,25 @@ static int tb_present(id<MTLCommandBuffer> cb, id<MTLBuffer> src,
     td.storageMode = mode;
     id<MTLTexture> srcTex = [src newTextureWithDescriptor:td offset:0
                                              bytesPerRow:g.frame_bpr];
-    if (!srcTex) { dispatch_semaphore_signal(g.inflight); return -1; }
+    if (!srcTex) {
+        /* PRESENT THE DRAWABLE EVEN THOUGH THERE IS NOTHING TO DRAW.
+         *
+         * A CAMetalLayer reclaims a drawable only when it is presented. Bailing
+         * out here after nextDrawable had already handed us one burned it
+         * permanently: three failures and the pool of three was gone, so the next
+         * nextDrawable blocked forever and the receiver stopped advancing frames
+         * while still looking healthy — the "bogging down" that toggling vsync
+         * cleared, because reassigning displaySyncEnabled reconfigures the layer
+         * and rebuilds the pool.
+         *
+         * Presenting an undrawn drawable shows one stale or blank frame, which is
+         * a far better failure than a permanently wedged pipeline. */
+        [cb presentDrawable:drawable];
+        [cb commit];
+        dispatch_semaphore_signal(g.inflight);
+        fprintf(stderr, "[metal] no source texture; drawable returned to the pool\n");
+        return -1;
+    }
 
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture     = drawable.texture;
