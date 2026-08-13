@@ -4412,7 +4412,20 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
         
         connectTimeoutWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: workItem)
+        // 5.0 was too tight, and measurably so. A bundled app's first local
+        // network connection sits in .waiting while macOS resolves its
+        // local-network policy, and that is NOT a failure — Network.framework
+        // retries and succeeds. Measured with a minimal signed app dialling this
+        // same receiver: ready at 201ms with no source pin, and ready at 5203ms
+        // with one. Against a 5000ms deadline the second case loses by 200ms
+        // every time, which presents as "Connection timed out — last network
+        // state: waiting(Network is down)" and looks exactly like a dead link.
+        //
+        // The deadline exists to stop a genuinely unreachable receiver hanging
+        // the UI forever, so it only has to be shorter than a person's patience,
+        // not shorter than the stack's own recovery. 20s is far past every
+        // measured success and still bounded.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20.0, execute: workItem)
     }
 
 
