@@ -18,6 +18,15 @@ final class TBDefaultOutputGuard: @unchecked Sendable {
     private let lock = NSLock()
     private var previousDeviceID: AudioDeviceID?
     private var listening = false
+    /// Fired when the system's default output becomes ours, or stops being ours.
+    ///
+    /// Choosing our device in Sound settings IS the user asking for audio to go
+    /// to the receiver. Without this the app could not tell, so the device could
+    /// sit selected while a per-session toggle silently dropped every sample —
+    /// the exact "selected and silent" state the driver's liveness probe exists
+    /// to prevent. Called on CoreAudio's thread; hop before touching UI state.
+    private var onSelectionChanged: ((Bool) -> Void)?
+    private var wasOurs = false
 
     private init() {}
 
@@ -55,10 +64,29 @@ final class TBDefaultOutputGuard: @unchecked Sendable {
     }
 
     private func noteCurrentDefault() {
-        guard let device = currentDefaultOutput(), !isOurs(device) else { return }
+        guard let device = currentDefaultOutput() else { return }
+        let ours = isOurs(device)
+
         lock.lock()
-        previousDeviceID = device
+        if !ours { previousDeviceID = device }
+        let changed = (ours != wasOurs)
+        wasOurs = ours
+        let notify = onSelectionChanged
         lock.unlock()
+
+        if changed { notify?(ours) }
+    }
+
+    /// Observe whether our device is the system output. Replaces any previous
+    /// observer; fires immediately with the current state so a caller does not
+    /// have to poll to find out where it is starting from.
+    func observeSelection(_ handler: @escaping (Bool) -> Void) {
+        lock.lock()
+        onSelectionChanged = handler
+        lock.unlock()
+        let ours = currentDefaultOutput().map { isOurs($0) } ?? false
+        lock.lock(); wasOurs = ours; lock.unlock()
+        handler(ours)
     }
 
     /// Begin tracking. Safe to call repeatedly.

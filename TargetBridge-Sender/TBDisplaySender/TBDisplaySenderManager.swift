@@ -150,6 +150,7 @@ final class TBDisplaySenderService: ObservableObject {
         restorePersistedSessions()
         // Publish the audio device immediately, not on first stream.
         refreshAudioDriverListener()
+        observeAudioDeviceSelection()
         startClipboardMonitoring()
         activationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification,
@@ -185,6 +186,32 @@ final class TBDisplaySenderService: ObservableObject {
             TBLog.connection.notice("audio driver listener: up — device stays published while the app runs")
         } else {
             TBLog.connection.error("audio driver listener: bind failed; the audio device will withdraw")
+        }
+    }
+
+    /// Selecting our device in Sound settings is a request to send audio to the
+    /// receiver, so honour it: switch the sessions' audio on.
+    ///
+    /// Without this the device could be chosen as the system output while
+    /// `audioEnabled` was false, and every sample was dropped in routeDriverAudio
+    /// with nothing said. Sound simply stopped, which is indistinguishable from a
+    /// broken driver — and is precisely the "selected and silent" failure the
+    /// driver's liveness probe was written to avoid.
+    ///
+    /// Deselecting is deliberately NOT the inverse: the user may switch output
+    /// briefly without meaning to change what this app streams, and silently
+    /// turning their setting off would be worse than leaving it on.
+    private func observeAudioDeviceSelection() {
+        TBDefaultOutputGuard.shared.observeSelection { [weak self] isOurs in
+            guard isOurs else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let off = self.sessions.filter { !$0.audioEnabled }
+                guard !off.isEmpty else { return }
+                off.forEach { $0.audioEnabled = true }
+                TBLog.connection.notice("audio: TargetBridge selected as output — enabling audio on \(off.count, privacy: .public) session(s)")
+                self.objectWillChange.send()
+            }
         }
     }
 
