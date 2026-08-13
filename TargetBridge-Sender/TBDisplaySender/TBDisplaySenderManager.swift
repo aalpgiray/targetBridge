@@ -102,6 +102,24 @@ final class TBDisplaySenderService: ObservableObject {
             objectWillChange.send()
         }
     }
+    /// The audio driver's loopback listener, owned by the APP rather than by a
+    /// session.
+    ///
+    /// WHY IT LIVES HERE
+    ///
+    /// The driver probes this port once a second and withdraws its audio device
+    /// after three refusals — deliberately, so a device cannot sit selected and
+    /// silent (see Driver.cpp's liveness loop). While the socket was opened by
+    /// the video pipeline and closed on session teardown, that meant the
+    /// TargetBridge output device only existed *during a stream*: end the
+    /// session, or lose the link, and it disappeared from macOS three seconds
+    /// later. The whole point of the driver feature is a native output device
+    /// that is always there to select.
+    ///
+    /// So the socket now opens with the app and closes with it. "Alive" comes to
+    /// mean "TargetBridge is running", which is what the driver's probe was
+    /// really asking all along.
+    private var audioDriverReceiver: TBAudioDriverReceiver?
     private var sessionCancellables: [UUID: AnyCancellable] = [:]
     private let receiverDiscovery = TBReceiverDiscovery()
     private let addonStore = TBAddonStore.shared
@@ -124,11 +142,14 @@ final class TBDisplaySenderService: ObservableObject {
             guard let self else { return }
             self.addons = addons
             normalizeAddonState()
+            refreshAudioDriverListener()
             objectWillChange.send()
         }
         refreshLocalInterfaces()
         addonStore.refresh()
         restorePersistedSessions()
+        // Publish the audio device immediately, not on first stream.
+        refreshAudioDriverListener()
         startClipboardMonitoring()
         activationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification,
@@ -139,6 +160,40 @@ final class TBDisplaySenderService: ObservableObject {
                 self?.refreshPrivacyPermissions()
             }
         }
+    }
+
+    /// Open the driver's loopback port so the audio device stays published.
+    /// Idempotent, and safe to call whenever the addon state changes.
+    func refreshAudioDriverListener() {
+        guard audioDriverAvailable else {
+            if audioDriverReceiver != nil {
+                audioDriverReceiver?.stop()
+                audioDriverReceiver = nil
+                TBLog.connection.notice("audio driver listener: stopped (addon disabled) — device will withdraw")
+            }
+            return
+        }
+        guard audioDriverReceiver == nil else { return }
+
+        let rx = TBAudioDriverReceiver { [weak self] pcm in
+            Task { @MainActor [weak self] in
+                self?.routeDriverAudio(pcm)
+            }
+        }
+        if rx.start() {
+            audioDriverReceiver = rx
+            TBLog.connection.notice("audio driver listener: up — device stays published while the app runs")
+        } else {
+            TBLog.connection.error("audio driver listener: bind failed; the audio device will withdraw")
+        }
+    }
+
+    /// Hand PCM to whichever session can actually carry it. With no live session
+    /// the audio is dropped here — the device stays present, which is the point:
+    /// selectable like any output, silent until something is streaming.
+    private func routeDriverAudio(_ pcm: Data) {
+        guard let session = sessions.first(where: { $0.isStreaming && $0.audioEnabled }) else { return }
+        session.acceptDriverAudio(pcm)
     }
 
     func refreshPrivacyPermissions() {

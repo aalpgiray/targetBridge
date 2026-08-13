@@ -1846,7 +1846,6 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         return parts.joined(separator: "\n")
     }
 
-    private var audioDriverReceiver: TBAudioDriverReceiver?
     private var micForwarder: TBMicForwarder?
     private var audioVolumeObserver: TBAudioDeviceVolumeObserver?
     @Published var audioEnabled: Bool
@@ -4435,20 +4434,21 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// there is nothing to choose. It pushes PCM to us over loopback UDP: no
     /// capture session, no microphone permission, and already the exact wire
     /// format, so it bypasses the converter entirely.
+    /// PCM handed over by the app-level driver listener.
+    ///
+    /// The socket is NOT owned here any more — see TBDisplaySenderService's
+    /// audio driver listener for why it has to outlive any one session.
+    func acceptDriverAudio(_ pcm: Data) {
+        guard audioEnabled, isStreaming else { return }
+        let payload = receiverSupportsFloat32Audio ? pcm : Self.int16(fromFloat32: pcm)
+        send(TBMonitorProtocol.makePacket(type: .audioFrame, payload: payload))
+    }
+
     private func startAudioDeviceCaptureIfNeeded() {
         guard audioEnabled, audioDriverAvailable else { return }
-
-        let rx = TBAudioDriverReceiver { [weak self] pcm in
-            Task { @MainActor [weak self] in
-                guard let self, self.audioEnabled else { return }
-                let payload = self.receiverSupportsFloat32Audio ? pcm : Self.int16(fromFloat32: pcm)
-                self.send(TBMonitorProtocol.makePacket(type: .audioFrame, payload: payload))
-            }
-        }
-        if rx.start() {
-            audioDriverReceiver = rx
-            startAudioVolumeMirror(uid: TBAudioDriverReceiver.deviceUID)
-        }
+        // The listener itself now starts with the app. Only the volume mirror is
+        // per-session, because it follows the receiver's hardware volume.
+        startAudioVolumeMirror(uid: TBAudioDriverReceiver.deviceUID)
     }
 
     /// Mirror a device's OS volume onto the receiver's hardware volume, so the
@@ -4503,8 +4503,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
         micForwarder?.stop()
         micForwarder = nil
-        audioDriverReceiver?.stop()
-        audioDriverReceiver = nil
+        // The driver listener is deliberately NOT stopped here. It belongs to the
+        // app, not the session: the driver withdraws its audio device the moment
+        // nothing answers on the sink port, so closing it at teardown made the
+        // output device vanish from macOS every time a stream ended.
         audioVolumeObserver?.stop()
         audioVolumeObserver = nil
     }
