@@ -70,8 +70,6 @@ final class TBDisplaySenderStatusItemController: NSObject {
         guard statusItem == nil else { return }
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "TargetBridge")
-        item.button?.imagePosition = .imageOnly
         item.button?.toolTip = TBDisplaySenderL10n.topBarToolTip(service.language)
 
         // Assign one menu instance for the lifetime of the status item and
@@ -83,6 +81,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
         menu.delegate = self
         item.menu = menu
         statusItem = item
+        applyStatusAppearance()
     }
 
     private func removeStatusItem() {
@@ -92,8 +91,61 @@ final class TBDisplaySenderStatusItemController: NSObject {
     }
 
     private func refreshStatusItem() {
-        guard let item = statusItem else { return }
-        item.button?.toolTip = TBDisplaySenderL10n.topBarToolTip(service.language)
+        applyStatusAppearance()
+    }
+
+    /// The frame rate beside the glyph, laid out like the battery item: value on
+    /// the left, symbol on the right, and nothing at all while idle so a full menu
+    /// bar gets the width back.
+    ///
+    /// Three details are load-bearing, and each one fails silently if missed:
+    ///   - `title`, never `attributedTitle`. An attributed string with no colour
+    ///     draws BLACK, and an explicit colour cannot adapt to a light vs dark menu
+    ///     bar. Only a plain title lets AppKit colour it correctly.
+    ///   - `isTemplate = true`. `contentTintColor` applies only to template images;
+    ///     a non-template symbol draws in its own colour, invisible on a dark bar.
+    ///   - monospaced digits, or the whole menu bar shifts sideways every time the
+    ///     rate ticks between 59 and 60.
+    private func applyStatusAppearance() {
+        guard let button = statusItem?.button else { return }
+
+        let live = service.sessions.filter { $0.isConnected }
+        let fps = live.map(\.liveMetrics.senderFPS).max() ?? 0
+        let streaming = !live.isEmpty
+
+        // Verified to exist. NSImage(systemSymbolName:) returns nil for an unknown
+        // name and assigning nil blanks the item -- "display.2.fill" does NOT exist,
+        // which once made the icon vanish exactly while streaming.
+        let image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "TargetBridge")
+        image?.isTemplate = true
+        if image == nil { button.title = "TB" }
+        button.image = image
+
+        if streaming, fps > 0 {
+            button.title = "\(fps) "
+            button.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            button.imagePosition = .imageRight
+        } else {
+            button.title = ""
+            button.imagePosition = .imageOnly
+        }
+        button.contentTintColor = streaming ? .controlAccentColor : nil
+        button.toolTip = TBDisplaySenderL10n.topBarToolTip(service.language)
+    }
+
+    /// The session shown on the screen this menu was opened from, if any.
+    ///
+    /// macOS puts the menu bar on every display, so opening the menu ON a streamed
+    /// display identifies that display -- no picker, no mode, no state to track.
+    /// Returns nil when opened from the Mac's own screen, where "which monitor" has
+    /// no answer and the menu should simply list them.
+    private func sessionForMenuScreen() -> TBDisplaySenderSession? {
+        guard let screen = statusItem?.button?.window?.screen,
+              let number = screen.deviceDescription[
+                NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+        else { return nil }
+        let displayID = CGDirectDisplayID(number.uint32Value)
+        return service.sessions.first(where: { $0.isConnected && $0.virtualDisplayID == displayID })
     }
 
     private func rebuildMenuItems(in menu: NSMenu) {
@@ -112,7 +164,12 @@ final class TBDisplaySenderStatusItemController: NSObject {
         // Brightness / volume sliders for each connected session. Reliable and
         // native-feeling: they drive the receiver directly via the existing
         // brightness/volume path — no event taps, no cursor/keyboard routing.
-        let connectedSessions = service.sessions.filter { $0.isConnected }
+        // Opened ON one of our displays: show just that display's controls, since
+        // that is unambiguously the one being looked at. Opened from this Mac's own
+        // screen: show them all, because there is nothing to disambiguate against.
+        let allConnected = service.sessions.filter { $0.isConnected }
+        let focused = sessionForMenuScreen()
+        let connectedSessions = focused.map { [$0] } ?? allConnected
         if !connectedSessions.isEmpty {
             menu.addItem(.separator())
             for session in connectedSessions {

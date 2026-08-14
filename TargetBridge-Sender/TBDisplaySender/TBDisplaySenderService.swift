@@ -2191,6 +2191,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var recvBuffer = Data()
 
     private var session = ReceiverBackedVirtualDisplaySession()
+
+    /// This session's virtual display, or `kCGNullDirectDisplay` when it has none.
+    ///
+    /// Exposed so the menu bar can tell WHICH display it was opened on: macOS puts
+    /// the menu bar on every screen, so opening it on a streamed display identifies
+    /// that display, and the menu can show only its controls. That removes a
+    /// monitor picker and any notion of a "selected" monitor.
+    var virtualDisplayID: CGDirectDisplayID { session.displayID }
     private let audioConverter = SBAudioConverter()
     /// False until the receiver says otherwise, so an unknown receiver gets the
     /// older format instead of noise.

@@ -121,17 +121,9 @@ struct Popover: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if m.monitors.isEmpty { setupHelper } else { list }
-            Divider().padding(.vertical, 6)
-            // Real rows, not flat text. A plain-styled button reads as a label,
-            // so the way into Settings looked like a caption.
-            VStack(spacing: 1) {
-                footerRow("gearshape", "Settings…") { openWindow() }
-                footerRow("power", "Quit TargetBridge") { NSApp.terminate(nil) }
-            }
-            .padding(.horizontal, 8).padding(.bottom, 8)
         }
-        .padding(.top, 12)
-        .frame(width: 300)
+        .padding(.vertical, 10)
+        .frame(width: 290)
     }
 
     @State private var hovered: String?
@@ -480,63 +472,12 @@ struct KeyCatcher: NSViewRepresentable {
     }
 }
 
-// MARK: - Control Centre style panel
-
-/// A borderless panel, NOT an NSPopover.
-///
-/// NSPopover always draws a beak pointing at the status item, and there is no API
-/// to remove it. macOS's own Control Centre panels (Display, Sound, Wi-Fi) are
-/// plain rounded panels with no arrow, so matching them means owning the window.
-/// It also puts dismissal under our control: a popover set to .transient closes on
-/// the first click anywhere, including clicks meant for its own controls.
-final class Panel: NSPanel {
-    override var canBecomeKey: Bool { true }   // sliders and toggles need key status
-}
-
-/// Real vibrancy. A SwiftUI `Material` blurs what is INSIDE the window, so in a
-/// borderless panel floating over the desktop it has nothing to sample and renders
-/// as flat grey -- the "looks old" version. Only NSVisualEffectView with
-/// .behindWindow blending samples the desktop underneath.
-struct Vibrancy: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let v = NSVisualEffectView()
-        // .popover, not .hudWindow. hudWindow is a dark, nearly opaque material --
-        // side by side with Control Centre it reads as flat grey. .popover is the
-        // one AppKit uses for real popovers and lets the desktop through.
-        v.material = .popover
-        v.blendingMode = .behindWindow
-        v.state = .active
-        v.wantsLayer = true
-        v.layer?.cornerRadius = 14
-        v.layer?.cornerCurve = .continuous
-        v.layer?.masksToBounds = true
-        return v
-    }
-    func updateNSView(_ v: NSVisualEffectView, context: Context) {}
-}
-
-struct PanelChrome<Content: View>: View {
-    @ViewBuilder var content: Content
-    var body: some View {
-        content
-            .background(Vibrancy())
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(.white.opacity(0.12), lineWidth: 0.5))
-            // Just enough for the shadow. This was 10, which read as a visible gap
-            // between the panel and the menu bar; macOS sits much closer.
-            .padding(5)
-    }
-}
-
 // MARK: - Host
 
-final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     let model = Model()
     var statusItem: NSStatusItem!
-    var panel: Panel!
-    var outsideClick: Any?
+    var menu: NSMenu!
     var window: NSWindow?
     var cancellable: AnyCancellable?
 
@@ -545,27 +486,20 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.target = self
-        statusItem.button?.action = #selector(toggle)
         refreshIcon()
 
-        let host = NSHostingView(
-            rootView: PanelChrome {
-                Popover(openWindow: { [weak self] in self?.openWindow() })
-                    .environmentObject(model)
-            })
-        host.sizingOptions = [.intrinsicContentSize]
-        panel = Panel(contentRect: .init(x: 0, y: 0, width: 320, height: 200),
-                      styleMask: [.borderless, .nonactivatingPanel],
-                      backing: .buffered, defer: false)
-        panel.contentView = host
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = true
-        panel.level = .statusBar
-        panel.isMovable = false
-        panel.hidesOnDeactivate = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        // An NSMenu, NOT a custom panel.
+        //
+        // Six iterations of NSPanel never matched macOS: the system gives real
+        // menus a backdrop that a custom window cannot reproduce, so every
+        // NSVisualEffectView approximation read as flat grey beside Control Centre.
+        // The app's existing menu already looked right -- the framework was doing
+        // the work all along. Custom views go INSIDE the menu, so the content is
+        // ours and the material, alignment, dismissal and keyboard handling are
+        // the system's.
+        menu = NSMenu()
+        menu.delegate = self
+        statusItem.menu = menu      // AppKit now owns showing and hiding it
 
         // The icon tracks streaming state, so refresh whenever the model changes.
         cancellable = model.objectWillChange.sink { [weak self] _ in
@@ -613,48 +547,8 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             : "TargetBridge — idle"
     }
 
-    @objc func toggle() {
-        panel.isVisible ? hidePanel() : showPanel()
-    }
-
-    func showPanel() {
-        guard let button = statusItem.button,
-              let bWin = button.window else { return }
-        refreshIcon()
-        panel.layoutIfNeeded()
-        let size = panel.contentView?.fittingSize ?? NSSize(width: 320, height: 260)
-        panel.setContentSize(size)
-
-        // Centred under the status item, clamped to the screen it lives on.
-        // LEFT edges aligned, not centred. macOS aligns a status item's menu or
-        // panel to the item's left edge; centring makes it hang off to the left and
-        // look unrelated to the icon that opened it.
-        let onScreen = bWin.convertToScreen(button.convert(button.bounds, to: nil))
-        var x = onScreen.minX - 5      // less the chrome padding, so edges line up
-        // macOS panels sit ~5pt under the bar; the chrome padding is part of
-        // that distance, so add it back rather than stacking two gaps.
-        var y = onScreen.minY - size.height + 5
-        if let vf = (bWin.screen ?? NSScreen.main)?.visibleFrame {
-            x = min(max(x, vf.minX + 8), vf.maxX - size.width - 8)
-            y = max(y, vf.minY + 8)
-        }
-        panel.setFrameOrigin(NSPoint(x: x, y: y))
-        panel.orderFrontRegardless()
-        panel.makeKey()
-
-        // Dismiss on a click OUTSIDE the panel only, so clicks on our own sliders
-        // and toggles are never swallowed.
-        outsideClick = NSEvent.addGlobalMonitorForEvents(
-            matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in self?.hidePanel() }
-    }
-
-    func hidePanel() {
-        if let m = outsideClick { NSEvent.removeMonitor(m); outsideClick = nil }
-        panel.orderOut(nil)
-    }
-
-    func openWindow() {
-        hidePanel()
+    @objc func openWindow() {
+        menu.cancelTracking()
         if window == nil {
             let w = NSWindow(contentRect: .init(x: 0, y: 0, width: 780, height: 520),
                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -669,6 +563,43 @@ final class Delegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.setActivationPolicy(.regular)     // Dock icon appears with the window
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Rebuilt each time it opens so the content is current.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+
+        // One item hosting the SwiftUI content. NSHostingView is transparent, so
+        // the menu's own material shows through -- which is the entire point.
+        let host = NSHostingView(rootView: Popover(openWindow: { [weak self] in
+            self?.openWindow()
+        }).environmentObject(model))
+
+        // An explicit frame is REQUIRED. NSMenuItem sizes its row from the view's
+        // frame, and NSHostingView does not set one -- so the item was present but
+        // zero-sized, and the menu rendered as just the separator and the two
+        // ordinary items with an invisible row between them.
+        host.layoutSubtreeIfNeeded()
+        let fitting = host.fittingSize
+        host.frame = NSRect(x: 0, y: 0,
+                            width: max(290, fitting.width),
+                            height: max(1, fitting.height))
+
+        let item = NSMenuItem()
+        item.view = host
+        menu.addItem(item)
+
+        menu.addItem(.separator())
+
+        // Ordinary menu items: native highlight, native type, keyboard support.
+        let settings = NSMenuItem(title: "Settings…", action: #selector(openWindow),
+                                  keyEquivalent: ",")
+        settings.target = self
+        menu.addItem(settings)
+
+        let quit = NSMenuItem(title: "Quit TargetBridge",
+                              action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quit)
     }
 
     func windowWillClose(_ n: Notification) {
