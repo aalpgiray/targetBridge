@@ -122,14 +122,28 @@ final class TBDisplaySenderStatusItemController: NSObject {
         button.image = image
 
         if streaming, fps > 0 {
-            button.title = "\(fps) "
-            button.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            // attributedTitle WITH an explicit dynamic colour.
+            //
+            // The trap is subtle and cost three wrong fixes: attributedTitle with
+            // NO colour attribute draws black, so it is unreadable on a dark menu
+            // bar -- but a plain `title` combined with contentTintColor is worse,
+            // because the accent colour is a user preference that can resolve dark
+            // (graphite), and it then tints the glyph too. Measured: labelColor
+            // resolves to white on dark and black on light, so it is the only
+            // option that adapts in BOTH directions while keeping monospaced
+            // digits, which stop the bar shifting as the rate ticks.
+            button.attributedTitle = NSAttributedString(
+                string: "\(fps) ",
+                attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular),
+                    .foregroundColor: NSColor.labelColor,
+                ])
             button.imagePosition = .imageRight
         } else {
-            button.title = ""
+            button.attributedTitle = NSAttributedString(string: "")
             button.imagePosition = .imageOnly
         }
-        button.contentTintColor = streaming ? .controlAccentColor : nil
+        button.contentTintColor = nil
         button.toolTip = TBDisplaySenderL10n.topBarToolTip(service.language)
     }
 
