@@ -121,10 +121,14 @@ struct TBMonitorPageView: View {
     @ObservedObject var service: TBDisplaySenderService
     @ObservedObject var session: TBDisplaySenderSession
     @State private var showDiagnostics = false
+    @State private var configurationChecks: [TBConfigurationCheck] = []
 
     var body: some View {
         Form {
             connectionSection
+            linkSection
+            streamSection
+            inputSection
             displaySection
             soundSection
             behaviourSection
@@ -171,6 +175,161 @@ struct TBMonitorPageView: View {
         }
     }
 
+
+    // MARK: Link — spec 3.1. Everything here was stranded in the old settings
+    // sheet; without it there is no way to choose a transport, an interface, or a
+    // receiver, which makes the window unusable rather than merely incomplete.
+
+    private var linkSection: some View {
+        Section(TBDisplaySenderL10n.connectionGroup(service.language)) {
+            Picker(TBDisplaySenderL10n.transportKind(service.language),
+                   selection: Binding(get: { session.transportKind },
+                                      set: { kind in
+                                          session.transportKind = kind
+                                          // Re-resolves the usable interfaces; skipping
+                                          // this leaves a stale local IP that fails to dial.
+                                          service.transportDidChange(for: session)
+                                      })) {
+                ForEach(service.availableTransportKinds) { kind in
+                    Text(kind.title(service.language)).tag(kind)
+                }
+            }
+
+            Picker(TBDisplaySenderL10n.localInterfaceIP(service.language),
+                   selection: $session.localInterfaceIP) {
+                Text(TBDisplaySenderL10n.notDetected(service.language)).tag("")
+                ForEach(service.availableInterfaces(for: session.transportKind)) { iface in
+                    Text(iface.displayText(service.language)).tag(iface.ip)
+                }
+            }
+
+            if !service.discoveredReceivers.isEmpty {
+                Picker(TBDisplaySenderL10n.discoveredReceiver(service.language),
+                       selection: Binding(get: { session.selectedReceiverID },
+                                          set: { id in
+                                              session.selectedReceiverID = id
+                                              if let r = service.discoveredReceivers
+                                                  .first(where: { $0.id == id }) {
+                                                  service.applyDiscoveredReceiver(r, to: session)
+                                              }
+                                          })) {
+                    Text(TBDisplaySenderL10n.receiverIP(service.language)).tag("")
+                    ForEach(service.discoveredReceivers) { receiver in
+                        Text(receiver.displayText).tag(receiver.id)
+                    }
+                }
+            }
+
+            TextField(TBDisplaySenderL10n.receiverIP(service.language),
+                      text: $session.receiverIP,
+                      prompt: Text("169.254.x.x / 192.168.x.x"))
+
+            HStack {
+                Button(session.isCableTesting
+                       ? TBDisplaySenderL10n.testingButton(service.language)
+                       : TBDisplaySenderL10n.cableTestButton(service.language)) {
+                    session.startCableTest()
+                }
+                .disabled(session.isCableTesting)
+                Button(TBDisplaySenderL10n.text("sender.diagnostics.check_configuration",
+                                                service.language)) {
+                    configurationChecks = service.configurationChecks(for: session)
+                }
+                Spacer()
+            }
+            // Rendered inline rather than in a sheet: these exist to be read next
+            // to the settings they are complaining about.
+            ForEach(configurationChecks) { check in
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: checkIcon(check.state))
+                        .foregroundStyle(checkColor(check.state))
+                        .frame(width: 16)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(TBDisplaySenderL10n.text(check.titleKey, service.language))
+                            .font(.footnote.weight(.semibold))
+                        Text(TBDisplaySenderL10n.text(check.detailKey, service.language,
+                                                      check.values))
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                }
+            }
+        }
+    }
+
+    private func checkIcon(_ state: TBConfigurationCheckState) -> String {
+        switch state {
+        case .passed:    return "checkmark.circle.fill"
+        case .attention: return "exclamationmark.triangle.fill"
+        case .pending:   return "clock.fill"
+        }
+    }
+
+    private func checkColor(_ state: TBConfigurationCheckState) -> Color {
+        switch state {
+        case .passed:    return .green
+        case .attention: return .yellow
+        case .pending:   return .secondary
+        }
+    }
+
+    // MARK: Stream — spec 3.2. capturePreset IS the streaming-quality control.
+
+    private var streamSection: some View {
+        Section {
+            Picker(TBDisplaySenderL10n.streamProfile(service.language),
+                   selection: $session.capturePreset) {
+                ForEach(TBDisplayCapturePreset.allCases, id: \.self) { preset in
+                    Text("\(preset.title(service.language)) · \(preset.description)").tag(preset)
+                }
+            }
+            Picker(TBDisplaySenderL10n.captureSource(service.language),
+                   selection: $session.captureSource) {
+                ForEach(TBDisplayCaptureSource.allCases) { source in
+                    Text(source.title(service.language)).tag(source)
+                }
+            }
+            Toggle("Match render to stream",
+                   isOn: $session.matchRenderToStream)
+        } header: {
+            Text(TBDisplaySenderL10n.streamProfile(service.language))
+        } footer: {
+            Text(TBDisplaySenderL10n.streamSummary(preset: session.capturePreset, source: session.captureSource, language: service.language))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: Input — spec 3.3
+
+    private var inputSection: some View {
+        Section("Input") {
+            Picker("Control",
+                   selection: Binding(get: { session.inputControlRole },
+                                      set: { service.setInputControlRole($0, for: session) })) {
+                ForEach(TBInputControlRole.allCases) { role in
+                    Text(String(describing: role).capitalized).tag(role)
+                }
+            }
+            Picker("Gestures",
+                   selection: $session.inputGestureMode) {
+                ForEach(TBInputGestureMode.allCases) { mode in
+                    Text(String(describing: mode).capitalized).tag(mode)
+                }
+            }
+            HStack {
+                Button("Accessibility…") {
+                    service.openAccessibilitySettings()
+                }
+                Button("Input Monitoring…") {
+                    service.openInputMonitoringSettings()
+                }
+                Spacer()
+            }
+        }
+    }
+
     // MARK: Display
 
     private var displaySection: some View {
@@ -193,6 +352,16 @@ struct TBMonitorPageView: View {
             }
             Toggle("V-Sync",
                    isOn: $session.vsyncEnabled)
+            LabeledContent(TBDisplaySenderL10n.displayProfiles(service.language)) {
+                HStack(spacing: 6) {
+                    ForEach(TBDisplayProfile.allCases) { profile in
+                        Button(TBDisplaySenderL10n.displayProfileTitle(
+                                profile, language: service.language)) {
+                            service.applyDisplayProfile(profile, to: session)
+                        }
+                    }
+                }
+            }
         }
     }
 
