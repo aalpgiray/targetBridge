@@ -24,7 +24,6 @@
 #include "tb_i18n.h"
 #include "tb_logship.h"
 #include "tb_health.h"
-#include "tb_menubar.h"
 
 #include <SDL.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -2714,10 +2713,6 @@ int main(int argc, char **argv) {
     a.disp = tb_disp_create(fullscreen);
     if (!a.disp) { fprintf(stderr, "tb_disp_create failed\n"); return 1; }
 
-    /* After tb_disp_create, because SDL_Init is what creates the NSApplication a
-     * status item attaches to. With the window now hidden between sessions, this
-     * is the only way to see or quit the receiver. */
-    tb_menubar_start();
 
     /* Open SDL Audio Device */
     SDL_AudioSpec spec;
@@ -2767,7 +2762,7 @@ int main(int argc, char **argv) {
      * recv+parse == drain - (upload+present) reported by [perf]. */
     double acc_drain_ms = 0.0, acc_wait_ms = 0.0, acc_other_ms = 0.0;
     double acc_since_ms = now_ms_f();
-    while (!g_term && !tb_menubar_quit_requested()) {
+    while (!g_term) {
         double loop_mark_ms = now_ms_f();
         unsigned int disp_actions = tb_disp_poll_actions(a.disp);
         int socket_activity = 0;
@@ -2898,13 +2893,6 @@ int main(int argc, char **argv) {
         /* Apply any cursor position that arrived since the last pass. Off the
          * packet path on purpose — see tb_metal_plane_flush_cursor. */
         tb_metal_plane_flush_cursor();
-
-        /* The same status the on-screen panel carries, for whoever is standing
-         * at the iMac now that there is no window between sessions. Called every
-         * iteration on purpose: it only touches AppKit when the text changes, and
-         * the once-a-second [loop] tick above is skipped while idle — which is
-         * exactly when the menu bar is the only thing saying anything. */
-        tb_menubar_set_state(a.client_fd >= 0 && a.session_active, a.status_text);
 
         if (a.client_fd < 0 || !a.session_active) {
             /* No client, or a connection that hasn't started a real streaming

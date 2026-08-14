@@ -8,7 +8,6 @@
 
 #include "display.h"
 #include "tb_i18n.h"
-#include "tb_window_mode.h"
 #include "tb_gesture_bridge.h"
 #include "tb_metal_plane.h"
 
@@ -500,33 +499,19 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
 static void tb_disp_refresh_window_mode(struct tb_display *d) {
     if (!d || !d->win) return;
 
-    /* The rule itself is in tb_window_mode.h, where it can be tested without a
-     * window server. This function is only the SDL half of it.
-     *
-     * Hidden rather than never created: Metal attaches lazily on the first frame
-     * (tb_metal_plane_init at render time), so the window is not needed early
-     * for that — but SDL_CreateWindow is entangled with SDL_Init, the renderer
-     * and the status texture at startup, and unpicking that ordering buys
-     * nothing a hidden window does not already give. Rendering into a hidden
-     * window is harmless; we simply do not. */
-    switch (tb_window_mode_for(d->is_connected, d->is_connecting,
-                               d->preferred_fullscreen)) {
-    case TB_WINDOW_FULLSCREEN:
+    /* Always on screen. The window used to be hidden between sessions so the
+     * iMac looked like a switched-off monitor, together with a menu bar item to
+     * keep it reachable. Both were removed: the connect failures appeared in the
+     * same period, and returning to the known-good shape is worth more than the
+     * cosmetics until that is understood. */
+    if ((d->is_connected || d->is_connecting) && d->preferred_fullscreen) {
         SDL_ShowWindow(d->win);
         SDL_SetWindowFullscreen(d->win, SDL_WINDOW_FULLSCREEN_DESKTOP);
-        break;
-    case TB_WINDOW_WINDOWED:
+    } else {
         SDL_ShowWindow(d->win);
         SDL_SetWindowFullscreen(d->win, 0);
         SDL_SetWindowSize(d->win, 980, 620);
         SDL_SetWindowPosition(d->win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-        break;
-    case TB_WINDOW_HIDDEN:
-        /* Leaving fullscreen before hiding, not after: hiding a window that is
-         * still a fullscreen Space leaves the Space behind as an empty desktop. */
-        SDL_SetWindowFullscreen(d->win, 0);
-        SDL_HideWindow(d->win);
-        break;
     }
 
     const int should_hide_cursor =

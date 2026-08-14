@@ -41,7 +41,7 @@ LDFLAGS  += -framework ApplicationServices -framework AppKit -framework CoreFoun
 endif
 
 C_SRC = src/main.c src/net.c src/decoder.c src/display.c src/tb_i18n.c src/tb_logship.c
-OBJC_SRC = src/tb_gesture_bridge.m src/tb_display_tweaks.m src/tb_mic_capture.m src/tb_metal_plane.m src/tb_health.m src/tb_menubar.m
+OBJC_SRC = src/tb_gesture_bridge.m src/tb_display_tweaks.m src/tb_mic_capture.m src/tb_metal_plane.m src/tb_health.m
 OBJ = $(C_SRC:.c=.o) $(OBJC_SRC:.m=.o) $(CODEC_OBJ)
 BIN = tbreceiver
 
@@ -60,14 +60,13 @@ $(CODEC_OBJ): $(CODEC)/tb_dpcm.c $(CODEC)/tb_dpcm.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJ) $(BIN) $(TEST_BIN) $(TEST_DPCM_BIN) $(TEST_WINMODE_BIN)
+	rm -f $(OBJ) $(BIN) $(TEST_BIN) $(TEST_DPCM_BIN)
 
 # Unit tests. net.c and tb_dpcm.c are pure POSIX/libc, so these need no
 # ffmpeg/SDL/pkgconf — they run anywhere, including CI, with no hardware.
 TEST_CFLAGS = -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11
 TEST_BIN = test_net_parser
 TEST_DPCM_BIN = test_dpcm
-TEST_WINMODE_BIN = test_window_mode
 
 $(TEST_BIN): tests/test_net_parser.c src/net.c src/net.h src/proto.h
 	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_parser.c src/net.c -o $@
@@ -75,12 +74,8 @@ $(TEST_BIN): tests/test_net_parser.c src/net.c src/net.h src/proto.h
 $(TEST_DPCM_BIN): tests/test_dpcm.c $(CODEC)/tb_dpcm.c $(CODEC)/tb_dpcm.h
 	$(CC) $(TEST_CFLAGS) -I$(CODEC) tests/test_dpcm.c $(CODEC)/tb_dpcm.c -o $@
 
-$(TEST_WINMODE_BIN): tests/test_window_mode.c src/tb_window_mode.h
-	$(CC) $(TEST_CFLAGS) -Isrc tests/test_window_mode.c -o $@
-
-test: $(TEST_BIN) $(TEST_DPCM_BIN) $(TEST_WINMODE_BIN)
+test: $(TEST_BIN) $(TEST_DPCM_BIN)
 	./$(TEST_BIN)
 	./$(TEST_DPCM_BIN)
-	./$(TEST_WINMODE_BIN)
 
 .PHONY: all clean test

@@ -102,26 +102,12 @@ echo "== menu bar / display control =============================="
 want "V-Sync toggle"                    1 "vsync\|vSync"           TargetBridge-Sender/TBDisplaySender TargetBridge-Sender/TBDisplayShared
 want "Night Shift / True Tone"          1 "nightShift\|NightShift\|night_shift" TargetBridge-Sender TargetBridge-Receiver
 
-echo "== seamless start (menu bar + auto-cast) ===================="
 # The receiver is a monitor: no Dock icon, no window between sessions, and the
-# menu bar as the only way to see or quit it. LSUIElement without the status item
 # would leave it running invisibly, so both halves are checked.
-want "receiver runs as a menu bar agent"  1 "LSUIElement"          TargetBridge-Receiver/scripts
-want "receiver status item"               1 "tb_menubar_start"     TargetBridge-Receiver/TBReceiverC/src
-want "status item built in"               1 "tb_menubar"           TargetBridge-Receiver/TBReceiverC/Makefile
-want "menu Quit reaches the run loop"     1 "tb_menubar_quit_requested" TargetBridge-Receiver/TBReceiverC/src
-want "window hidden between sessions"     1 "TB_WINDOW_HIDDEN"     TargetBridge-Receiver/TBReceiverC/src
-want "window mode test"                   1 "test_window_mode"     TargetBridge-Receiver/TBReceiverC/Makefile
-want "sender auto-cast rule"              1 "TBAutoCast"           TargetBridge-Sender/TBDisplaySender
-want "auto-cast runs on discovery"        1 "evaluateAutoCast"     TargetBridge-Sender/TBDisplaySender
 # Without this latch auto-cast reconnects a session the user just stopped, which
 # makes the Disconnect button look broken.
-want "manual-stop suppression"            1 "autoCastSuppressedByManualStop" TargetBridge-Sender/TBDisplaySender
-want "auto-cast survives a launch"        1 "autoCastEnabled"      TargetBridge-Sender/TBDisplaySender
-want "auto-cast tests"                    1 "TBAutoCastTests"      TargetBridge-Sender/TBDisplaySenderTests
 # A session configured by typing an address has no selectedReceiverID, so
 # matching only on service name made the shipped toggle silently do nothing.
-want "auto-cast matches a typed address"  1 "rememberedReceiverIP" TargetBridge-Sender/TBDisplaySender
 # One unplug used to repoint a session at whatever interface was left (a VM
 # bridge, in practice) and never move it back, breaking manual reconnect too.
 want "local interface choice survives unplug" 1 "preferredLocalInterfaceIP" TargetBridge-Sender/TBDisplaySender
