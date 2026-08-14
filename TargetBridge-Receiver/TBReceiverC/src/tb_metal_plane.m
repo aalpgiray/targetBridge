@@ -231,20 +231,51 @@ void tb_metal_plane_set_vsync(int enabled) {
     fprintf(stderr, "[metal] vsync %s\n", want ? "on" : "off (lower latency, may tear)");
 }
 
-/* Set by set_cursor, cleared by the flush. Atomic because positions can arrive
- * on the reader thread while the loop flushes on main. */
+/* Set by set_cursor, cleared by the cursor thread. */
 static atomic_int g_cursor_dirty = 0;
 
-/* Defined with the cursor-plane code further down. */
+static void tb_cursor_layer_attach(void);
+static void tb_cursor_layer_ensure(void);
 static void tb_cursor_layer_place(void);
+
+/* The cursor's own thread.
+ *
+ * WHY IT HAS ONE
+ *
+ * Placement used to run on the receiver's main loop. That loop blocks for up to
+ * 100ms in dispatch_semaphore_wait(g.inflight) when the GPU is backed up — and
+ * when presentQ is sitting in nextDrawable waiting for a vblank, inflight is
+ * exactly what stops being signalled. Measured: `submit 100%`, `drawable 11.6ms`
+ * and cursor latency going from 1.6ms to 23.9ms mean / 95ms worst, all in the
+ * same five-second window. The cursor was never the faulty part; it was starved
+ * by render backpressure, which is why three fixes aimed at the cursor missed.
+ *
+ * Only PROPERTY writes happen here — position, size, hidden — inside an explicit
+ * CATransaction, which is what Core Animation supports off the main thread. The
+ * structural work (creating the layer, re-parenting it, building its image) stays
+ * on the main thread via tb_metal_plane_flush_cursor, because mutating a layer
+ * TREE off-main while AppKit may also be touching it is a different and much
+ * worse risk. */
+static pthread_t      g_cursor_thread;
+static atomic_int     g_cursor_thread_run = 0;
+static pthread_mutex_t g_cursor_state_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Written by the packet thread, read by the cursor thread. Snapshotted together
+ * so a placement can never mix a new x with an old y. */
+static struct { int x, y, sw, sh, visible; double arrival_ms; } g_cur_pending;
+
 
 void tb_metal_plane_set_cursor(int x, int y, int source_w, int source_h,
                                int visible, int type) {
-    g.cur_x = x; g.cur_y = y;
-    g.cur_sw = source_w > 0 ? source_w : 1;
-    g.cur_sh = source_h > 0 ? source_h : 1;
-    g.cur_visible = visible;
     g.cur_type = type;
+
+    pthread_mutex_lock(&g_cursor_state_lock);
+    g_cur_pending.x       = x;
+    g_cur_pending.y       = y;
+    g_cur_pending.sw      = source_w > 0 ? source_w : 1;
+    g_cur_pending.sh      = source_h > 0 ? source_h : 1;
+    g_cur_pending.visible = visible;
+    g_cur_pending.arrival_ms = g.cur_arrival_ms;
+    pthread_mutex_unlock(&g_cursor_state_lock);
 
     /* Only mark it dirty. Placement happens once per run-loop pass via
      * tb_metal_plane_flush_cursor().
@@ -387,9 +418,43 @@ static void tb_cursor_build(float scale) {
  * own action dictionary AND per update, is deliberate belt-and-braces.
  */
 
+/* The cursor's placement loop. Wakes often enough to keep up with a 120 Hz
+ * sender and does nothing at all when no position has arrived. */
+static void *tb_cursor_thread_main(void *unused) {
+    (void)unused;
+    pthread_setname_np("tb.cursor");
+    while (atomic_load(&g_cursor_thread_run)) {
+        if (atomic_exchange(&g_cursor_dirty, 0)) {
+            @autoreleasepool { tb_cursor_layer_place(); }
+        }
+        /* ~240 Hz: half the sender's sample interval, so a position never waits
+         * for a whole one. Idle cost is a sleep and an atomic load. */
+        usleep(4000);
+    }
+    return NULL;
+}
+
+/* Called from the receiver's main loop. Structural work ONLY — the loop can block
+ * for up to 100ms on GPU backpressure, and that is precisely why placement no
+ * longer happens here. */
 void tb_metal_plane_flush_cursor(void) {
-    if (!atomic_exchange(&g_cursor_dirty, 0)) return;
-    tb_cursor_layer_place();
+    tb_cursor_layer_ensure();
+
+    if (!atomic_load(&g_cursor_thread_run) && g.cursorLayer) {
+        atomic_store(&g_cursor_thread_run, 1);
+        if (pthread_create(&g_cursor_thread, NULL, tb_cursor_thread_main, NULL) != 0) {
+            atomic_store(&g_cursor_thread_run, 0);
+            fprintf(stderr, "[cursor] no thread; placing on the main loop instead\n");
+        } else {
+            pthread_detach(g_cursor_thread);
+            fprintf(stderr, "[cursor] placement moved to its own thread\n");
+        }
+    }
+
+    /* Fallback: without a thread, keep the old behaviour rather than freezing. */
+    if (!atomic_load(&g_cursor_thread_run) && atomic_exchange(&g_cursor_dirty, 0)) {
+        tb_cursor_layer_place();
+    }
 }
 
 void tb_metal_plane_note_cursor_arrival(double recv_ms) {
@@ -464,7 +529,6 @@ static void tb_cursor_layer_sync_image(float scale) {
 /* Place the sprite from the last known cursor state. Cheap enough to call on
  * every packet: it is two float assignments and a compositor notification, with
  * no drawing and no frame involved. */
-static void tb_cursor_layer_attach(void);
 
 /* The layer our cursor must be parented to. Computed the same way attach() does,
  * so place() can notice when they have diverged. */
@@ -488,18 +552,14 @@ static void tb_cursor_note_skip(const char *why) {
     else     fprintf(stderr, "[cursor] placement resumed\n");
 }
 
-static void tb_cursor_layer_place(void) {
+/* Main thread only: make sure the layer exists and hangs off the current metal
+ * layer. Cheap — a pointer comparison in the common case. */
+static void tb_cursor_layer_ensure(void) {
     CALayer *host = tb_cursor_host();
-    if (!host) { tb_cursor_note_skip("no metal layer"); return; }
-
-    /* SELF-HEAL. The plane is torn down and rebuilt on resolution changes and
-     * fullscreen transitions, which can leave the cursor layer parented to a
-     * layer that is no longer on screen — or to nothing. Re-parent rather than
-     * return, or the cursor is frozen until something else reconfigures the
-     * layer tree (toggling vsync, as it turns out). */
+    if (!host) return;
     if (!g.cursorLayer || g.cursorLayer.superlayer != host) {
         tb_cursor_layer_attach();
-        if (!g.cursorLayer) { tb_cursor_note_skip("plane unavailable"); return; }
+        if (!g.cursorLayer) return;
         if (g.cursorLayer.superlayer != host) {
             [CATransaction begin];
             [CATransaction setDisableActions:YES];
@@ -509,12 +569,29 @@ static void tb_cursor_layer_place(void) {
             fprintf(stderr, "[cursor] plane re-parented to the current metal layer\n");
         }
     }
+    /* The sprite is built here too: it allocates and makes a CGImage, which has
+     * no business happening on the hot path. */
+    if (g.cursorLayer && g.frame_w > 0) {
+        tb_cursor_layer_sync_image(((g.frame_w >= 5000) ? 58.f : 44.f) / 24.f);
+    }
+}
+
+static void tb_cursor_layer_place(void) {
+    CALayer *host = g.cursorLayer.superlayer;
+    if (!host) { tb_cursor_note_skip("no metal layer"); return; }
 
     CGRect b = host.bounds;
     if (b.size.width <= 0 || b.size.height <= 0) b = g.layer.bounds;
     if (b.size.width <= 0 || b.size.height <= 0) { tb_cursor_note_skip("host has no bounds"); return; }
 
-    if (!g.cur_visible || g.cur_sw <= 0 || g.cur_sh <= 0) {
+    pthread_mutex_lock(&g_cursor_state_lock);
+    const int cx = g_cur_pending.x, cy = g_cur_pending.y;
+    const int csw = g_cur_pending.sw, csh = g_cur_pending.sh;
+    const int cvis = g_cur_pending.visible;
+    const double carr = g_cur_pending.arrival_ms;
+    pthread_mutex_unlock(&g_cursor_state_lock);
+
+    if (!cvis || csw <= 0 || csh <= 0) {
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         g.cursorLayer.hidden = YES;
@@ -522,10 +599,8 @@ static void tb_cursor_layer_place(void) {
         return;   /* pointer is on the sending Mac; not a fault, not a commit */
     }
 
-    /* Same sizing rule as the Metal path, so switching between them cannot
-     * change how big the arrow looks. */
-    const float scale = ((g.frame_w >= 5000) ? 58.f : 44.f) / 24.f;
-    tb_cursor_layer_sync_image(scale);
+    /* The sprite is prepared by tb_cursor_layer_ensure on the main thread; here we
+     * only place what already exists. */
     if (g.cur_layer_w <= 0 || g.frame_w <= 0 || g.frame_h <= 0) {
         tb_cursor_note_skip("no sprite or frame size yet");
         return;
@@ -538,9 +613,9 @@ static void tb_cursor_layer_place(void) {
      * own hot spot, which is the pixel the user is actually pointing with. */
     const double offx = g.cursorImage ? (double)g.cur_img_hot_x : (double)TB_CUR_PAD;
     const double offy = g.cursorImage ? (double)g.cur_img_hot_y : (double)TB_CUR_PAD;
-    const double fx = ((double)g.cur_x / (double)g.cur_sw)
+    const double fx = ((double)cx / (double)csw)
                     - (offx / (double)g.frame_w);
-    const double fy = ((double)g.cur_y / (double)g.cur_sh)
+    const double fy = ((double)cy / (double)csh)
                     - (offy / (double)g.frame_h);
     const double wPts = (double)g.cur_layer_w / (double)g.frame_w * b.size.width;
     const double hPts = (double)g.cur_layer_h / (double)g.frame_h * b.size.height;
@@ -562,9 +637,11 @@ static void tb_cursor_layer_place(void) {
      * gating them to the display refresh. */
     tb_cursor_note_skip(NULL);   /* placements are flowing again */
     tb_health_note_cursor_commit();
-    if (g.cur_arrival_ms > 0.0) {
-        tb_health_note_cursor_latency(tb_mp_now_ms() - g.cur_arrival_ms);
-        g.cur_arrival_ms = 0.0;   /* one report per packet, not per placement */
+    if (carr > 0.0) {
+        tb_health_note_cursor_latency(tb_mp_now_ms() - carr);
+        pthread_mutex_lock(&g_cursor_state_lock);
+        if (g_cur_pending.arrival_ms == carr) g_cur_pending.arrival_ms = 0.0;
+        pthread_mutex_unlock(&g_cursor_state_lock);
     }
 }
 
@@ -621,6 +698,9 @@ static void tb_cursor_layer_attach(void) {
 }
 
 static void tb_cursor_layer_detach(void) {
+    /* Stop the placement thread before the layer goes, so it cannot touch a
+     * released layer. Detached, so a short wait is enough for it to notice. */
+    if (atomic_exchange(&g_cursor_thread_run, 0)) usleep(12000);
     if (!g.cursorLayer) return;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];

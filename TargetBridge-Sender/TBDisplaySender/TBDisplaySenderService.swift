@@ -547,7 +547,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
     ///
     /// 0 (the default) sends everything captured, which is today's behaviour.
     private let maxSendFPS = UserDefaults.standard.integer(forKey: "TBMaxSendFPS")
-    private var lastSendHostTime = 0.0
+    /// When the next send slot opens. A SCHEDULE, not "time since last send" —
+    /// see the throttle for why that difference matters once capture is
+    /// oversampled.
+    private var nextSendHostTime = 0.0
     /// Frames skipped by the cap. Kept apart from `cadenceDrops`, which means
     /// "the link could not keep up" — these are deliberate and healthy.
     private var oversampleSkips = 0
@@ -1123,14 +1126,33 @@ private final class TBVideoPipeline: @unchecked Sendable {
         // oversampling is actually happening.
         if maxSendFPS > 0 {
             let now = Self.hostNow()
-            // 0.95 of the period: capture jitter must not make us skip a slot
-            // and halve the output rate.
-            let minGap = 0.95 / Double(maxSendFPS)
-            if now - lastSendHostTime < minGap {
+            let period = 1.0 / Double(maxSendFPS)
+
+            // A SLOT SCHEDULE, not a minimum gap.
+            //
+            // The old rule was "at least 0.95 of a period since the last send". At
+            // 60 Hz capture that is safe: arrivals are 16.67ms apart against a
+            // 15.83ms gate, so every frame passes. Oversample capture to 120 Hz and
+            // it inverts — two arrivals are 16.67ms, leaving 0.83ms of headroom,
+            // while measured arrival jitter is several milliseconds. A pair landing
+            // slightly early is skipped, the next chance is a whole 8.33ms later,
+            // and that send lands ~25ms after the last one, which the receiver bins
+            // as a dropped 60 Hz period. Measured 5-8% late frames at 120 Hz against
+            // 0.3-1% at 60 Hz.
+            //
+            // Advancing a schedule by exactly one period cannot drift, and the
+            // tolerance accepts a frame arriving slightly early rather than
+            // forfeiting the slot. A quarter period is well above the jitter and well
+            // below the arrival interval, so one slot never admits two frames.
+            let tolerance = period * 0.25
+            if now + tolerance < nextSendHostTime {
                 oversampleSkips += 1
                 return
             }
-            lastSendHostTime = now
+            nextSendHostTime += period
+            // More than a period behind (a stall, or the first frame): resync rather
+            // than firing a catch-up burst.
+            if nextSendHostTime < now { nextSendHostTime = now + period }
         }
 
         let frameEnteredAt = Self.hostNow()
