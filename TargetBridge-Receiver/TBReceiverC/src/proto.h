@@ -119,6 +119,23 @@
  * keeps writing to its own console. */
 #define TB_PKT_LOG              0x41
 
+/* Phase feedback, receiver -> sender, once a second. Big endian: uint32 mean
+ * drawable wait in MICROSECONDS, uint32 sample count.
+ *
+ * The sender picks the moment it sends each frame, but only the receiver can see
+ * where that moment falls inside its own refresh cycle, and `[layer nextDrawable]`
+ * measures exactly that: near zero means a drawable was free, a full refresh
+ * period means the pool was exhausted and we arrived at the worst possible point.
+ * Both clocks are stable to about a millisecond, so a bad phase does not average
+ * out — it persists for minutes. This packet is the error signal that lets the
+ * sender walk its send schedule out of that state.
+ *
+ * Microseconds rather than a float so the wire stays integer and endian-clean;
+ * uint32 covers 71 minutes, which is 5 orders of magnitude more than needed.
+ * Purely advisory: a sender that ignores this type loses the correction and
+ * nothing else. */
+#define TB_PKT_PHASE            0x43
+
 #define TB_HDR_BYTES        5   /* 4 length + 1 type */
 
 

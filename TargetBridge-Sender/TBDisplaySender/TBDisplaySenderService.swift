@@ -551,9 +551,135 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// see the throttle for why that difference matters once capture is
     /// oversampled.
     private var nextSendHostTime = 0.0
+    /// Measured mean interval between captured frames, in seconds — the arrival
+    /// rate the compositor is ACTUALLY producing, not the rate we asked for.
+    ///
+    /// The throttle's tolerance has to be smaller than this or one slot admits
+    /// two consecutive arrivals, so it must follow the real capture rate.
+    /// Deriving it from `TBVirtualRefresh` would be a guess: that default is a
+    /// request, the display may land on a different mode, and the compositor is
+    /// demand-driven so it can produce below its mode rate. Measuring costs one
+    /// multiply-add per frame on a delta we were already computing.
+    ///
+    /// Seeded from the configured refresh purely so the first few frames have a
+    /// sane bound; it converges on the truth within ~20 frames either way.
+    private var captureIntervalEMA: Double = {
+        let hz = UserDefaults.standard.double(forKey: "TBVirtualRefresh")
+        return 1.0 / (hz > 1 ? hz : 60.0)
+    }()
     /// Frames skipped by the cap. Kept apart from `cadenceDrops`, which means
     /// "the link could not keep up" — these are deliberate and healthy.
     private var oversampleSkips = 0
+
+    // MARK: Phase lock
+    //
+    // The schedule above fixes how OFTEN we send. Nothing fixes WHERE inside the
+    // receiver's refresh cycle those sends land, and that phase is set by whenever
+    // the session happened to start. Land just after the receiver's deadline and
+    // every present waits nearly a full refresh for the next vblank — measured as
+    // `drawable 16.6ms` with `submit` at 98% and cursor latency at 27ms, while
+    // still holding a full 60 fps. It is not a throughput problem, so no rate
+    // counter shows it.
+    //
+    // It used to average out. Once the slot schedule cut send jitter from ±10ms to
+    // ±1ms, the phase became stable too, so a bad one now persists for minutes.
+    // Making the link steadier is what made this failure durable.
+    //
+    // The fix walks the schedule to a better phase. Two things make it cheap now
+    // and did not before:
+    //   - the receiver's `nextDrawable` wait is a ready-made error signal
+    //   - at 240 Hz capture a fresh frame exists every 4.17ms, so moving the send
+    //     instant costs at most that much staleness. At 60 Hz capture the same
+    //     move would cost up to 16.7ms and hand back everything it won, which is
+    //     why this idea was rejected earlier.
+    //
+    /// Off by default: this is a feedback loop over a one-second average, so it
+    /// can hunt, and the flag makes an A/B against `drawable` cost nothing.
+    ///   defaults write com.targetbridge.sender TBPhaseLock -bool true
+    private let phaseLockEnabled = UserDefaults.standard.bool(forKey: "TBPhaseLock")
+    /// Guards `pendingPhaseShift` alone: reports arrive on the connection queue and
+    /// the schedule is owned by the capture queue.
+    private let phaseShiftLock = NSLock()
+    private var pendingPhaseShift = 0.0
+    /// Checked before taking the lock so the per-frame cost on the capture thread
+    /// is one Bool read rather than a lock acquisition 240 times a second. A torn
+    /// read of a flag that is only ever set true or false cannot mislead by more
+    /// than one frame, and the next report would set it again.
+    private var phaseShiftPending = false
+    /// Connection queue only — no lock needed.
+    private var phaseCorrecting = false
+    private var phaseStepsApplied = 0
+    /// Enter correcting above this, leave below the other: hysteresis, or a mean
+    /// hovering near one threshold would step on every report forever. The good
+    /// phase measures 0.0–0.1ms and the bad one a full 16.6ms, so there is a wide
+    /// gap to place these in and no need for them to be finely tuned.
+    private static let phaseBadMs = 3.0
+    private static let phaseGoodMs = 1.0
+    /// Phase is circular, so stepping steadily in ONE direction sweeps every phase
+    /// and is guaranteed to cross the good region — which is why no attempt is made
+    /// to work out the sign of the error. Eight steps of an eighth of a period make
+    /// one full sweep; three sweeps without success means the cause is not phase,
+    /// so stop rather than churn the schedule forever. Reset on any good report.
+    private static let phaseMaxSteps = 24
+
+    /// One phase report from the receiver. Called on the connection queue; the
+    /// resulting shift is handed to the capture queue through `pendingPhaseShift`
+    /// so the schedule keeps a single writer.
+    ///
+    /// The controller lives here rather than beside the packet decoding because
+    /// this is the type that owns the schedule — the decision and the thing it
+    /// acts on stay together, and the session only has to decode bytes.
+    func notePhaseReport(meanMs: Double, samples: UInt32) {
+        // No schedule means nothing to shift: the phase is then whatever the
+        // compositor produces and we have no handle on it. Still logged — the
+        // number is the only view we get of where our sends land in the receiver's
+        // refresh cycle, and it is what an A/B of this feature is judged on.
+        guard phaseLockEnabled, maxSendFPS > 0 else {
+            TBTelemetryReporter.emit(
+                "phase drawable \(String(format: "%.2f", meanMs))ms n=\(samples) (lock off)")
+            return
+        }
+
+        if phaseCorrecting {
+            if meanMs < Self.phaseGoodMs {
+                TBTelemetryReporter.emit(
+                    "phase locked: drawable \(String(format: "%.2f", meanMs))ms"
+                    + " after \(phaseStepsApplied) step(s)")
+                phaseCorrecting = false
+                phaseStepsApplied = 0
+                return
+            }
+            if phaseStepsApplied >= Self.phaseMaxSteps {
+                // Swept every phase three times over and the wait did not come
+                // down, so the cause is not where we send. Stop stepping and say
+                // so — silently continuing would leave a moving schedule looking
+                // like a fixed one.
+                TBTelemetryReporter.emit(
+                    "phase giving up: drawable \(String(format: "%.2f", meanMs))ms"
+                    + " unchanged after \(phaseStepsApplied) steps — not a phase problem")
+                phaseCorrecting = false
+                phaseStepsApplied = 0
+                return
+            }
+        } else if meanMs > Self.phaseBadMs {
+            phaseCorrecting = true
+            phaseStepsApplied = 0
+        } else {
+            phaseStepsApplied = 0
+            return
+        }
+
+        let step = (1.0 / Double(maxSendFPS)) / 8.0
+        phaseShiftLock.lock()
+        pendingPhaseShift += step
+        phaseShiftPending = true
+        phaseShiftLock.unlock()
+        phaseStepsApplied += 1
+        TBTelemetryReporter.emit(
+            "phase stepping: drawable \(String(format: "%.2f", meanMs))ms n=\(samples)"
+            + " -> shift \(String(format: "%.2f", step * 1000.0))ms"
+            + " (step \(phaseStepsApplied)/\(Self.phaseMaxSteps))")
+    }
     /// Bands per frame. 18 or 20 measured best on this hardware: encode grows
     /// ~0.26 ms per slice (two GPU round trips each), so past ~20 it overtakes the
     /// wire and becomes the slowest stage, and the makespan turns back up.
@@ -1026,6 +1152,25 @@ private final class TBVideoPipeline: @unchecked Sendable {
         return max(0, min(7, periods))
     }
 
+    /// Bin a CAPTURE gap in units of the measured arrival interval.
+    ///
+    /// `cadenceBin` divides by a hardcoded 1/60, which is right for sends — we
+    /// send 60 — but wrong for arrivals the moment capture is oversampled, and
+    /// wrong in the worst way: at 120 Hz an 8.33 ms gap is 0.5 periods and Swift
+    /// rounds that AWAY from zero, so every arrival landed in bin 1 and the
+    /// histogram read as a flawless 60 Hz cadence. It was not reporting the
+    /// capture rate at all. At 240 Hz the same divisor collapses everything into
+    /// bin 0. Both hide exactly what the oversampling experiment needs to see.
+    ///
+    /// Binning against the arrival interval keeps the meaning that made this
+    /// histogram useful: 1 is on time, 2 is one missed arrival, whatever the rate.
+    /// The absolute rate is reported separately as `interval`, since a histogram
+    /// normalised by its own rate can no longer show it.
+    private func captureBin(_ seconds: Double) -> Int {
+        let periods = Int((seconds / max(captureIntervalEMA, 0.0005)).rounded())
+        return max(0, min(7, periods))
+    }
+
     /// Host-clock seconds, the same timebase sample buffer timestamps use.
     private static func hostNow() -> Double {
         CMClockGetTime(CMClockGetHostTimeClock()).seconds
@@ -1041,8 +1186,16 @@ private final class TBVideoPipeline: @unchecked Sendable {
             latDeliveryMax = max(latDeliveryMax, delivery)
         }
         if lastCapturePTS > 0, pts > lastCapturePTS {
-            capCadenceBin[cadenceBin(pts - lastCapturePTS)] += 1
+            let delta = pts - lastCapturePTS
+            capCadenceBin[captureBin(delta)] += 1
             capCadenceCount += 1
+            // Track the real arrival interval for the throttle's tolerance.
+            // Bounded to 1..50ms (240 Hz .. 20 Hz) so a stall or a resume does not
+            // drag the estimate somewhere that makes the tolerance unsafe; alpha
+            // 1/16 settles in ~20 frames, which is well inside a second.
+            if delta > 0.001, delta < 0.050 {
+                captureIntervalEMA += (delta - captureIntervalEMA) / 16.0
+            }
         }
         lastCapturePTS = pts
 
@@ -1061,6 +1214,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
         // a few doubles is cheap; formatting them is not.
         let capBins = capCadenceBin
         let sendBins = sendCadenceBin
+        let capInterval = captureIntervalEMA
+        let skips = oversampleSkips
         let drops = cadenceDrops
         let idle = tbIdleFramesSeen
         let idleGap = tbIdleInputGapMin
@@ -1077,6 +1232,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         let budget = preset.maxPendingVideoPackets
             * ((dpcmEnabled && dpcmSlicesEnabled) ? max(1, dpcmSliceCount) : 1)
 
+        oversampleSkips = 0
         tbIdleFramesSeen = 0
         tbIdleInputGapMin = .greatestFiniteMagnitude
         tbWakeShortSum = 0; tbWakeShortCount = 0
@@ -1085,6 +1241,8 @@ private final class TBVideoPipeline: @unchecked Sendable {
         stageProbeMax = 0; stageLockMax = 0; stageCtxMax = 0; stageSubmitMax = 0
 
         TBTelemetryReporter.report(capBins: capBins, sendBins: sendBins,
+                                   capIntervalMs: capInterval * 1000.0,
+                                   oversampleSkips: skips,
                                    drops: drops, idle: idle,
                                    probe: sProbe, lock: sLock,
                                    ctx: sCtx, submit: sSubmit,
@@ -1128,6 +1286,20 @@ private final class TBVideoPipeline: @unchecked Sendable {
             let now = Self.hostNow()
             let period = 1.0 / Double(maxSendFPS)
 
+            // Slide the schedule if the receiver reported a bad phase. Applied
+            // here, on the thread that owns `nextSendHostTime`, so the schedule has
+            // exactly one writer. The shift moves WHEN a slot opens, never how far
+            // apart slots are, so the send rate is untouched: one interval comes out
+            // 2.08ms long and every interval after it is a normal period again.
+            if phaseShiftPending {
+                phaseShiftLock.lock()
+                let shift = pendingPhaseShift
+                pendingPhaseShift = 0
+                phaseShiftPending = false
+                phaseShiftLock.unlock()
+                nextSendHostTime += shift
+            }
+
             // A SLOT SCHEDULE, not a minimum gap.
             //
             // The old rule was "at least 0.95 of a period since the last send". At
@@ -1142,9 +1314,17 @@ private final class TBVideoPipeline: @unchecked Sendable {
             //
             // Advancing a schedule by exactly one period cannot drift, and the
             // tolerance accepts a frame arriving slightly early rather than
-            // forfeiting the slot. A quarter period is well above the jitter and well
-            // below the arrival interval, so one slot never admits two frames.
-            let tolerance = period * 0.25
+            // forfeiting the slot.
+            //
+            // The tolerance is bounded by the ARRIVAL interval, not the send
+            // period. A fixed quarter-period is 4.17ms at 60 fps out, which is
+            // safely below a 120 Hz arrival gap (8.33ms) but exactly EQUAL to a
+            // 240 Hz one — so at 240 Hz a slot would admit the next arrival too
+            // and we would send in pairs, doubling the wire rate and putting the
+            // sends back into the bursty pattern the schedule exists to remove.
+            // 40% of the measured arrival gap keeps a comfortable margin at any
+            // capture rate, and stays far above the ±1ms jitter we now have.
+            let tolerance = min(period * 0.25, captureIntervalEMA * 0.4)
             if now + tolerance < nextSendHostTime {
                 oversampleSkips += 1
                 return
@@ -2915,6 +3095,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 micForwarder?.forward(payload)
             case .receiverLog:
                 TBReceiverLogSink.shared.append(payload)
+            case .phaseReport:
+                handlePhaseReport(payload)
             case .displayTweaks:
                 // Receiver reporting its real state (it may have been changed on
                 // that Mac directly). Adopt it without sending anything back —
@@ -2933,6 +3115,23 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 break
             }
         }
+    }
+
+    /// One phase report from the receiver: its mean `nextDrawable` wait.
+    /// Decodes and forwards; the controller lives in `TBVideoPipeline`, which owns
+    /// the schedule it acts on.
+    private func handlePhaseReport(_ payload: Data) {
+        guard payload.count >= 8 else { return }
+        let b = [UInt8](payload)
+        // Assembled byte by byte rather than loaded as a UInt32: the payload sits
+        // at an arbitrary offset inside the receive buffer, so it carries no
+        // alignment guarantee, and this also states the endianness outright.
+        let meanUs = (UInt32(b[0]) << 24) | (UInt32(b[1]) << 16)
+                   | (UInt32(b[2]) << 8)  |  UInt32(b[3])
+        let samples = (UInt32(b[4]) << 24) | (UInt32(b[5]) << 16)
+                    | (UInt32(b[6]) << 8)  |  UInt32(b[7])
+        guard samples > 0 else { return }
+        pipeline?.notePhaseReport(meanMs: Double(meanUs) / 1000.0, samples: samples)
     }
 
     private func currentLocalMouseLocation() -> CGPoint? {

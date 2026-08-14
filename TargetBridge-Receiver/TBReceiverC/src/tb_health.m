@@ -130,10 +130,33 @@ static volatile double g_cur_gap_sum = 0, g_cur_gap_max = 0;
 static volatile long   g_cur_n = 0;
 static double          g_cur_last_ms = 0;
 
+/* A SECOND accumulator over the same samples, for the phase report.
+ *
+ * It cannot share the health report's totals: that report drains them on its own
+ * ~5s cadence, and a feedback loop reading the same variables would get whatever
+ * fraction of a window happened to have accumulated since the last drain — a
+ * mean over 200ms one second and over 4s the next. Two counters over one sample
+ * is a few bytes and removes the coupling entirely. */
+static volatile double g_phase_sum = 0;
+static volatile long   g_phase_n   = 0;
+
 void tb_health_note_drawable_wait(double ms) {
     g_draw_sum += ms;
     if (ms > g_draw_max) g_draw_max = ms;
     g_draw_n++;
+    g_phase_sum += ms;
+    g_phase_n++;
+}
+
+int tb_health_take_drawable_phase(double *mean_ms, long *n) {
+    const double sum = g_phase_sum;
+    const long   cnt = g_phase_n;
+    g_phase_sum = 0;
+    g_phase_n   = 0;
+    if (cnt <= 0) return 0;
+    if (mean_ms) *mean_ms = sum / (double)cnt;
+    if (n)       *n = cnt;
+    return 1;
 }
 
 static volatile double g_curlat_sum = 0, g_curlat_max = 0;

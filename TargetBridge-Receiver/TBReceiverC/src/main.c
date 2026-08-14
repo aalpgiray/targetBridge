@@ -3041,6 +3041,21 @@ int main(int argc, char **argv) {
                         acc_other_ms, acc_other_ms * 100.0 / span);
                 acc_drain_ms = acc_wait_ms = acc_other_ms = 0.0;
                 acc_since_ms = now_ms_f();
+
+                /* Phase feedback to the sender. Sent from here because this tick
+                 * already runs once a second on the thread that owns the socket,
+                 * so it needs no timer of its own and no cross-thread send. */
+                double phase_mean = 0.0;
+                long   phase_n = 0;
+                if (tb_health_take_drawable_phase(&phase_mean, &phase_n)) {
+                    uint8_t body[8];
+                    double us = phase_mean * 1000.0;
+                    if (us < 0.0) us = 0.0;
+                    if (us > 4294967295.0) us = 4294967295.0;
+                    write_be32(body, (uint32_t)us);
+                    write_be32(body + 4, (uint32_t)phase_n);
+                    (void)tb_send_packet(&a, TB_PKT_PHASE, body, sizeof body);
+                }
             }
         }
     }

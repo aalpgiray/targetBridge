@@ -52,7 +52,9 @@ enum TBTelemetryReporter {
             .joined(separator: "  ")
     }
 
-    static func report(capBins: [Int], sendBins: [Int], drops: Int, idle: Int,
+    static func report(capBins: [Int], sendBins: [Int],
+                       capIntervalMs: Double, oversampleSkips: Int,
+                       drops: Int, idle: Int,
                        probe: Double, lock: Double, ctx: Double, submit: Double,
                        hadProcess: Bool,
                        deliverySum: Double, deliveryMax: Double,
@@ -74,7 +76,16 @@ enum TBTelemetryReporter {
             } else {
                 idleNote = " idle \(idle)"
             }
-            emit("cadence capture(pts) \(fmt(capBins)) \(idleNote)")
+            // `interval` is the absolute arrival rate. The histogram beside it is
+            // normalised by this same interval, so it can show missed arrivals but
+            // NOT the rate -- without this number an oversampled capture is
+            // indistinguishable from a 60 Hz one. `skipped` is the deliberate
+            // decimation: at 120 Hz in / 60 out it should be ~half the arrivals.
+            let rateNote = String(format: " interval %.2fms (%.0fHz) skipped %d",
+                                  capIntervalMs,
+                                  capIntervalMs > 0.01 ? 1000.0 / capIntervalMs : 0,
+                                  oversampleSkips)
+            emit("cadence capture(pts) \(fmt(capBins))\(rateNote)\(idleNote)")
             emit("cadence emit(wall)   \(fmt(emitBins))  drops \(drops)")
             // The wake-up cost, which every other number here is blind to.
             // `long` is the one that matters: resuming after a real pause.

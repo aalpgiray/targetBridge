@@ -84,6 +84,17 @@ void tb_health_note_submit(double ms);
 void tb_health_note_drawable_wait(double ms);
 void tb_health_note_cursor_commit(void);
 
+/* Drain the drawable wait for the PHASE REPORT, which is a control signal rather
+ * than a diagnostic — see TB_PKT_PHASE. Returns 0 and writes nothing when no
+ * samples have arrived since the last call, which is the normal state whenever
+ * nothing is being presented; the caller should send no report at all in that
+ * case rather than a mean of zero, since "no frames" and "no wait" would
+ * otherwise look identical and the sender would read the latter as a good phase.
+ *
+ * Independent of the health report's own totals, so calling either does not
+ * disturb the other. */
+int tb_health_take_drawable_phase(double *mean_ms, long *n);
+
 /* Arrival-to-commit for one cursor position: off the socket to on the
  * compositor, including any wait in the control queue. Excludes the network hop
  * by design — the sender's clock is on another machine and unsynchronised, so

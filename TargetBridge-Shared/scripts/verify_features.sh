@@ -68,6 +68,7 @@ want "GPU decode on the receiver"       1 "render_dpcm_slice"  TargetBridge-Rece
 want "wire packet: whole frame"          1 "rawDPCM\b"          TargetBridge-Sender/TBDisplayShared
 want "wire packet: slice"                1 "rawDPCMSlice"       TargetBridge-Sender/TBDisplayShared
 want "wire packet: receiver log"         1 "receiverLog"        TargetBridge-Sender/TBDisplayShared
+want "wire packet: phase report"         1 "phaseReport"        TargetBridge-Sender/TBDisplayShared
 want "receiver packet handlers"         1 "RAW_DPCM_SLICE"     TargetBridge-Receiver/TBReceiverC/src
 want "codec built into the receiver"    1 "tb_dpcm"            TargetBridge-Receiver/TBReceiverC/Makefile
 

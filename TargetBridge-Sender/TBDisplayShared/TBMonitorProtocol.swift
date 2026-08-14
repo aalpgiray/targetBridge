@@ -51,6 +51,19 @@ enum TBMonitorPacketType: UInt8 {
     /// appends these to a file so both sides can be read from one machine.
     case receiverLog = 0x41
 
+    /// The receiver's mean `nextDrawable` wait, receiver -> sender, once a second.
+    /// Big endian: `UInt32` microseconds, `UInt32` sample count.
+    ///
+    /// We choose the instant each frame is sent, but only the receiver can see
+    /// where that instant lands inside its own refresh cycle. A wait near zero
+    /// means a drawable was free; a wait near a full refresh means the pool was
+    /// exhausted and we are arriving at the worst possible moment. Since both
+    /// clocks are now stable to about a millisecond, that state persists for
+    /// minutes instead of averaging away — so this is the error signal the sender
+    /// needs to walk its schedule out of it. See the phase controller in
+    /// `TBDisplaySenderService`.
+    case phaseReport = 0x43
+
     /// The real cursor bitmap, sent only when the cursor CHANGES shape.
     ///
     /// The alternative was to draw each cursor from geometry on the receiver,
