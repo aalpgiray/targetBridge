@@ -169,6 +169,11 @@ final class TBDisplaySenderStatusItemController: NSObject {
     /// has stopped advertising while still streaming).
     private func addMonitorRows(to menu: NSMenu) {
         var rows: [TBMenuMonitorSpec] = []
+        // Match on EVERY address a receiver advertises, not just the preferred
+        // one. A receiver reachable over both Thunderbolt and Wi-Fi publishes two
+        // addresses; the session dialled one of them, so comparing against a
+        // single field lists the same machine twice -- once as connected and once
+        // as available.
         var seenIP = Set<String>()
 
         for session in service.sessions where session.isConnected {
@@ -182,7 +187,10 @@ final class TBDisplaySenderStatusItemController: NSObject {
                 onTap: { [weak session] in session?.stop() }))
         }
 
-        for receiver in service.discoveredReceivers where !seenIP.contains(receiver.preferredIP) {
+        for receiver in service.discoveredReceivers {
+            let addresses = [receiver.preferredIP, receiver.thunderboltIP, receiver.networkIP]
+                .filter { !$0.isEmpty }
+            if addresses.contains(where: { seenIP.contains($0) }) { continue }
             rows.append(TBMenuMonitorSpec(
                 symbol: "display",
                 title: receiver.displayText,
@@ -235,6 +243,11 @@ final class TBDisplaySenderStatusItemController: NSObject {
         let session = service.sessions.first(where: { !$0.isConnected })
             ?? service.sessions.first
         guard let session else { return }
+        // applyDiscoveredReceiver resolves the address via receiver.ip(for:), which
+        // returns the THUNDERBOLT address when the session's transport is
+        // Thunderbolt. Reaching for preferredIP here instead would silently dial
+        // the Wi-Fi address of a machine sitting on a Thunderbolt bridge -- the
+        // difference between a lossless 5K60 link and one that cannot carry it.
         service.applyDiscoveredReceiver(receiver, to: session)
         session.connect()
     }
