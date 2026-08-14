@@ -2474,7 +2474,38 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     func connect() {
-        guard connection == nil, !receiverIP.isEmpty, !localInterfaceIP.isEmpty else { return }
+        // A user-visible button must never do nothing silently.
+        //
+        // This guard used to be a bare `return`: press Connect with a stranded
+        // `connection` object and the app did nothing, said nothing, and created
+        // no socket. From the outside that is indistinguishable from a network
+        // fault, and it sent us chasing the firewall, TCC, entitlements and code
+        // signing for two days. The button looked enabled because `isConnected`
+        // is a separate flag, and only relaunching the app cleared it.
+        //
+        // Reported through TBTelemetryReporter, not TBLog: `log stream` has never
+        // reliably captured this subsystem, so a diagnostic sent only there is a
+        // diagnostic we cannot read. The sink writes to receiver.log, which has
+        // captured every other number in this project.
+        if !receiverIP.isEmpty, !localInterfaceIP.isEmpty, connection != nil {
+            // Non-nil but not connected means the previous connection was never
+            // torn down. Recover rather than refuse: the user asked to connect,
+            // and the stale object is ours to clean up.
+            TBTelemetryReporter.emit(
+                "connect: found a stale connection object (isConnected=\(isConnected))"
+                + " — tearing it down and dialling again")
+            stop(resetStatusTo: nil)
+        }
+        guard connection == nil else {
+            TBTelemetryReporter.emit("connect: refused — teardown left a connection behind")
+            return
+        }
+        guard !receiverIP.isEmpty, !localInterfaceIP.isEmpty else {
+            TBTelemetryReporter.emit(
+                "connect: refused — receiverIP=\"\(receiverIP)\""
+                + " localInterfaceIP=\"\(localInterfaceIP)\" (one is empty)")
+            return
+        }
         connectTimeoutWorkItem?.cancel()
         connectTimeoutWorkItem = nil
         recvBuffer.removeAll(keepingCapacity: false)
@@ -2627,7 +2658,21 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     self.setStatus(.connectionFailed("\(error.localizedDescription) — \(detail)"))
                     self.stop(resetStatusTo: nil)
                 case .cancelled:
+                    // Clear the object, not just the flag.
+                    //
+                    // This used to set isConnected = false and stop. The UI then
+                    // showed "disconnected" while `connection` was still non-nil,
+                    // and connect()'s guard turned every later press into a silent
+                    // no-op that only an app relaunch cleared. Whether this path is
+                    // reachable without stop() having already run is unproven --
+                    // but a state that strands the Connect button must not depend
+                    // on that being impossible.
                     self.isConnected = false
+                    if self.connection != nil {
+                        TBTelemetryReporter.emit(
+                            "connection cancelled outside teardown — clearing it")
+                        self.stop(resetStatusTo: nil)
+                    }
                 default:
                     break
                 }
@@ -3017,7 +3062,17 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private func receiveLoop(on connection: NWConnection) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { [weak self] data, _, isDone, error in
             Task { @MainActor [weak self] in
-                guard let self, self.connection === connection else { return }
+                // A receive completion for a connection we have already replaced is
+                // stale and must not touch current state -- but say so, because a
+                // teardown that arrives here is a teardown nobody performs.
+                guard let self else { return }
+                guard self.connection === connection else {
+                    if isDone || error != nil {
+                        TBTelemetryReporter.emit(
+                            "receive: EOF/error for a superseded connection — ignored")
+                    }
+                    return
+                }
                 if let data, !data.isEmpty {
                     self.recvBuffer.append(data)
                     self.drainPackets()
