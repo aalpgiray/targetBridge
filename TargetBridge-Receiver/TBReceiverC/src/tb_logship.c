@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <time.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -56,21 +57,74 @@ static void ring_put(const uint8_t *p, size_t n) {
     pthread_mutex_unlock(&g.lock);
 }
 
+/* Stamp each line as it leaves, so the shipped log can be correlated with when
+ * something was actually seen.
+ *
+ * Every line used to be bare text. Diagnosing an intermittent stall then meant
+ * guessing whether a `[perf]` or `cursor gap` sample came from before or after
+ * the moment the user described — which produced three wrong diagnoses of the
+ * same symptom. One timestamp ends that whole class of ambiguity.
+ *
+ * Stamped here rather than at each fprintf: one place, and every existing log
+ * line gets it for free. */
+static void stamp_line_start(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tmv;
+    localtime_r(&ts.tv_sec, &tmv);
+    char pfx[32];
+    const int k = snprintf(pfx, sizeof(pfx), "%02d:%02d:%02d.%03d ",
+                           tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+                           (int)(ts.tv_nsec / 1000000));
+    if (k > 0) {
+        ssize_t off = 0;
+        while (off < k) {
+            const ssize_t w = write(g.real_stderr, pfx + off, (size_t)(k - off));
+            if (w <= 0) break;
+            off += w;
+        }
+        ring_put((const uint8_t *)pfx, (size_t)k);
+    }
+}
+
 static void *reader_main(void *unused) {
     (void)unused;
     uint8_t buf[8192];
+    /* Start of a line, so the first chunk gets a stamp. */
+    int at_line_start = 1;
     for (;;) {
         const ssize_t n = read(g.pipe_r, buf, sizeof(buf));
         if (n > 0) {
             /* Local console first: if the socket is down or the ring is full,
              * the person at the receiver still sees everything. */
-            ssize_t off = 0;
-            while (off < n) {
-                const ssize_t w = write(g.real_stderr, buf + off, (size_t)(n - off));
-                if (w <= 0) break;
-                off += w;
+            /* Emit segment by segment so a stamp lands after every newline,
+             * never mid-line. A read can straddle any number of lines. */
+            ssize_t seg = 0;
+            for (ssize_t i = 0; i < n; ++i) {
+                if (at_line_start) { stamp_line_start(); at_line_start = 0; }
+                if (buf[i] == '\n') {
+                    const size_t len = (size_t)(i - seg + 1);
+                    ssize_t off = 0;
+                    while ((size_t)off < len) {
+                        const ssize_t w = write(g.real_stderr, buf + seg + off, len - (size_t)off);
+                        if (w <= 0) break;
+                        off += w;
+                    }
+                    ring_put(buf + seg, len);
+                    seg = i + 1;
+                    at_line_start = 1;
+                }
             }
-            ring_put(buf, (size_t)n);
+            if (seg < n) {
+                const size_t len = (size_t)(n - seg);
+                ssize_t off = 0;
+                while ((size_t)off < len) {
+                    const ssize_t w = write(g.real_stderr, buf + seg + off, len - (size_t)off);
+                    if (w <= 0) break;
+                    off += w;
+                }
+                ring_put(buf + seg, len);
+            }
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
