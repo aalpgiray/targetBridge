@@ -7,11 +7,18 @@ struct TBDisplaySenderApp: App {
 
     var body: some Scene {
         WindowGroup("TargetBridge", id: "main") {
-            // The monitors window replaces the old card stack. The previous view
-            // still exists and still compiles; it is simply no longer mounted, so
-            // reverting is a one-line change if this turns out worse in practice.
-            TBMonitorsWindowView(service: service)
-                .frame(minWidth: 720, minHeight: 460)
+            // RESTORED. TBMonitorsWindowView is the redesign and it is still in the
+            // build, but it only covers what the session CARD showed -- transport,
+            // local interface, manual receiver entry, discovery, stream profile,
+            // capture source, display profiles and the cable test all lived in the
+            // per-session settings SHEET, and mounting the new window made every
+            // one of them unreachable. Streaming quality is not an option you can
+            // ship without.
+            //
+            // Swap back to TBMonitorsWindowView once those sections exist on the
+            // monitor page.
+            TBDisplaySenderContentView(service: service)
+                .frame(minWidth: 540)
                 .task {
                     statusItemController.activate()
                     // Track which output the user was on before selecting ours,
