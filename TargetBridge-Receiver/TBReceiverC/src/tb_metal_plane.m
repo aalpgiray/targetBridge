@@ -464,27 +464,72 @@ static void tb_cursor_layer_sync_image(float scale) {
 /* Place the sprite from the last known cursor state. Cheap enough to call on
  * every packet: it is two float assignments and a compositor notification, with
  * no drawing and no frame involved. */
-static void tb_cursor_layer_place(void) {
-    if (!g.cursorLayer) return;
+static void tb_cursor_layer_attach(void);
 
-    CALayer *host = g.cursorLayer.superlayer;
-    if (!host) return;
-    const CGRect b = host.bounds;
-    if (b.size.width <= 0 || b.size.height <= 0) return;
+/* The layer our cursor must be parented to. Computed the same way attach() does,
+ * so place() can notice when they have diverged. */
+static CALayer *tb_cursor_host(void) {
+    if (!g.layer) return nil;
+    return g.layer.superlayer ?: g.layer;
+}
+
+/* Say why a placement did nothing — once per change of reason, so a permanent
+ * stall names itself instead of just going quiet.
+ *
+ * Every early return here used to be silent. When the layer lost its parent the
+ * cursor froze for good and the only clue was the absence of `cursor gap` in the
+ * health line, which is indistinguishable from the pointer being on the other
+ * Mac. Two wrong diagnoses came out of that ambiguity. */
+static void tb_cursor_note_skip(const char *why) {
+    static const char *last = NULL;
+    if (last == why) return;
+    last = why;
+    if (why) fprintf(stderr, "[cursor] placement skipped: %s\n", why);
+    else     fprintf(stderr, "[cursor] placement resumed\n");
+}
+
+static void tb_cursor_layer_place(void) {
+    CALayer *host = tb_cursor_host();
+    if (!host) { tb_cursor_note_skip("no metal layer"); return; }
+
+    /* SELF-HEAL. The plane is torn down and rebuilt on resolution changes and
+     * fullscreen transitions, which can leave the cursor layer parented to a
+     * layer that is no longer on screen — or to nothing. Re-parent rather than
+     * return, or the cursor is frozen until something else reconfigures the
+     * layer tree (toggling vsync, as it turns out). */
+    if (!g.cursorLayer || g.cursorLayer.superlayer != host) {
+        tb_cursor_layer_attach();
+        if (!g.cursorLayer) { tb_cursor_note_skip("plane unavailable"); return; }
+        if (g.cursorLayer.superlayer != host) {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            [g.cursorLayer removeFromSuperlayer];
+            [host addSublayer:g.cursorLayer];
+            [CATransaction commit];
+            fprintf(stderr, "[cursor] plane re-parented to the current metal layer\n");
+        }
+    }
+
+    CGRect b = host.bounds;
+    if (b.size.width <= 0 || b.size.height <= 0) b = g.layer.bounds;
+    if (b.size.width <= 0 || b.size.height <= 0) { tb_cursor_note_skip("host has no bounds"); return; }
 
     if (!g.cur_visible || g.cur_sw <= 0 || g.cur_sh <= 0) {
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         g.cursorLayer.hidden = YES;
         [CATransaction commit];
-        return;
+        return;   /* pointer is on the sending Mac; not a fault, not a commit */
     }
 
     /* Same sizing rule as the Metal path, so switching between them cannot
      * change how big the arrow looks. */
     const float scale = ((g.frame_w >= 5000) ? 58.f : 44.f) / 24.f;
     tb_cursor_layer_sync_image(scale);
-    if (g.cur_layer_w <= 0 || g.frame_w <= 0 || g.frame_h <= 0) return;
+    if (g.cur_layer_w <= 0 || g.frame_w <= 0 || g.frame_h <= 0) {
+        tb_cursor_note_skip("no sprite or frame size yet");
+        return;
+    }
 
     /* Cursor arrives in the sender's source-frame space; express everything as a
      * fraction of the frame, then multiply by the layer's size in points. That
@@ -515,6 +560,7 @@ static void tb_cursor_layer_place(void) {
     /* Cadence, not latency — the sender's 120 Hz clock is on another machine.
      * ~8ms between commits means positions flow; ~17ms means something is
      * gating them to the display refresh. */
+    tb_cursor_note_skip(NULL);   /* placements are flowing again */
     tb_health_note_cursor_commit();
     if (g.cur_arrival_ms > 0.0) {
         tb_health_note_cursor_latency(tb_mp_now_ms() - g.cur_arrival_ms);
@@ -528,13 +574,21 @@ static void tb_cursor_layer_attach(void) {
     /* Escape hatch. If the plane ever misbehaves — wrong place, wrong size, a
      * compositor quirk on some macOS version — TB_CURSOR_PLANE=0 falls straight
      * back to compositing the cursor into the frame, which is what shipped
-     * before and is known to be correct if slower. */
-    const char *env = getenv("TB_CURSOR_PLANE");
-    if (env && env[0] == '0') {
-        fprintf(stderr, "[metal] cursor plane disabled by TB_CURSOR_PLANE=0; "
-                        "cursor will ride the video frames again\n");
-        return;
+     * before and is known to be correct if slower.
+     *
+     * Decided once. place() now calls attach() on every flush to self-heal a
+     * mis-parented layer, so re-reading the environment here would re-log this
+     * line up to 120 times a second. */
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char *env = getenv("TB_CURSOR_PLANE");
+        disabled = (env && env[0] == '0') ? 1 : 0;
+        if (disabled) {
+            fprintf(stderr, "[metal] cursor plane disabled by TB_CURSOR_PLANE=0; "
+                            "cursor will ride the video frames again\n");
+        }
     }
+    if (disabled) return;
     CALayer *host = g.layer.superlayer ?: g.layer;
 
     CALayer *cur = [CALayer layer];
