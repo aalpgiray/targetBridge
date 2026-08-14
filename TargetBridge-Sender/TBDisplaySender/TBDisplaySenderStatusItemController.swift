@@ -11,6 +11,8 @@ final class TBDisplaySenderStatusItemController: NSObject {
     // its target weakly). Cleared and rebuilt each time the menu opens.
     private var sliderTargets: [TBMenuSliderTarget] = []
     private var toggleRows: [TBMenuToggleRowView] = []
+    // NSMenuItem.view does not retain the target of its subviews' actions.
+    private var monitorRows: [TBMenuMonitorRowView] = []
 
     init(service: TBDisplaySenderService) {
         self.service = service
@@ -162,10 +164,86 @@ final class TBDisplaySenderStatusItemController: NSObject {
         return service.sessions.first(where: { $0.isConnected && $0.virtualDisplayID == displayID })
     }
 
+    /// One row per discovered receiver, plus any connected session that discovery
+    /// is not currently reporting (a manually entered address, or a receiver that
+    /// has stopped advertising while still streaming).
+    private func addMonitorRows(to menu: NSMenu) {
+        var rows: [TBMenuMonitorSpec] = []
+        var seenIP = Set<String>()
+
+        for session in service.sessions where session.isConnected {
+            seenIP.insert(session.receiverIP)
+            rows.append(TBMenuMonitorSpec(
+                symbol: "display",
+                title: service.sessionTitle(for: session),
+                subtitle: session.statusText,
+                isStreaming: session.isStreaming,
+                isError: false,
+                onTap: { [weak session] in session?.stop() }))
+        }
+
+        for receiver in service.discoveredReceivers where !seenIP.contains(receiver.preferredIP) {
+            rows.append(TBMenuMonitorSpec(
+                symbol: "display",
+                title: receiver.displayText,
+                subtitle: TBDisplaySenderL10n.statusChipIdle(service.language),
+                isStreaming: false,
+                isError: false,
+                onTap: { [weak self] in self?.connect(to: receiver) }))
+        }
+
+        if rows.isEmpty {
+            menu.addItem(.separator())
+            addSetupHelp(to: menu)
+            return
+        }
+
+        menu.addItem(.separator())
+        for spec in rows {
+            let view = TBMenuMonitorRowView(spec: spec,
+                                            width: TBMenuMetrics.width,
+                                            leadingInset: TBMenuMetrics.inset)
+            let item = NSMenuItem()
+            // NSMenuItem sizes its row from the view's frame; the initialiser sets
+            // it, and without one the item is present at zero height.
+            item.view = view
+            menu.addItem(item)
+            monitorRows.append(view)
+        }
+    }
+
+    /// Nothing found. Says what to do rather than simply reporting emptiness --
+    /// this is the first thing a new user sees, and "no displays" alone is a dead
+    /// end. A disabled item is enough; this does not need a custom view.
+    private func addSetupHelp(to menu: NSMenu) {
+        let text = TBDisplaySenderL10n.discoveryHint(service.language)
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        item.attributedTitle = NSAttributedString(
+            string: text,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ])
+        item.isEnabled = false
+        menu.addItem(item)
+    }
+
+    /// Connect through the SAME path the window uses. A second route would drift
+    /// out of step with it -- applyDiscoveredReceiver also settles the transport
+    /// and local interface, and skipping it dials a stale address.
+    private func connect(to receiver: TBDiscoveredReceiver) {
+        let session = service.sessions.first(where: { !$0.isConnected })
+            ?? service.sessions.first
+        guard let session else { return }
+        service.applyDiscoveredReceiver(receiver, to: session)
+        session.connect()
+    }
+
     private func rebuildMenuItems(in menu: NSMenu) {
         menu.removeAllItems()
         sliderTargets.removeAll()
         toggleRows.removeAll()
+        monitorRows.removeAll()
 
         let titleItem = NSMenuItem(title: "TargetBridge", action: nil, keyEquivalent: "")
         titleItem.isEnabled = false
@@ -174,6 +252,10 @@ final class TBDisplaySenderStatusItemController: NSObject {
         let statusItem = NSMenuItem(title: service.summaryStatusText(), action: nil, keyEquivalent: "")
         statusItem.isEnabled = false
         menu.addItem(statusItem)
+
+        // The monitor list: the reason the menu bar is useful on its own. Without
+        // it there is no way to start streaming without opening the main window.
+        addMonitorRows(to: menu)
 
         // Brightness / volume sliders for each connected session. Reliable and
         // native-feeling: they drive the receiver directly via the existing
@@ -252,7 +334,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
         let openItem = NSMenuItem(
             title: TBDisplaySenderL10n.showMainWindow(service.language),
             action: #selector(showMainWindow),
-            keyEquivalent: ""
+            keyEquivalent: ","
         )
         openItem.target = self
         menu.addItem(openItem)
