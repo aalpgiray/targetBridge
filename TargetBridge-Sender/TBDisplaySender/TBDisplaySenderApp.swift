@@ -7,8 +7,11 @@ struct TBDisplaySenderApp: App {
 
     var body: some Scene {
         WindowGroup("TargetBridge", id: "main") {
-            TBDisplaySenderContentView(service: service)
-                .frame(minWidth: 540)
+            // The monitors window replaces the old card stack. The previous view
+            // still exists and still compiles; it is simply no longer mounted, so
+            // reverting is a one-line change if this turns out worse in practice.
+            TBMonitorsWindowView(service: service)
+                .frame(minWidth: 720, minHeight: 460)
                 .task {
                     statusItemController.activate()
                     // Track which output the user was on before selecting ours,
