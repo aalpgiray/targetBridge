@@ -2551,6 +2551,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // reliably captured this subsystem, so a diagnostic sent only there is a
         // diagnostic we cannot read. The sink writes to receiver.log, which has
         // captured every other number in this project.
+        // Recover only from a DEAD connection. `isConnected` true means the
+        // session is live and this is a redundant Connect -- tearing that down
+        // and redialling drops a working stream, which is exactly what happened
+        // when a second Connect arrived during a healthy session.
+        if isConnected, connection != nil {
+            TBTelemetryReporter.emit("connect: already connected — nothing to do")
+            return
+        }
         if !receiverIP.isEmpty, !localInterfaceIP.isEmpty, connection != nil {
             // Non-nil but not connected means the previous connection was never
             // torn down. Recover rather than refuse: the user asked to connect,
@@ -2690,6 +2698,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 guard let self, let conn, self.connection === conn else { return }
                 switch state {
                 case .ready:
+                    TBTelemetryReporter.emit("connect: ready")
                     self.connectTimeoutWorkItem?.cancel()
                     self.connectTimeoutWorkItem = nil
                     self.isConnected = true
@@ -2706,9 +2715,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     // unplugged, firewall drop, …). Record and log the real
                     // reason so a later timeout can report it instead of a
                     // bare "Connection timed out".
+                    TBTelemetryReporter.emit("connect: waiting — \(error)")
                     self.lastConnectionStateDetail = "waiting(\(error.localizedDescription))"
                     TBLog.connection.warning("connect: waiting — \(error.localizedDescription, privacy: .public)")
                 case .failed(let error):
+                    TBTelemetryReporter.emit("connect: FAILED — \(error)")
                     self.lastConnectionStateDetail = "failed(\(error.localizedDescription))"
                     let detail = TBConnectionDiagnostics.failureDetail(
                         receiverHost: self.receiverIP,

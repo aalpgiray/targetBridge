@@ -147,11 +147,6 @@ final class TBDisplaySenderStatusItemController: NSObject {
             button.imagePosition = .imageOnly
         }
         button.contentTintColor = nil
-        TBTelemetryReporter.emit(
-            "statusitem: appearance img=\(button.image != nil) "
-            + "w=\(button.frame.width) len=\(statusItem?.length ?? -99) "
-            + "vis=\(statusItem?.isVisible ?? false) "
-            + "screen=\(button.window?.screen?.frame.origin.x ?? -1)")
         button.toolTip = TBDisplaySenderL10n.topBarToolTip(service.language)
     }
 
