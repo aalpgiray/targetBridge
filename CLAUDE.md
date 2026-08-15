@@ -18,24 +18,31 @@ and the x86 build is slow enough that this matters.
 
 ```bash
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
-bash TargetBridge-Sender/scripts/build_targetbridge_sender_app.sh   # sender
+bash TargetBridge-Sender/scripts/build_targetbridge_sender_app.sh   # sender (arm64)
 bash TargetBridge-Receiver/scripts/build_x86_bundle.sh              # receiver (x86_64)
 bash TargetBridge-Shared/scripts/verify_features.sh                 # must stay at 0 failed
+bash TargetBridge-Shared/scripts/check_localizations.sh             # de en fr it zh
 ```
 
-Use those scripts rather than `xcodebuild` directly — the signing step at the end
-is load-bearing, and the script explains why in place.
+Use those scripts, never `xcodebuild` directly — the signing step at the end is
+load-bearing and the script explains why in place.
 
-**`/Applications/TargetBridge.app` is the canonical install.** Installing is a
-sequence, not a copy, and the whole sequence runs every time:
+**Installing is one command.** It quits the app, preserves the audio driver,
+installs, re-signs and relaunches:
 
-1. quit the running app
-2. `tccutil reset ScreenCapture com.targetbridge.sender`, same for `Accessibility`
-3. remove the old bundle, `ditto` the new one, `xattr -cr`
-4. restore `Contents/Resources/TargetBridge.driver` — Debug builds omit the audio
-   driver, so a clean install loses it — then re-sign, because restoring it breaks
-   the seal
-5. launch
+```bash
+bash TargetBridge-Sender/scripts/install_sender.sh
+```
+
+Do NOT reset TCC. That was required under ad-hoc signing, when every rebuild
+produced a new identity; the sender is now signed with a stable certificate, so
+grants survive and resetting only throws away the Local Network permission the
+signing exists to keep. Run `make_local_signing_cert.sh` once per machine if
+`security find-identity -v -p codesigning` shows no TargetBridge identity.
+
+**A new Swift file must be added to `project.pbxproj`** or it is silently not
+compiled — no error, the symbol is simply absent. Check with
+`nm build/TargetBridge.app/Contents/MacOS/TargetBridge.debug.dylib | grep <symbol>`.
 
 Propose a build and wait for agreement before running one.
 

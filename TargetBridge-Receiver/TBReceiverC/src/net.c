@@ -1,5 +1,6 @@
 /* net.c — POSIX socket server + packet parser. */
 #include <net/if.h>
+#include <SystemConfiguration/SystemConfiguration.h>
 
 #include "net.h"
 #include "proto.h"
@@ -301,6 +302,46 @@ static int is_rfc1918_ipv4(const char *host) {
     return a == 172 && b >= 16 && b <= 31;
 }
 
+/* Ask macOS what this interface IS, rather than guessing from its address.
+ *
+ * SCNetworkInterfaceCopyAll is the API behind `networksetup
+ * -listallhardwareports`, and it reports en1 as "Thunderbolt 1" on a machine
+ * where the address heuristics see nothing special. That is the strongest signal
+ * available: SCNetworkInterfaceGetInterfaceType returns plain "Ethernet" for
+ * Thunderbolt, and the IORegistry does not mention Thunderbolt for the BSD
+ * device at all, so the display name is the only place the fact appears.
+ *
+ * Caveat, deliberately not relied on alone: the name is LOCALIZED. Apple appears
+ * not to translate the trademark, but that is unverified on a non-English system,
+ * so this is one layer of three and the address heuristics remain underneath. A
+ * false negative here degrades to the old behaviour rather than breaking. */
+static int tb_iface_name_says_thunderbolt(const char *bsd_name) {
+    CFArrayRef all = SCNetworkInterfaceCopyAll();
+    if (!all) return 0;
+
+    int found = 0;
+    const CFIndex count = CFArrayGetCount(all);
+    for (CFIndex i = 0; i < count && !found; i++) {
+        SCNetworkInterfaceRef iface = (SCNetworkInterfaceRef)CFArrayGetValueAtIndex(all, i);
+        CFStringRef bsd = SCNetworkInterfaceGetBSDName(iface);
+        if (!bsd) continue;
+
+        char bsdbuf[64];
+        if (!CFStringGetCString(bsd, bsdbuf, sizeof bsdbuf, kCFStringEncodingUTF8)) continue;
+        if (strcmp(bsdbuf, bsd_name) != 0) continue;
+
+        CFStringRef display = SCNetworkInterfaceGetLocalizedDisplayName(iface);
+        if (display) {
+            char namebuf[256];
+            if (CFStringGetCString(display, namebuf, sizeof namebuf, kCFStringEncodingUTF8)) {
+                found = strcasestr(namebuf, "thunderbolt") != NULL;
+            }
+        }
+    }
+    CFRelease(all);
+    return found;
+}
+
 /* Is this interface a plausible Thunderbolt/direct link?
  *
  * The original test was `name starts with "bridge"` AND `address in 169.254/16`,
@@ -323,6 +364,16 @@ static int tb_is_direct_link_address(const char *host) {
     return 0;
 }
 
+/* Three layers, strongest first. A corporate LAN on 10/8 would reach layer 3 and
+ * be misread as a direct link -- but such an interface is Wi-Fi or an ordinary
+ * Ethernet adapter, never NAMED Thunderbolt, so layer 2 settles it first. */
+static int tb_iface_is_direct_link(const char *name, const char *host) {
+    if (strncmp(name, "bridge", 6) == 0) return 1;              /* 1: unambiguous */
+    if (tb_iface_name_says_thunderbolt(name)) return 1;         /* 2: macOS says so */
+    if (strncmp(name, "en", 2) != 0) return 0;
+    return tb_is_direct_link_address(host);                     /* 3: address floor */
+}
+
 int tb_net_get_tb_ip(char *buf, size_t bufsz) {
     struct ifaddrs *ifap = NULL;
     if (getifaddrs(&ifap) != 0) return -1;
@@ -341,12 +392,11 @@ int tb_net_get_tb_ip(char *buf, size_t bufsz) {
 
             const int isBridge = strncmp(p->ifa_name, "bridge", 6) == 0;
             if (pass == 0 && !isBridge) continue;
-            if (pass == 1 && !tb_is_direct_link_name(p->ifa_name)) continue;
 
             char host[NI_MAXHOST];
             if (getnameinfo(p->ifa_addr, sizeof(struct sockaddr_in),
                             host, sizeof(host), NULL, 0, NI_NUMERICHOST) != 0) continue;
-            if (!tb_is_direct_link_address(host)) continue;
+            if (!tb_iface_is_direct_link(p->ifa_name, host)) continue;
 
             snprintf(buf, bufsz, "%s", host);
             ret = 0;

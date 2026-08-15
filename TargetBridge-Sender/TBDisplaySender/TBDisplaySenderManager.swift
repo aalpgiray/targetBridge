@@ -2,6 +2,7 @@ import AppKit
 import ApplicationServices
 import Combine
 import Foundation
+import SystemConfiguration
 import Network
 
 enum TBTransportKind: String, CaseIterable, Identifiable {
@@ -608,10 +609,38 @@ final class TBDisplaySenderService: ObservableObject {
     /// interface is the fast one, discovery advertises one address and the sender
     /// dials another.
     func isDirectLinkInterface(name: String, ip: String) -> Bool {
-        if name.hasPrefix("bridge") { return ip.hasPrefix("169.254.") || ip.hasPrefix("10.") }
-        if name.hasPrefix("en") { return ip.hasPrefix("169.254.") || ip.hasPrefix("10.") }
-        return false
+        // Layer 1: a bridge* interface is unambiguous.
+        if name.hasPrefix("bridge") { return true }
+        // Layer 2: ask macOS. SCNetworkInterface reports en1 as "Thunderbolt 1"
+        // where every address heuristic sees an ordinary Ethernet device. This is
+        // what settles a corporate LAN on 10/8 -- such an interface is Wi-Fi or a
+        // plain Ethernet adapter and is never NAMED Thunderbolt.
+        if Self.thunderboltBSDNames.contains(name) { return true }
+        // Layer 3: the address floor, for when the name lookup says nothing.
+        guard name.hasPrefix("en") else { return false }
+        return ip.hasPrefix("169.254.") || ip.hasPrefix("10.")
     }
+
+    /// BSD names macOS calls "Thunderbolt", read once per launch.
+    ///
+    /// The display name is LOCALIZED and Apple may translate it on some systems --
+    /// unverified. That is why this is one layer of three: a false negative here
+    /// falls through to the address heuristic rather than breaking detection.
+    /// SCNetworkInterfaceGetInterfaceType is no help; it returns "Ethernet" for
+    /// Thunderbolt, and the IORegistry does not mention it at all.
+    private static let thunderboltBSDNames: Set<String> = {
+        guard let all = SCNetworkInterfaceCopyAll() as? [SCNetworkInterface] else { return [] }
+        var names: Set<String> = []
+        for iface in all {
+            guard let bsd = SCNetworkInterfaceGetBSDName(iface) as String?,
+                  let display = SCNetworkInterfaceGetLocalizedDisplayName(iface) as String?
+            else { continue }
+            if display.range(of: "thunderbolt", options: .caseInsensitive) != nil {
+                names.insert(bsd)
+            }
+        }
+        return names
+    }()
 
     func availableInterfaces(for transportKind: TBTransportKind) -> [TBLocalLinkInterface] {
         localInterfaces.filter { $0.transportKind == transportKind }
