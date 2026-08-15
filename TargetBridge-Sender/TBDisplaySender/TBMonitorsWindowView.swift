@@ -15,27 +15,42 @@ import SwiftUI
 /// `LabeledContent` — rather than the previous bespoke cards, gradient tiles and
 /// hand-built status chips. Looking like macOS is mostly a matter of not
 /// overriding it.
+/// What the sidebar can select: a monitor, or one of the app-level pages.
+///
+/// App settings used to be a separate window and About a modal sheet. Both are
+/// just content, and content belongs in the detail pane -- a sheet you must
+/// dismiss to see anything else is the wrong shape for a page you might want to
+/// read while looking at a monitor's settings.
+enum TBSidebarItem: Hashable {
+    case monitor(TBDisplaySenderSession.ID)
+    case general
+    case addons
+    case about
+}
+
 struct TBMonitorsWindowView: View {
     @ObservedObject var service: TBDisplaySenderService
-    @State private var selection: TBDisplaySenderSession.ID?
-    @State private var showingAbout = false
+    @State private var selection: TBSidebarItem?
 
     var body: some View {
         NavigationSplitView {
             sidebar
         } detail: {
-            if let session = selectedSession {
-                TBMonitorPageView(service: service, session: session)
-                    .id(session.id)
-            } else {
-                TBNoMonitorsView(service: service)
+            switch selection {
+            case .general: TBGeneralPageView(service: service)
+            case .addons:  TBAddonsPageView(service: service)
+            case .about:   TBAboutPageView(service: service)
+            default:
+                if let session = selectedSession {
+                    TBMonitorPageView(service: service, session: session)
+                        .id(session.id)
+                } else {
+                    TBNoMonitorsView(service: service)
+                }
             }
         }
         .navigationTitle("")
         .task { service.refreshLocalInterfaces() }
-        .sheet(isPresented: $showingAbout) {
-            TBDisplaySenderAboutView(service: service)
-        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
@@ -44,29 +59,26 @@ struct TBMonitorsWindowView: View {
                     Label(TBDisplaySenderL10n.addSessionButton(service.language),
                           systemImage: "plus")
                 }
-                Button { showingAbout = true } label: {
-                    Label("About", systemImage: "info.circle")
-                }
-                // App-wide preferences — language, menu bar icon, logging — live in
-                // the Settings scene, NOT on a monitor's page. Mounting this window
-                // removed the only way in: its predecessor had this link, and ⌘, is
-                // taken by "Show main window" in the menu bar.
-                SettingsLink {
-                    Label("Settings", systemImage: "gearshape")
-                }
+
             }
         }
-        .onAppear { if selection == nil { selection = service.sessions.first?.id } }
+        .onAppear {
+            if selection == nil, let first = service.sessions.first { selection = .monitor(first.id) }
+        }
         // A removed monitor must not leave the detail pane bound to a dead session.
         .onChange(of: service.sessions.count) { _, _ in
-            if selection == nil || !service.sessions.contains(where: { $0.id == selection }) {
-                selection = service.sessions.first?.id
+            if case .monitor(let id) = selection,
+               !service.sessions.contains(where: { $0.id == id }) {
+                selection = service.sessions.first.map { TBSidebarItem.monitor($0.id) }
             }
         }
     }
 
     private var selectedSession: TBDisplaySenderSession? {
-        service.sessions.first(where: { $0.id == selection }) ?? service.sessions.first
+        if case .monitor(let id) = selection {
+            return service.sessions.first(where: { $0.id == id })
+        }
+        return service.sessions.first
     }
 
     private var sidebar: some View {
@@ -74,8 +86,13 @@ struct TBMonitorsWindowView: View {
             Section(TBDisplaySenderL10n.connectionGroup(service.language)) {
                 ForEach(service.sessions) { session in
                     TBMonitorRowView(service: service, session: session)
-                        .tag(session.id as TBDisplaySenderSession.ID?)
+                        .tag(TBSidebarItem.monitor(session.id))
                 }
+            }
+            Section {
+                Label("General", systemImage: "gearshape").tag(TBSidebarItem.general)
+                Label("Add-ons", systemImage: "puzzlepiece.extension").tag(TBSidebarItem.addons)
+                Label("About", systemImage: "info.circle").tag(TBSidebarItem.about)
             }
         }
         .navigationSplitViewColumnWidth(min: 200, ideal: 220, max: 280)
@@ -478,5 +495,112 @@ struct TBNoMonitorsView: View {
                 .font(.callout)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+}
+
+// MARK: - App-level pages
+//
+// Previously a separate Settings window with hand-built card sections, plus an
+// About modal sheet. Both are now sidebar destinations using the same native
+// chrome as a monitor's page, so the whole app is one window with one grammar.
+
+struct TBGeneralPageView: View {
+    @ObservedObject var service: TBDisplaySenderService
+
+    var body: some View {
+        Form {
+            Section {
+                Picker(TBDisplaySenderL10n.languageGroup(service.language),
+                       selection: $service.language) {
+                    ForEach(TBDisplaySenderLanguage.allCases) { language in
+                        Text(language.pickerTitle).tag(language)
+                    }
+                }
+            }
+            Section("Interface") {
+                Toggle(TBDisplaySenderL10n.showMenuBarIcon(service.language),
+                       isOn: $service.showsMenuBarIcon)
+                Toggle(TBDisplaySenderL10n.largeCursor(service.language),
+                       isOn: $service.largeCursor)
+            }
+            Section {
+                Toggle(TBDisplaySenderL10n.preventDisplaySleep(service.language),
+                       isOn: $service.preventDisplaySleep)
+                Toggle(TBDisplaySenderL10n.autoRestartOnWake(service.language),
+                       isOn: $service.autoRestartOnWake)
+            } header: {
+                Text("While streaming")
+            }
+            Section {
+                Toggle(TBDisplaySenderL10n.verboseDisplayLogging(service.language),
+                       isOn: $service.verboseDisplayLogging)
+            } footer: {
+                Text("Writes virtual display events to Console. Useful when a display "
+                     + "does not appear; noisy otherwise.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("General")
+    }
+}
+
+struct TBAddonsPageView: View {
+    @ObservedObject var service: TBDisplaySenderService
+
+    var body: some View {
+        Form {
+            Section {
+                HStack {
+                    Button("Reload") { service.refreshAddons() }
+                    Button("Open Folder") { service.openAddonsFolder() }
+                    Spacer()
+                }
+            } footer: {
+                Text("Add-ons load from JSON manifests. Stop all monitors before "
+                     + "enabling or disabling one.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("Add-ons")
+    }
+}
+
+struct TBAboutPageView: View {
+    @ObservedObject var service: TBDisplaySenderService
+
+    var body: some View {
+        Form {
+            Section {
+                HStack(spacing: 14) {
+                    Image(nsImage: NSApp.applicationIconImage)
+                        .resizable().frame(width: 56, height: 56)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("TargetBridge").font(.title2.weight(.semibold))
+                        Text(TBDisplaySenderBuildInfo.versionDisplay)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .padding(.vertical, 4)
+            }
+            Section {
+                Text("Captures this Mac's desktop or a virtual display, encodes it, "
+                     + "and presents it on an iMac over Thunderbolt.")
+            }
+            Section {
+                Link("GitHub", destination: URL(string: "https://github.com/swellweb/targetBridge")!)
+                Link("Latest release",
+                     destination: URL(string: "https://github.com/swellweb/targetBridge/releases")!)
+            }
+            Section("Credits") {
+                Text("Created by swellweb with the TargetBridge open-source community.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("About")
     }
 }
