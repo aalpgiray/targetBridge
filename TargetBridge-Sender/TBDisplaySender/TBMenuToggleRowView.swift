@@ -194,6 +194,12 @@ struct TBMenuSliderRow: View {
             Slider(value: Binding(get: { value },
                                   set: { value = $0; onChange($0) }),
                    in: 0...1)
+                // Control Centre's tracks are thinner than a form slider's.
+                // .mini is the slimmest AppKit offers (12pt against 16pt for
+                // regular); Apple's own is thinner still because it is a custom
+                // control rather than an NSSlider, so this is as close as the
+                // stock control gets.
+                .controlSize(.mini)
             Image(systemName: trailingSymbol)
                 .font(.system(size: 13))
                 .foregroundStyle(.secondary)

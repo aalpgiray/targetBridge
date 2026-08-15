@@ -430,7 +430,7 @@ final class TBDisplaySenderStatusItemController: NSObject {
         // SwiftUI's Slider fills with the accent colour, which is what the
         // prototype looked like and what every Control Centre slider looks like.
         // Hosting one view is cheaper than reimplementing the fill by hand.
-        let height: CGFloat = 32
+        let height: CGFloat = 28
         let row = TBMenuSliderRow(symbol: symbol,
                                   trailingSymbol: trailingSymbol,
                                   label: label,
