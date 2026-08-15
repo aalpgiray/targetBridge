@@ -165,3 +165,42 @@ final class TBMenuToggleRowView: NSView {
         stateFields.indices.contains(index) ? stateFields[index] : nil
     }
 }
+
+// MARK: - Slider row
+
+import SwiftUI
+
+/// Brightness in the menu bar, drawn the way Control Centre draws it.
+///
+/// A plain NSSlider inside a menu renders an unfilled grey track: `trackFillColor`
+/// is documented but has no effect there. SwiftUI's `Slider` fills with the accent
+/// colour, so the menu matches the rest of the system instead of looking like a
+/// 2014 control.
+struct TBMenuSliderRow: View {
+    let symbol: String
+    let trailingSymbol: String
+    let label: String
+    @State var value: Double
+    let width: CGFloat
+    let inset: CGFloat
+    let onChange: (Double) -> Void
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: symbol)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .frame(width: 14)
+            Slider(value: Binding(get: { value },
+                                  set: { value = $0; onChange($0) }),
+                   in: 0...1)
+            Image(systemName: trailingSymbol)
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+        }
+        .padding(.horizontal, inset)
+        .frame(width: width)
+        .accessibilityLabel(label)
+    }
+}

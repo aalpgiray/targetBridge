@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import Combine
 
 @MainActor
@@ -422,46 +423,23 @@ final class TBDisplaySenderStatusItemController: NSObject {
     private func makeSliderItem(symbol: String, trailingSymbol: String, label: String,
                                 value: Double, onChange: @escaping (Double) -> Void) -> NSMenuItem {
         let width = TBMenuMetrics.width
-        let height: CGFloat = 28
-        let inset = TBMenuMetrics.inset
-        let leadingIcon: CGFloat = 13
-        let trailingIcon: CGFloat = 17
-        let gap: CGFloat = 8
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
-
-        func glyph(_ name: String, size: CGFloat, x: CGFloat) -> NSImageView {
-            let view = NSImageView(frame: NSRect(x: x, y: (height - size) / 2, width: size, height: size))
-            view.image = NSImage(systemSymbolName: name, accessibilityDescription: label)
-            // Decorative: the slider itself carries the name, so reading these
-            // as well would announce the row three times.
-            view.setAccessibilityElement(false)
-            view.contentTintColor = .secondaryLabelColor
-            view.imageScaling = .scaleProportionallyUpOrDown
-            return view
-        }
-
-        container.addSubview(glyph(symbol, size: leadingIcon, x: inset))
-        container.addSubview(glyph(trailingSymbol, size: trailingIcon,
-                                   x: width - inset - trailingIcon))
-
-        let sliderX = inset + leadingIcon + gap
-        let sliderWidth = width - sliderX - gap - trailingIcon - inset
-        let slider = NSSlider(frame: NSRect(x: sliderX, y: (height - 19) / 2,
-                                            width: sliderWidth, height: 19))
-        slider.minValue = 0
-        slider.maxValue = 1
-        slider.doubleValue = value
-        slider.isContinuous = true
-        // Set even though menus currently ignore it: harmless, and it is the
-        // supported way to get an accent-filled track if that changes.
-        slider.trackFillColor = .controlAccentColor
-        slider.controlSize = .small
-        slider.setAccessibilityLabel(label)
-        let target = TBMenuSliderTarget(onChange)
-        slider.target = target
-        slider.action = #selector(TBMenuSliderTarget.changed(_:))
-        sliderTargets.append(target)
-        container.addSubview(slider)
+        // SwiftUI's Slider, hosted, not a hand-built NSSlider.
+        //
+        // NSSlider draws an unfilled grey track inside a menu -- trackFillColor is
+        // documented but ignored there, which the previous version set and noted.
+        // SwiftUI's Slider fills with the accent colour, which is what the
+        // prototype looked like and what every Control Centre slider looks like.
+        // Hosting one view is cheaper than reimplementing the fill by hand.
+        let height: CGFloat = 32
+        let row = TBMenuSliderRow(symbol: symbol,
+                                  trailingSymbol: trailingSymbol,
+                                  label: label,
+                                  value: value,
+                                  width: width,
+                                  inset: TBMenuMetrics.inset,
+                                  onChange: onChange)
+        let container = NSHostingView(rootView: row)
+        container.frame = NSRect(x: 0, y: 0, width: width, height: height)
 
         let item = NSMenuItem()
         item.view = container
