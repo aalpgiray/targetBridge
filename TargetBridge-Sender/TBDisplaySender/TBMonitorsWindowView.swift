@@ -399,7 +399,7 @@ struct TBMonitorPageView: View {
             // fallback. The pointer now follows the system's own accessibility
             // cursor size instead, which is the setting a person actually changes.
             LabeledContent("Pointer size") {
-                Text(TBDisplaySenderService.systemCursorScale() > 1.0
+                Text(TBDisplaySenderSession.systemCursorScale() > 1.0
                      ? "Following system (larger)"
                      : "Following system")
                     .foregroundStyle(.secondary)
