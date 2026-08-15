@@ -302,6 +302,34 @@ static void tb_disp_fill_rounded_rect(CGContextRef ctx,
     CGPathRelease(path);
 }
 
+/* Draw text centred on x by measuring it first.
+ *
+ * Every centred string here used to be positioned with a hand-tuned offset
+ * (`center_x - 158.0 * scale`), which centres exactly one string in one language
+ * and drifts for all five the app ships in. */
+static void tb_disp_draw_text_centered(CGContextRef ctx, const char *text,
+                                       const char *font_name, CGFloat size,
+                                       CGFloat center_x, CGFloat y,
+                                       CGFloat r, CGFloat g, CGFloat b) {
+    if (!text || !*text) return;
+    CFStringRef str = CFStringCreateWithCString(NULL, text, kCFStringEncodingUTF8);
+    if (!str) return;
+    CFStringRef fname = CFStringCreateWithCString(NULL, font_name, kCFStringEncodingUTF8);
+    CTFontRef font = CTFontCreateWithName(fname ? fname : CFSTR("Helvetica"), size, NULL);
+    const void *keys[] = { kCTFontAttributeName };
+    const void *vals[] = { font };
+    CFDictionaryRef attrs = CFDictionaryCreate(NULL, keys, vals, 1,
+                                               &kCFTypeDictionaryKeyCallBacks,
+                                               &kCFTypeDictionaryValueCallBacks);
+    CFAttributedStringRef astr = CFAttributedStringCreate(NULL, str, attrs);
+    CTLineRef line = CTLineCreateWithAttributedString(astr);
+    const double width = CTLineGetTypographicBounds(line, NULL, NULL, NULL);
+    tb_disp_draw_text(ctx, text, font_name, size,
+                      center_x - (CGFloat)width / 2.0, y, r, g, b);
+    CFRelease(line); CFRelease(astr); CFRelease(attrs);
+    CFRelease(font); if (fname) CFRelease(fname); CFRelease(str);
+}
+
 static void tb_disp_draw_brand_icon(CGContextRef ctx, CGFloat x, CGFloat y, CGFloat size) {
     const CGFloat inset = size * 0.22;
     const CGFloat monitor_w = size * 0.56;
@@ -391,93 +419,135 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
 
     const char *current_language = tb_i18n_current_language();
     const int zh = current_language && strncmp(current_language, "zh", 2) == 0;
-    const char *title_font = zh ? "PingFangSC-Semibold" : "Helvetica-Bold";
-    const char *body_font = zh ? "PingFangSC-Regular" : "Helvetica";
-    const char *section_font = zh ? "PingFangSC-Semibold" : "Helvetica-Bold";
+    /* The system font, not Helvetica. macOS is SF everywhere; Helvetica is what
+     * makes a Mac screen look a decade old, and it was the single biggest reason
+     * this panel did not match the sender. ".AppleSystemUIFont" resolves to SF at
+     * whatever weight the name asks for. */
+    const char *title_font = zh ? "PingFangSC-Semibold" : ".AppleSystemUIFontBold";
+    const char *body_font = zh ? "PingFangSC-Regular" : ".AppleSystemUIFont";
+    const char *section_font = zh ? "PingFangSC-Semibold" : ".AppleSystemUIFontBold";
     const char *mono_font = "Menlo";
     const char *mono_bold_font = "Menlo-Bold";
 
     if (connecting) {
-        const CGFloat min_side = (CGFloat)(drawable_w < drawable_h ? drawable_w : drawable_h);
-        const CGFloat scale = min_side / 720.0;
-        const CGFloat icon_size = 132.0 * scale;
-        const CGFloat center_x = (CGFloat)drawable_w / 2.0;
-        const CGFloat icon_x = center_x - icon_size / 2.0;
-        const CGFloat icon_y = (CGFloat)drawable_h / 2.0 - 206.0 * scale;
+        /* Same grammar as the status panel: one scale factor, the system font,
+         * rounded surfaces, near-black ground. This branch used to be styled
+         * separately, so the two screens the receiver shows looked like different
+         * applications -- and this is the one a person stares at while waiting. */
+        const CGFloat S = (CGFloat)(drawable_w < drawable_h ? drawable_w : drawable_h) / 720.0;
+        const CGFloat W = (CGFloat)drawable_w;
+        const CGFloat H = (CGFloat)drawable_h;
+        const CGFloat cx = W / 2.0;
 
-        tb_disp_fill_rect(ctx, 0, 0, (CGFloat)drawable_w, (CGFloat)drawable_h, 0.035, 0.045, 0.06, 1.0);
-        tb_disp_fill_rounded_rect(ctx,
-                                  center_x - 300.0 * scale,
-                                  icon_y - 60.0 * scale,
-                                  600.0 * scale,
-                                  490.0 * scale,
-                                  38.0 * scale,
-                                  0.075, 0.09, 0.12, 1.0);
-        tb_disp_draw_brand_icon(ctx, icon_x, icon_y, icon_size);
-        tb_disp_draw_text(ctx, "TargetBridge", title_font, 42.0 * scale,
-                          center_x - 156.0 * scale, icon_y + icon_size + 74.0 * scale,
-                          0.95, 0.98, 0.97);
-        tb_disp_draw_text(ctx, "RECEIVER", mono_bold_font, 15.0 * scale,
-                          center_x - 48.0 * scale, icon_y + icon_size + 104.0 * scale,
-                          0.40, 0.90, 0.59);
-        tb_disp_draw_text(ctx, tb_i18n_get("receiver.splash.connecting"), body_font, 23.0 * scale,
-                          center_x - 158.0 * scale, icon_y + icon_size + 166.0 * scale,
-                          0.93, 0.95, 0.99);
-        tb_disp_draw_text(ctx, tb_i18n_get("receiver.splash.waiting_first_frame"), body_font, 17.0 * scale,
-                          center_x - 178.0 * scale, icon_y + icon_size + 202.0 * scale,
-                          0.62, 0.68, 0.77);
-        tb_disp_draw_text(ctx, TB_RECEIVER_VERSION, mono_font, 13.0 * scale,
-                          center_x - 26.0 * scale, icon_y + icon_size + 310.0 * scale,
-                          0.40, 0.45, 0.53);
+        tb_disp_fill_rect(ctx, 0, 0, W, H, 0.043, 0.043, 0.051, 1.0);
+
+        const CGFloat icon = 96.0 * S;
+        const CGFloat icon_y = H / 2.0 + 40.0 * S;
+        tb_disp_draw_brand_icon(ctx, cx - icon / 2.0, icon_y, icon);
+
+        /* Centred by measuring, not by guessing an offset. The old code shifted
+         * text left by hand-tuned constants like `cx - 158 * scale`, which only
+         * centred the one string it was tuned against and drifted for every
+         * translation. */
+        tb_disp_draw_text_centered(ctx, "TargetBridge", title_font, 30.0 * S,
+                                   cx, icon_y - 46.0 * S, 0.98, 0.98, 1.0);
+        tb_disp_draw_text_centered(ctx, tb_i18n_get("receiver.splash.connecting"),
+                                   body_font, 17.0 * S,
+                                   cx, icon_y - 78.0 * S, 0.58, 0.60, 0.66);
+        tb_disp_draw_text_centered(ctx, tb_i18n_get("receiver.splash.waiting_first_frame"),
+                                   body_font, 14.0 * S,
+                                   cx, icon_y - 104.0 * S, 0.45, 0.47, 0.53);
+        tb_disp_draw_text_centered(ctx, TB_RECEIVER_VERSION, mono_font, 12.0 * S,
+                                   cx, 56.0 * S, 0.35, 0.36, 0.41);
     } else {
+    /* EVERYTHING scales.
+     *
+     * This panel used raw pixel values -- a 28pt title, 72pt margins -- while the
+     * connecting splash beside it scaled by min_side/720. On a 5120x2880 panel
+     * that made the connected view roughly a third the size it should be, which
+     * is most of why it read as cheap. One factor, applied to every dimension.  */
+    const CGFloat S = (CGFloat)(drawable_w < drawable_h ? drawable_w : drawable_h) / 720.0;
+    const CGFloat W = (CGFloat)drawable_w;
+    const CGFloat H = (CGFloat)drawable_h;
 
-    tb_disp_fill_rect(ctx, 0, 0, (CGFloat)drawable_w, (CGFloat)drawable_h, 0.06, 0.07, 0.09, 1.0);
-    tb_disp_fill_rect(ctx, 48, 52, (CGFloat)drawable_w - 96, (CGFloat)drawable_h - 104, 0.11, 0.12, 0.15, 1.0);
-    tb_disp_fill_rect(ctx, 48, (CGFloat)drawable_h - 152, (CGFloat)drawable_w - 96, 2, 0.22, 0.24, 0.29, 1.0);
+    /* Sender's palette: near-black ground, one raised surface, hairline borders. */
+    tb_disp_fill_rect(ctx, 0, 0, W, H, 0.043, 0.043, 0.051, 1.0);
 
-    const CGFloat outer_x = 72.0;
-    const CGFloat outer_w = (CGFloat)drawable_w - 144.0;
-    const CGFloat top_y = (CGFloat)drawable_h - 176.0;
-    const CGFloat card_gap = 28.0;
-    const CGFloat card_w = (outer_w - card_gap) / 2.0;
+    const CGFloat margin = 64.0 * S;
+    const CGFloat card_r = 14.0 * S;
+    const CGFloat pad = 22.0 * S;
+    const CGFloat gap = 16.0 * S;
+    const CGFloat content_w = W - margin * 2.0;
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.title"), title_font, 28, 72, (CGFloat)drawable_h - 84, 0.95, 0.97, 1.0);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.subtitle"), body_font, 17, 72, (CGFloat)drawable_h - 118, 0.72, 0.76, 0.84);
-    tb_disp_draw_text(ctx, TB_RECEIVER_VERSION, mono_bold_font, 17, (CGFloat)drawable_w - 220, (CGFloat)drawable_h - 82, 0.64, 0.69, 0.78);
-    tb_disp_draw_text(ctx, TB_RECEIVER_BUILD, mono_font, 13, (CGFloat)drawable_w - 220, (CGFloat)drawable_h - 114, 0.53, 0.57, 0.66);
+    /* Header: name, then the address as the one thing worth reading from across
+     * a room. Everything else is support. */
+    CGFloat y = H - margin - 34.0 * S;
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.title"), title_font, 34.0 * S,
+                      margin, y, 0.98, 0.98, 1.0);
+    tb_disp_draw_text(ctx, TB_RECEIVER_VERSION, mono_font, 15.0 * S,
+                      W - margin - 150.0 * S, y + 6.0 * S, 0.45, 0.47, 0.53);
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.ip_thunderbolt_bridge"), section_font, 15, outer_x, top_y, 0.54, 0.62, 0.76);
-    tb_disp_draw_text(ctx, ip, mono_bold_font, 34, outer_x, top_y - 42.0, 0.43, 0.93, 0.60);
+    y -= 30.0 * S;
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.subtitle"), body_font, 17.0 * S,
+                      margin, y, 0.58, 0.60, 0.66);
 
-    const CGFloat info_top = top_y - 126.0;
-    const CGFloat info_h = 194.0;
-    tb_disp_fill_rect(ctx, outer_x, info_top - info_h, card_w, info_h, 0.14, 0.15, 0.19, 1.0);
-    tb_disp_fill_rect(ctx, outer_x + card_w + card_gap, info_top - info_h, card_w, info_h, 0.14, 0.15, 0.19, 1.0);
+    /* The address, given the weight it deserves. */
+    y -= 92.0 * S;
+    tb_disp_fill_rounded_rect(ctx, margin, y - 26.0 * S, content_w, 104.0 * S,
+                              card_r, 0.10, 0.10, 0.12, 1.0);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.ip_thunderbolt_bridge"),
+                      section_font, 14.0 * S, margin + pad, y + 44.0 * S,
+                      0.50, 0.52, 0.58);
+    tb_disp_draw_text(ctx, ip, mono_bold_font, 46.0 * S,
+                      margin + pad, y - 2.0 * S, 0.40, 0.85, 0.55);
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.status"), section_font, 15, outer_x + 20.0, info_top - 34.0, 0.54, 0.62, 0.76);
-    tb_disp_draw_text(ctx, status, body_font, 22, outer_x + 20.0, info_top - 68.0, 0.94, 0.96, 0.99);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.sender"), section_font, 14, outer_x + 20.0, info_top - 118.0, 0.54, 0.62, 0.76);
-    tb_disp_draw_text(ctx, sender, body_font, 20, outer_x + 20.0, info_top - 148.0, 0.94, 0.96, 0.99);
+    /* Two cards of detail, rounded to match every surface in the sender. */
+    const CGFloat card_w = (content_w - gap) / 2.0;
+    const CGFloat card_h = 150.0 * S;
+    y -= card_h + gap + 26.0 * S;
 
-    const CGFloat display_x = outer_x + card_w + card_gap + 20.0;
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.display"), section_font, 15, display_x, info_top - 34.0, 0.54, 0.62, 0.76);
-    tb_disp_draw_text(ctx, panel, zh ? body_font : mono_font, 20, display_x, info_top - 68.0, 0.94, 0.96, 0.99);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.stream_profile"), section_font, 14, display_x, info_top - 118.0, 0.54, 0.62, 0.76);
-    tb_disp_draw_text(ctx, mode, zh ? body_font : mono_font, 20, display_x, info_top - 148.0, 0.94, 0.96, 0.99);
+    tb_disp_fill_rounded_rect(ctx, margin, y, card_w, card_h, card_r,
+                              0.10, 0.10, 0.12, 1.0);
+    tb_disp_fill_rounded_rect(ctx, margin + card_w + gap, y, card_w, card_h, card_r,
+                              0.10, 0.10, 0.12, 1.0);
 
-    const CGFloat footer_top = info_top - info_h - 28.0;
-    const CGFloat footer_h = 150.0;
-    tb_disp_fill_rect(ctx, outer_x, footer_top - footer_h, outer_w, footer_h, 0.14, 0.15, 0.19, 1.0);
+    const CGFloat lx = margin + pad;
+    const CGFloat rx = margin + card_w + gap + pad;
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.status"), section_font, 13.0 * S,
+                      lx, y + card_h - 30.0 * S, 0.50, 0.52, 0.58);
+    tb_disp_draw_text(ctx, status, body_font, 20.0 * S,
+                      lx, y + card_h - 58.0 * S, 0.94, 0.95, 0.98);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.sender"), section_font, 13.0 * S,
+                      lx, y + card_h - 96.0 * S, 0.50, 0.52, 0.58);
+    tb_disp_draw_text(ctx, sender, body_font, 18.0 * S,
+                      lx, y + card_h - 122.0 * S, 0.94, 0.95, 0.98);
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.language"), section_font, 15, outer_x + 20.0, footer_top - 32.0, 0.54, 0.62, 0.76);
-    tb_disp_draw_text(ctx, language, body_font, 20, outer_x + 20.0, footer_top - 64.0, 0.94, 0.96, 0.99);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.display"), section_font, 13.0 * S,
+                      rx, y + card_h - 30.0 * S, 0.50, 0.52, 0.58);
+    tb_disp_draw_text(ctx, panel, zh ? body_font : mono_font, 18.0 * S,
+                      rx, y + card_h - 58.0 * S, 0.94, 0.95, 0.98);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.stream_profile"), section_font, 13.0 * S,
+                      rx, y + card_h - 96.0 * S, 0.50, 0.52, 0.58);
+    tb_disp_draw_text(ctx, mode, zh ? body_font : mono_font, 18.0 * S,
+                      rx, y + card_h - 122.0 * S, 0.94, 0.95, 0.98);
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.permissions"), section_font, 15, outer_x + 20.0, footer_top - 102.0, 0.54, 0.62, 0.76);
-    tb_disp_draw_text(ctx, permissions, body_font, 20, outer_x + 20.0, footer_top - 134.0, 0.94, 0.96, 0.99);
+    /* Permissions only matter when something is missing, so they sit with the
+     * language line rather than in a card of their own. */
+    y -= 44.0 * S;
+    tb_disp_draw_text(ctx, permissions, body_font, 15.0 * S,
+                      margin, y, 0.58, 0.60, 0.66);
+    y -= 26.0 * S;
+    tb_disp_draw_text(ctx, language, body_font, 15.0 * S,
+                      margin, y, 0.58, 0.60, 0.66);
 
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_1"), body_font, 17, 72, 138, 0.76, 0.80, 0.88);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_2"), body_font, 17, 72, 108, 0.76, 0.80, 0.88);
-    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_4"), body_font, 17, 72, 78, 0.76, 0.80, 0.88);
+    /* Help at the foot, quiet: this screen exists because nothing is streaming,
+     * so the next step is the most useful thing on it. */
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_1"), body_font, 16.0 * S,
+                      margin, margin + 52.0 * S, 0.62, 0.64, 0.70);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_2"), body_font, 16.0 * S,
+                      margin, margin + 26.0 * S, 0.62, 0.64, 0.70);
+    tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_4"), body_font, 16.0 * S,
+                      margin, margin, 0.62, 0.64, 0.70);
     }
 
     CGContextRelease(ctx);

@@ -26,6 +26,13 @@ final class TBAppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
     }
+
+    /// Clicking the Dock icon with no window open reopens one, rather than
+    /// activating an app that shows nothing.
+    func applicationShouldHandleReopen(_ sender: NSApplication,
+                                       hasVisibleWindows flag: Bool) -> Bool {
+        true
+    }
 }
 
 @main
