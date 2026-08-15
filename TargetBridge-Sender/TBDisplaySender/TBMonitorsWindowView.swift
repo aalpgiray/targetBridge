@@ -201,6 +201,22 @@ struct TBMonitorPageView: View {
             diagnosticsSection
         }
         .formStyle(.grouped)
+        // Run the checks on appear rather than waiting for a button.
+        //
+        // Everything they report is already known: permissions from TCC, the
+        // interface from the link, compatibility from the receiver's Bonjour
+        // record. Making the user press "Check configuration" to learn what the
+        // app could have told them on arrival is a button for the app's benefit,
+        // not theirs. The button stays for a manual re-run.
+        .task(id: session.id) {
+            configurationChecks = service.configurationChecks(for: session)
+        }
+        .onChange(of: session.receiverIP) { _, _ in
+            configurationChecks = service.configurationChecks(for: session)
+        }
+        .onChange(of: session.isConnected) { _, _ in
+            configurationChecks = service.configurationChecks(for: session)
+        }
         // The rate is only rendered inside the configuration check list, so a test
         // run with that list closed wrote a number nowhere visible -- it surfaced
         // later beside an unrelated button. Refresh the checks when they are open,

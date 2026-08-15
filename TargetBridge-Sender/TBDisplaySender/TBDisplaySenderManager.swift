@@ -339,6 +339,17 @@ final class TBDisplaySenderService: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    /// The discovery record for a session's receiver, matched on any address it
+    /// advertises -- a receiver reachable over both Thunderbolt and Wi-Fi
+    /// publishes two, and the session dialled only one of them.
+    private func discoveredReceiverFor(_ session: TBDisplaySenderSession) -> TBDiscoveredReceiver? {
+        let ip = session.receiverIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !ip.isEmpty else { return nil }
+        return discoveredReceivers.first {
+            $0.preferredIP == ip || $0.thunderboltIP == ip || $0.networkIP == ip
+        }
+    }
+
     func configurationChecks(for session: TBDisplaySenderSession) -> [TBConfigurationCheck] {
         let interfaces = TBConnectionDiagnostics.currentIPv4Interfaces()
         let role = session.inputControlRole
@@ -350,8 +361,17 @@ final class TBDisplaySenderService: ObservableObject {
                 $0.ip == session.localInterfaceIP && $0.transportKind == .thunderboltBridge
             },
             receiverAddress: session.receiverIP.trimmingCharacters(in: .whitespacesAndNewlines),
-            receiverProfileAvailable: session.receiverSupportsHEVCDecodeHint != nil,
-            receiverSupportsHEVC: session.receiverSupportsHEVCDecodeHint,
+            // Fall back to DISCOVERY when no connection has happened yet.
+            //
+            // The receiver broadcasts supportsHEVCDecode and its panel in the
+            // Bonjour TXT record, so the answer is known before dialling. Gating
+            // this on a past connection made a check that could be answered
+            // immediately say "connect once" instead -- the sender already knows
+            // which monitor it is talking about.
+            receiverProfileAvailable: session.receiverSupportsHEVCDecodeHint != nil
+                || discoveredReceiverFor(session) != nil,
+            receiverSupportsHEVC: session.receiverSupportsHEVCDecodeHint
+                ?? discoveredReceiverFor(session)?.supportsHEVCDecode,
             requiresHEVC: session.capturePreset.codecName == "HEVC",
             cableRate: session.cableTestResult,
             requiresSenderInputMonitoring: role == .senderMaster,
