@@ -301,6 +301,27 @@ struct TBMonitorPageView: View {
                 }
                 Spacer()
             }
+
+            // The RESULT, not just the button.
+            //
+            // Porting the action without its output made the cable test look like
+            // it did nothing -- the same miss as the add-ons list, where the
+            // controls came across and the content did not. Dual-cable runs report
+            // a combined figure plus each link, so an underperforming cable is
+            // visible next to its partner.
+            LabeledContent(TBDisplaySenderL10n.cableTestButton(service.language)) {
+                if let rate = session.cableTestResult {
+                    Text(session.cableTestDetail.map {
+                        String(format: "%.2f Gbits/s  (%@)", rate, $0)
+                    } ?? String(format: "%.2f Gbits/s", rate))
+                        .foregroundStyle(.green)
+                } else {
+                    Text(session.isCableTesting
+                         ? TBDisplaySenderL10n.testingButton(service.language)
+                         : TBDisplaySenderL10n.noTestResult(service.language))
+                        .foregroundStyle(.secondary)
+                }
+            }
             // Rendered inline rather than in a sheet: these exist to be read next
             // to the settings they are complaining about.
             ForEach(configurationChecks) { check in
@@ -437,8 +458,18 @@ struct TBMonitorPageView: View {
     // MARK: Diagnostics — collapsed, because it is for when something is wrong
 
     private var diagnosticsSection: some View {
+        // A Section with a header, not a DisclosureGroup nested inside one.
+        //
+        // Rows inside a DisclosureGroup sit a level deeper than the form's own
+        // rows, so they lose the leading inset and the separators every sibling
+        // row gets -- which is why this block read as cramped against the group
+        // edge. A Section is laid out by the form itself and matches Display,
+        // Sound and the rest exactly.
+        //
+        // Collapsing is kept: the header carries the toggle, so the group is still
+        // out of the way until something is wrong.
         Section {
-            DisclosureGroup(isExpanded: $showDiagnostics) {
+            if showDiagnostics {
                 LabeledContent(TBDisplaySenderL10n.fpsLabel(service.language)) {
                     Text("\(session.liveMetrics.senderFPS)")
                         .font(.body.monospacedDigit())
@@ -451,13 +482,24 @@ struct TBMonitorPageView: View {
                     Text(session.virtualDisplayText).foregroundStyle(.secondary)
                 }
                 LabeledContent("Receiver panel") {
-                    Text(session.receiverPanelText).foregroundStyle(.secondary)
+                    Text(session.receiverPanelText)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
                 }
                 Button(TBDisplaySenderL10n.restartCaptureButton(service.language)) {
                     session.restartCaptureNow()
                 }
-            } label: {
+            }
+        } header: {
+            HStack {
                 Text("Diagnostics")
+                Spacer()
+                Button(showDiagnostics ? "Hide" : "Show") {
+                    withAnimation { showDiagnostics.toggle() }
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tint)
+                .textCase(nil)
             }
         }
     }
