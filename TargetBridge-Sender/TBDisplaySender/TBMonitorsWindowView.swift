@@ -391,8 +391,19 @@ struct TBMonitorPageView: View {
             }
             Toggle("V-Sync",
                    isOn: $session.vsyncEnabled)
-            Toggle(TBDisplaySenderL10n.largeCursor(service.language),
-                   isOn: $session.largeCursor)
+            // "Large cursor on receiver" is gone.
+            //
+            // It did nothing on the SCStream path -- which is the one in use --
+            // because showsCursor is false there and the pointer is composited on
+            // its own plane; the flag was only read by the legacy CGDisplayStream
+            // fallback. The pointer now follows the system's own accessibility
+            // cursor size instead, which is the setting a person actually changes.
+            LabeledContent("Pointer size") {
+                Text(TBDisplaySenderService.systemCursorScale() > 1.0
+                     ? "Following system (larger)"
+                     : "Following system")
+                    .foregroundStyle(.secondary)
+            }
             LabeledContent(TBDisplaySenderL10n.displayProfiles(service.language)) {
                 HStack(spacing: 6) {
                     ForEach(TBDisplayProfile.allCases) { profile in

@@ -2289,6 +2289,20 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var streamingActivity: NSObjectProtocol?
     /// Identity of the last cursor bitmap shipped, so we resend only on change.
     private var lastSentCursorImage: NSImage?
+    /// Last size actually sent, so a pure resize is not skipped by identity.
+    private var lastSentCursorSize: CGSize = .zero
+
+    /// The accessibility pointer size, 1.0 when unset.
+    ///
+    /// Read from the same preference System Settings writes. Shake-to-find is NOT
+    /// visible here -- NSCursor reports a fixed 28x40 throughout a shake -- so that
+    /// magnification cannot currently be mirrored; this covers the setting a user
+    /// actually chooses, which is what "Large cursor on receiver" was meant to be.
+    static func systemCursorScale() -> CGFloat {
+        let v = UserDefaults(suiteName: "com.apple.universalaccess")?
+            .double(forKey: "mouseDriverCursorSize") ?? 0
+        return v > 0 ? CGFloat(v) : 1.0
+    }
     private var lastCheckedCursor: NSCursor?
     private var lastCheckedCursorType: Int = 0
     private var baselineDisplayIDs = Set<CGDirectDisplayID>()
@@ -4314,7 +4328,19 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private func sendCursorImageIfChanged() {
         guard let cursor = NSCursor.currentSystem else { return }
         let image = cursor.image
-        if let last = lastSentCursorImage, last === image { return }
+
+        // Resend when the SIZE changes, not only when the image object changes.
+        //
+        // macOS scales the pointer for the accessibility "cursor size" setting and
+        // for shake-to-find, and it can hand back the SAME NSImage at a new size.
+        // Identity alone therefore misses every resize, which is why the pointer
+        // on the receiver never grew.
+        let scale = Self.systemCursorScale()
+        let scaled = CGSize(width: image.size.width * scale,
+                            height: image.size.height * scale)
+        if let last = lastSentCursorImage, last === image,
+           lastSentCursorSize == scaled { return }
+        lastSentCursorSize = scaled
 
         var rect = CGRect(origin: .zero, size: image.size)
         guard let cg = image.cgImage(forProposedRect: &rect, context: nil, hints: nil),
