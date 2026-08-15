@@ -2755,6 +2755,15 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
 
         startConnectWatchdog()
+        // Report exactly what we dial, so a failure can be compared against a
+        // probe rather than reasoned about. Every isolated difference (params,
+        // bundle id, host form, literal vs string) has been measured to work, so
+        // the remaining variable is what THIS call actually receives.
+        TBTelemetryReporter.emit(
+            "connect: dialing host=\(dialHost) port=\(TBMonitorProtocol.port) "
+            + "scoped=\(scopedHost) local=\(localInterfaceIP) "
+            + "iface=\(connectInterfaceName ?? "nil") transport=\(transportKind.rawValue) "
+            + "pin=\(params.requiredLocalEndpoint != nil)")
         conn.start(queue: connectionQueue)
     }
 
