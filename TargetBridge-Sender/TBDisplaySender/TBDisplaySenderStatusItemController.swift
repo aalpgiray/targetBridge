@@ -537,33 +537,8 @@ final class TBDisplaySenderStatusItemController: NSObject {
         runAfterMenuDismissal {
             NSApp.activate(ignoringOtherApps: true)
 
-            // Front the REAL window if one exists.
-            //
-            // Two rules matter here and both were wrong before:
-            //   - `canBecomeMain && contentView != nil` also matches SwiftUI's
-            //     internal helper windows, so this sometimes fronted an invisible
-            //     one and returned, and sometimes fell through -- which is how the
-            //     app ended up with TWO monitor windows.
-            //   - openWindow(id:) on a WindowGroup CREATES a window; it does not
-            //     front an existing one. It must only be called when there is
-            //     genuinely none.
-            //
-            // A real scene window is identifiable: it is visible, sized, and its
-            // content view actually has subviews. Helper windows are not.
-            let real = NSApp.windows.filter {
-                $0.canBecomeMain
-                    && !($0 is NSPanel)
-                    && $0.frame.width > 200 && $0.frame.height > 200
-                    && !($0.contentView?.subviews.isEmpty ?? true)
-            }
-            if let existing = real.first {
-                // More than one already open: collapse to the first rather than
-                // leaving duplicates behind.
-                for extra in real.dropFirst() { extra.close() }
-                existing.makeKeyAndOrderFront(nil)
-                return
-            }
-            TBWindowOpener.shared.open?()
+            // One owner for window creation — see TBAppDelegate.showMainWindow.
+            TBAppDelegate.showMainWindow()
         }
     }
 

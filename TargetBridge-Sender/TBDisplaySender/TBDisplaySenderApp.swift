@@ -71,11 +71,34 @@ final class TBAppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
-    /// Clicking the Dock icon with no window open reopens one, rather than
-    /// activating an app that shows nothing.
+    /// Clicking the Dock icon reopens a window — through the SAME path the menu
+    /// uses, so only one owner ever creates one.
+    ///
+    /// Returning `true` here let AppKit restore a window on its own while the menu
+    /// item independently called openWindow(id:). Two owners, two windows,
+    /// cascaded 29pt apart. Handling it explicitly and returning false keeps
+    /// creation in one place.
     func applicationShouldHandleReopen(_ sender: NSApplication,
                                        hasVisibleWindows flag: Bool) -> Bool {
-        true
+        if !flag { TBAppDelegate.showMainWindow() }
+        return false
+    }
+
+    /// The single way a window gets shown: front an existing one, or ask SwiftUI
+    /// for a new one only when there is genuinely none.
+    @MainActor
+    static func showMainWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        let real = NSApp.windows.filter {
+            $0.canBecomeMain && !($0 is NSPanel)
+                && $0.frame.width > 200 && $0.frame.height > 200
+        }
+        if let first = real.first {
+            for extra in real.dropFirst() { extra.close() }
+            first.makeKeyAndOrderFront(nil)
+            return
+        }
+        TBWindowOpener.shared.open?()
     }
 }
 
