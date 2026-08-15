@@ -6,7 +6,10 @@
 #include <stdio.h>
 #include <time.h>
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 /* 256 KB holds several seconds of the receiver's chattiest output, which is far
  * more than the main loop needs to fall behind by — it drains every iteration. */
@@ -15,6 +18,15 @@
 static struct {
     int             started;
     int             real_stderr;     /* dup of the original fd, for local output */
+    /* A LOCAL file, because the shipped copy dies with the link.
+     *
+     * The receiver's only output path was the wire: it ships stderr to the sender
+     * over the same TCP connection whose failures we most need to explain, so at
+     * the exact moment something breaks its account is lost. The launch agent
+     * runs `open -a`, so launchd's StandardErrorPath captures the output of
+     * `open`, not of the app -- meaning nothing was written locally either.
+     * Every diagnosis of this end has therefore been inference from the other. */
+    int             local_file;
     int             pipe_r;
     pthread_t       thread;
 
@@ -83,6 +95,7 @@ static void stamp_line_start(void) {
             if (w <= 0) break;
             off += w;
         }
+        if (g.local_file >= 0) (void)!write(g.local_file, pfx, (size_t)k);
         ring_put((const uint8_t *)pfx, (size_t)k);
     }
 }
@@ -110,6 +123,7 @@ static void *reader_main(void *unused) {
                         if (w <= 0) break;
                         off += w;
                     }
+                        if (g.local_file >= 0) (void)!write(g.local_file, buf + seg, len);
                     ring_put(buf + seg, len);
                     seg = i + 1;
                     at_line_start = 1;
@@ -123,6 +137,7 @@ static void *reader_main(void *unused) {
                     if (w <= 0) break;
                     off += w;
                 }
+                    if (g.local_file >= 0) (void)!write(g.local_file, buf + seg, len);
                 ring_put(buf + seg, len);
             }
             continue;
@@ -145,6 +160,34 @@ int tb_logship_start(void) {
     if (fl < 0 || fcntl(fds[1], F_SETFL, fl | O_NONBLOCK) != 0) {
         close(fds[0]); close(fds[1]);
         return -1;
+    }
+
+    /* ~/Library/Logs/TargetBridge/receiver-local.log, opened append-only. Kept
+     * beside the sender's copy so both ends read the same way, and separate from
+     * it so a lost link never costs us the receiver's side. */
+    {
+        const char *home = getenv("HOME");
+        char dir[512], path[600];
+        if (home && *home) {
+            snprintf(dir, sizeof dir, "%s/Library/Logs/TargetBridge", home);
+            mkdir(dir, 0755);   /* harmless if it exists */
+            snprintf(path, sizeof path, "%s/receiver-local.log", dir);
+            g.local_file = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (g.local_file >= 0) {
+                /* Truncate a log that has grown past ~16 MB rather than letting
+                 * it grow without bound -- the shipped one reached 33 MB in a day
+                 * with no rotation, which is a problem worth not repeating. */
+                struct stat st;
+                if (fstat(g.local_file, &st) == 0 && st.st_size > 16 * 1024 * 1024) {
+                    close(g.local_file);
+                    g.local_file = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                }
+                const char *banner = "\n=== receiver started ===\n";
+                (void)!write(g.local_file, banner, strlen(banner));
+            }
+        } else {
+            g.local_file = -1;
+        }
     }
 
     g.real_stderr = dup(STDERR_FILENO);
