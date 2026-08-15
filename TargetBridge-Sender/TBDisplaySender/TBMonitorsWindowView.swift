@@ -86,6 +86,15 @@ struct TBMonitorsWindowView: View {
         }
     }
 
+    /// Does this add-on have settings of its own worth a tab?
+    ///
+    /// Capability-driven, so adding a section to TBAddonDetailPageView for a new
+    /// capability is the only change needed to give it a tab.
+    static func ownsSettings(_ addon: TBAddonRecord) -> Bool {
+        let caps = addon.manifest.capabilities
+        return caps.contains(.audioDriver) || caps.contains(.inputDockstation)
+    }
+
     static func symbol(for addon: TBAddonRecord) -> String {
         if addon.manifest.capabilities.contains(.audioDriver) { return "speaker.wave.2" }
         if addon.manifest.capabilities.contains(.audioRelay) { return "waveform" }
@@ -112,9 +121,13 @@ struct TBMonitorsWindowView: View {
             Section {
                 Label("General", systemImage: "gearshape").tag(TBSidebarItem.general)
                 Label("Add-ons", systemImage: "puzzlepiece.extension").tag(TBSidebarItem.addons)
-                // Enabled add-ons only: a disabled add-on contributes nothing, so a
-                // tab for it would be a page of controls that do not apply.
-                ForEach(service.addons.filter { service.isAddonEnabled($0) }) { addon in
+                // Enabled AND owning settings. A disabled add-on contributes
+                // nothing, and one with no settings of its own would get an empty
+                // page -- its enable switch already lives on the Add-ons list, so a
+                // tab would add a click and show nothing new.
+                ForEach(service.addons.filter {
+                    service.isAddonEnabled($0) && Self.ownsSettings($0)
+                }) { addon in
                     Label(addon.name, systemImage: Self.symbol(for: addon))
                         .tag(TBSidebarItem.addon(addon.id))
                 }
@@ -378,6 +391,8 @@ struct TBMonitorPageView: View {
             }
             Toggle("V-Sync",
                    isOn: $session.vsyncEnabled)
+            Toggle(TBDisplaySenderL10n.largeCursor(service.language),
+                   isOn: $session.largeCursor)
             LabeledContent(TBDisplaySenderL10n.displayProfiles(service.language)) {
                 HStack(spacing: 6) {
                     ForEach(TBDisplayProfile.allCases) { profile in
@@ -506,8 +521,6 @@ struct TBGeneralPageView: View {
             Section("Interface") {
                 Toggle(TBDisplaySenderL10n.showMenuBarIcon(service.language),
                        isOn: $service.showsMenuBarIcon)
-                Toggle(TBDisplaySenderL10n.largeCursor(service.language),
-                       isOn: $service.largeCursor)
             }
             Section {
                 Toggle(TBDisplaySenderL10n.preventDisplaySleep(service.language),
