@@ -252,6 +252,18 @@ final class TBDisplaySenderService: ObservableObject {
             .joined(separator: "   ")
     }
 
+    /// Just the interface a session is actually bound to.
+    ///
+    /// `localInterfaceSummaryText` concatenates EVERY interface, which is fine in a
+    /// wide header but unreadable in a 220pt sidebar -- it wrapped into two lines
+    /// of half-truncated addresses. What matters there is the one in use.
+    func boundInterfaceText(for session: TBDisplaySenderSession) -> String {
+        guard let match = localInterfaces.first(where: { $0.ip == session.localInterfaceIP }) else {
+            return TBDisplaySenderL10n.notDetected(language)
+        }
+        return match.displayText(language)
+    }
+
     var availableTransportKinds: [TBTransportKind] {
         TBTransportKind.allCases.filter { transportKind in
             switch transportKind {
@@ -315,6 +327,9 @@ final class TBDisplaySenderService: ObservableObject {
             hasScreenRecording: CGPreflightScreenCaptureAccess(),
             transportIsThunderbolt: session.transportKind == .thunderboltBridge,
             localInterfaceName: TBConnectionDiagnostics.interfaceName(forLocalIP: session.localInterfaceIP, in: interfaces),
+            localInterfaceIsDirectLink: localInterfaces.contains {
+                $0.ip == session.localInterfaceIP && $0.transportKind == .thunderboltBridge
+            },
             receiverAddress: session.receiverIP.trimmingCharacters(in: .whitespacesAndNewlines),
             receiverProfileAvailable: session.receiverSupportsHEVCDecodeHint != nil,
             receiverSupportsHEVC: session.receiverSupportsHEVCDecodeHint,
@@ -594,7 +609,24 @@ final class TBDisplaySenderService: ObservableObject {
         applyDisplayProfile(profile, to: session)
     }
 
+    /// What to call this monitor, best name first.
+    ///
+    /// "Session 1" is a position, not a name -- it changes when another monitor is
+    /// removed, and it is the vocabulary the UI is meant to have retired. Prefer
+    /// what the user typed, then what the receiver calls itself, and fall back to
+    /// the positional label only when there is nothing else.
     func sessionTitle(for session: TBDisplaySenderSession) -> String {
+        let custom = session.customName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !custom.isEmpty { return custom }
+
+        if let receiver = discoveredReceivers.first(where: {
+            $0.preferredIP == session.receiverIP
+                || $0.thunderboltIP == session.receiverIP
+                || $0.networkIP == session.receiverIP
+        }), !receiver.receiverName.isEmpty {
+            return receiver.receiverName
+        }
+
         let index = sessions.firstIndex(where: { $0.id == session.id }).map { $0 + 1 } ?? 0
         return TBDisplaySenderL10n.sessionTitle(language, index: index)
     }

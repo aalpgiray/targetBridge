@@ -2014,6 +2014,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 receiverSupportsHEVCDecodeHint = nil
                 receiverInputMonitoringTrustedHint = nil
                 receiverAccessibilityTrustedHint = nil
+                // The address is what a name is stored against, so this is the
+                // moment we learn which monitor's name to show.
+                loadCustomNameForCurrentReceiver()
             }
         }
     }
@@ -2114,6 +2117,54 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     // update only re-renders the small FPS subview — not the whole session card
     // or (via the manager's objectWillChange bubble-up) the entire window.
     let liveMetrics = TBSessionLiveMetrics()
+    /// What the user calls this monitor. Empty means "no name given", which falls
+    /// back to the receiver's own name and then to a positional label.
+    ///
+    /// Persisted per session, because a display you have named is a thing you
+    /// expect to still be named tomorrow. Keyed on the session's id, which is
+    /// stable across launches.
+    @Published var customName: String = "" {
+        didSet {
+            guard customName != oldValue else { return }
+            saveCustomName()
+            objectWillChange.send()
+        }
+    }
+
+    /// Keyed on the RECEIVER ADDRESS, not the session id.
+    ///
+    /// `id` is a fresh UUID every launch, so a name stored under it could never be
+    /// read back — it would look like it persisted until the app restarted. The
+    /// address is what identifies a monitor across launches, which is also how the
+    /// user thinks about it: the name belongs to the iMac, not to a session object.
+    private static func nameKey(for receiverIP: String) -> String? {
+        let trimmed = receiverIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : "TBMonitorName.\(trimmed)"
+    }
+
+    private func saveCustomName() {
+        guard let key = Self.nameKey(for: receiverIP) else { return }
+        let trimmed = customName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: key)
+        } else {
+            UserDefaults.standard.set(trimmed, forKey: key)
+        }
+    }
+
+    /// Called when the receiver address settles — at init and whenever it changes,
+    /// since that is the moment we learn which monitor this session refers to.
+    func loadCustomNameForCurrentReceiver() {
+        guard let key = Self.nameKey(for: receiverIP) else { return }
+        let stored = UserDefaults.standard.string(forKey: key) ?? ""
+        if stored != customName {
+            // Assign through the backing store to avoid didSet writing it straight
+            // back out, which would be harmless but pointless.
+            _customName = Published(initialValue: stored)
+            objectWillChange.send()
+        }
+    }
+
     @Published var receiverPanelText: String
     @Published var virtualDisplayText: String
     @Published var captureDisplayText: String

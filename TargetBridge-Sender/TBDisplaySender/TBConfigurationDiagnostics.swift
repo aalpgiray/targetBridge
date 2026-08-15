@@ -18,6 +18,9 @@ struct TBConfigurationDiagnosticSnapshot {
     var hasScreenRecording: Bool
     var transportIsThunderbolt: Bool
     var localInterfaceName: String?
+    /// Decided by the same classifier that builds the interface list, so this
+    /// check can never drift from what the user picked from.
+    var localInterfaceIsDirectLink: Bool = false
     var receiverAddress: String
     var receiverProfileAvailable: Bool
     var receiverSupportsHEVC: Bool?
@@ -50,7 +53,12 @@ enum TBConfigurationDiagnostics {
         guard let interface = snapshot.localInterfaceName, !interface.isEmpty else {
             return check("local_link", .attention, "sender.diagnostics.local_link", "sender.diagnostics.local_link_missing")
         }
-        let isBridge = interface.lowercased().hasPrefix("bridge")
+        // Ask the same classifier the interface list uses. This used to test
+        // `hasPrefix("bridge")` on its own, so after direct links stopped being
+        // bridge-only it warned "Thunderbolt Bridge is selected, but en1 is not a
+        // bridge interface" about a working Thunderbolt link -- a diagnostic
+        // reporting a fault that did not exist, which is worse than silence.
+        let isBridge = snapshot.localInterfaceIsDirectLink
         let state: TBConfigurationCheckState = snapshot.transportIsThunderbolt && !isBridge ? .attention : .passed
         let detail = snapshot.transportIsThunderbolt
             ? (isBridge ? "sender.diagnostics.thunderbolt_link_ready" : "sender.diagnostics.thunderbolt_link_unexpected")

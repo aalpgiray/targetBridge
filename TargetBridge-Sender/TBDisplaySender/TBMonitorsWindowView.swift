@@ -45,8 +45,14 @@ struct TBMonitorsWindowView: View {
                           systemImage: "plus")
                 }
                 Button { showingAbout = true } label: {
-                    Label("About",
-                          systemImage: "info.circle")
+                    Label("About", systemImage: "info.circle")
+                }
+                // App-wide preferences — language, menu bar icon, logging — live in
+                // the Settings scene, NOT on a monitor's page. Mounting this window
+                // removed the only way in: its predecessor had this link, and ⌘, is
+                // taken by "Show main window" in the menu bar.
+                SettingsLink {
+                    Label("Settings", systemImage: "gearshape")
                 }
             }
         }
@@ -79,10 +85,12 @@ struct TBMonitorsWindowView: View {
             // nothing connects.
             VStack(alignment: .leading, spacing: 2) {
                 Divider()
-                Text(service.localInterfaceSummaryText)
+                Text(selectedSession.map { service.boundInterfaceText(for: $0) }
+                     ?? service.localInterfaceSummaryText)
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                     .padding(.horizontal, 12)
                     .padding(.top, 6)
                     .padding(.bottom, 8)
@@ -143,6 +151,8 @@ struct TBMonitorPageView: View {
 
     private var connectionSection: some View {
         Section {
+            TextField("Name", text: $session.customName,
+                      prompt: Text(service.sessionTitle(for: session)))
             LabeledContent(TBDisplaySenderL10n.receiverIP(service.language)) {
                 Text(session.receiverIP.isEmpty
                      ? "—"
@@ -368,7 +378,7 @@ struct TBMonitorPageView: View {
     // MARK: Sound
 
     private var soundSection: some View {
-        Section(TBDisplaySenderL10n.streamAudio(service.language)) {
+        Section {
             Toggle(TBDisplaySenderL10n.streamAudio(service.language),
                    isOn: $session.audioEnabled)
             if session.isConnected {
@@ -376,6 +386,17 @@ struct TBMonitorPageView: View {
                     Slider(value: $session.volume, in: 0...1).frame(width: 200)
                 }
             }
+        } header: {
+            Text(TBDisplaySenderL10n.streamAudio(service.language))
+        } footer: {
+            // This is the master switch for BOTH audio paths: captured audio and
+            // the TargetBridge audio device. Turning it off drops driver samples
+            // too, silently -- the "selected and silent" failure that reads as a
+            // broken driver. The label alone did not say that.
+            Text(service.audioDriverAvailable
+                 ? "Sends this Mac's audio to the display. Also required for the TargetBridge audio device to play through it."
+                 : "Sends this Mac's audio to the display.")
+                .foregroundStyle(.secondary)
         }
     }
 
