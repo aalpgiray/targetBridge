@@ -620,7 +620,12 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// to work out the sign of the error. Eight steps of an eighth of a period make
     /// one full sweep; three sweeps without success means the cause is not phase,
     /// so stop rather than churn the schedule forever. Reset on any good report.
-    private static let phaseMaxSteps = 24
+    /// One full sweep is 8 steps of period/8. Three sweeps was chosen to be
+    /// generous, but a sweep that finds the SAME wait at every phase has already
+    /// proved the cause is not phase -- 12 steps of an unchanging 11.3ms was that,
+    /// and it kept going. Give up after ten, and only count a step as progress if
+    /// the wait actually moved.
+    private static let phaseMaxSteps = 10
 
     /// One phase report from the receiver. Called on the connection queue; the
     /// resulting shift is handed to the capture queue through `pendingPhaseShift`
@@ -634,6 +639,18 @@ private final class TBVideoPipeline: @unchecked Sendable {
         // compositor produces and we have no handle on it. Still logged — the
         // number is the only view we get of where our sends land in the receiver's
         // refresh cycle, and it is what an A/B of this feature is judged on.
+        // Only steer a session that is actually streaming.
+        //
+        // The loop kept stepping after the receiver went quiet -- shifting the send
+        // schedule of a session with no peer, which cannot converge and cannot
+        // help. Seen at 14:04:56: steps 11 and 12 applied a second AFTER the
+        // receiver's last frame.
+        // `running` is the pipeline's own liveness; it is cleared by stop().
+        guard running else {
+            phaseCorrecting = false
+            phaseStepsApplied = 0
+            return
+        }
         guard phaseLockEnabled, maxSendFPS > 0 else {
             TBTelemetryReporter.emit(
                 "phase drawable \(String(format: "%.2f", meanMs))ms n=\(samples) (lock off)")
