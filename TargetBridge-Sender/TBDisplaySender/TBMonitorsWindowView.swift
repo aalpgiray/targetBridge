@@ -179,7 +179,6 @@ struct TBMonitorPageView: View {
             connectionSection
             linkSection
             streamSection
-            inputSection
             displaySection
             behaviourSection
             diagnosticsSection
@@ -353,34 +352,9 @@ struct TBMonitorPageView: View {
         }
     }
 
-    // MARK: Input — spec 3.3
-
-    private var inputSection: some View {
-        Section("Input") {
-            Picker("Control",
-                   selection: Binding(get: { session.inputControlRole },
-                                      set: { service.setInputControlRole($0, for: session) })) {
-                ForEach(TBInputControlRole.allCases) { role in
-                    Text(String(describing: role).capitalized).tag(role)
-                }
-            }
-            Picker("Gestures",
-                   selection: $session.inputGestureMode) {
-                ForEach(TBInputGestureMode.allCases) { mode in
-                    Text(String(describing: mode).capitalized).tag(mode)
-                }
-            }
-            HStack {
-                Button("Accessibility…") {
-                    service.openAccessibilitySettings()
-                }
-                Button("Input Monitoring…") {
-                    service.openInputMonitoringSettings()
-                }
-                Spacer()
-            }
-        }
-    }
+    // Input has no section here any more: it belongs to the Input Dockstation
+    // add-on, and setInputControlRole already enforces ONE master across all
+    // monitors -- so it was never a per-monitor setting in the first place.
 
     // MARK: Display
 
@@ -676,6 +650,10 @@ struct TBAddonDetailPageView: View {
                 audioDriverSection
             }
 
+            if addon.manifest.capabilities.contains(.inputDockstation) {
+                inputDockstationSection
+            }
+
             if let site = addon.manifest.documentationURL ?? addon.manifest.websiteURL,
                let url = URL(string: site) {
                 Section { Link("Documentation", destination: url) }
@@ -725,6 +703,48 @@ struct TBAddonDetailPageView: View {
             Button("OK", role: .cancel) { installerError = nil }
         } message: {
             Text(installerError ?? "")
+        }
+    }
+
+    /// Which Mac drives the keyboard and mouse.
+    ///
+    /// App-level, not per-monitor: setInputControlRole already forces every other
+    /// monitor to .off when one is made master, so there is only ever one answer.
+    /// Presenting it per monitor implied a choice that does not exist.
+    @ViewBuilder
+    private var inputDockstationSection: some View {
+        Section {
+            Picker("Keyboard and mouse", selection: Binding(
+                get: { service.sessions.first(where: { $0.inputControlRole != .off })?.inputControlRole ?? .off },
+                set: { role in
+                    guard let session = service.sessions.first else { return }
+                    service.setInputControlRole(role, for: session)
+                })) {
+                Text("Off").tag(TBInputControlRole.off)
+                Text("This Mac is master").tag(TBInputControlRole.senderMaster)
+                Text("The display is master").tag(TBInputControlRole.receiverMaster)
+            }
+            .disabled(service.sessions.isEmpty)
+        } header: {
+            Text("Control")
+        } footer: {
+            Text("Master drives the keyboard and pointer for both Macs. Only one "
+                 + "display can be master at a time.")
+                .foregroundStyle(.secondary)
+        }
+
+        Section {
+            HStack {
+                Button("Accessibility…") { service.openAccessibilitySettings() }
+                Button("Input Monitoring…") { service.openInputMonitoringSettings() }
+                Spacer()
+            }
+        } header: {
+            Text("Permissions")
+        } footer: {
+            Text("macOS requires these before one Mac can send keystrokes or "
+                 + "pointer movement to the other.")
+                .foregroundStyle(.secondary)
         }
     }
 
