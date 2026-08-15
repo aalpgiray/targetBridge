@@ -58,7 +58,26 @@ final class TBDisplaySenderService: ObservableObject {
             objectWillChange.send()
         }
     }
-    @Published var showsMenuBarIcon = true
+    /// Persisted, like every other preference here.
+    ///
+    /// This was a plain `= true` with no defaults read or write, so "Hide top bar
+    /// icon" removed the item for that launch and nothing restored it -- the
+    /// checkbox in Settings still read as ON because the stored value was never
+    /// consulted. With the window's own entry point now living in that menu, the
+    /// app became unreachable: no icon, and no way to open the window to get it
+    /// back.
+    ///
+    /// Registered with a default of true so a first launch still shows the icon;
+    /// `object(forKey:)` distinguishes "never set" from "set to false", which
+    /// `bool(forKey:)` cannot.
+    @Published var showsMenuBarIcon: Bool =
+        (UserDefaults.standard.object(forKey: "fd.tbdisplaysender.showsMenuBarIcon") as? Bool) ?? true {
+        didSet {
+            UserDefaults.standard.set(showsMenuBarIcon,
+                                      forKey: "fd.tbdisplaysender.showsMenuBarIcon")
+            objectWillChange.send()
+        }
+    }
     @Published var largeCursor: Bool = UserDefaults.standard.bool(forKey: "fd.tbdisplaysender.largeCursor") {
         didSet {
             UserDefaults.standard.set(largeCursor, forKey: "fd.tbdisplaysender.largeCursor")

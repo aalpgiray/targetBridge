@@ -581,6 +581,19 @@ final class TBDisplaySenderStatusItemController: NSObject {
     @objc
     private func hideStatusItem() {
         runAfterMenuDismissal { [service] in
+            // Confirm, because this is now PERSISTENT and the menu is the main way
+            // into the app: hiding it with no window open leaves nothing to click.
+            // The alert says where the switch lives before it disappears, rather
+            // than after.
+            let alert = NSAlert()
+            alert.messageText = "Hide the menu bar icon?"
+            alert.informativeText = "TargetBridge keeps running. To bring the icon "
+                + "back, open TargetBridge from Applications and turn it on again "
+                + "in General."
+            alert.addButton(withTitle: "Hide")
+            alert.addButton(withTitle: "Cancel")
+            alert.alertStyle = .warning
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
             service.showsMenuBarIcon = false
         }
     }
