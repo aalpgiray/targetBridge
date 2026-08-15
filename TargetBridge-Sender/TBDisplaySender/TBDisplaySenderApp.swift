@@ -1,9 +1,37 @@
 import SwiftUI
 
+/// Owns everything that must exist whether or not a window does.
+///
+/// The status item used to be a `let` on the App struct, activated from the
+/// window's `.task`. SwiftUI does not eagerly construct App properties, so with no
+/// window open the controller was never built and no menu bar item existed --
+/// which, once the window's entry point moved INTO that menu, left the app running
+/// and completely unreachable. An NSApplicationDelegate runs at launch regardless
+/// of scenes, which is the only place this can safely live.
+final class TBAppDelegate: NSObject, NSApplicationDelegate {
+    private var statusItemController: TBDisplaySenderStatusItemController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let controller = TBDisplaySenderStatusItemController(service: TBDisplaySenderService.shared)
+        controller.activate()
+        statusItemController = controller
+
+        if TBDisplaySenderService.shared.audioDriverAvailable {
+            TBDefaultOutputGuard.shared.begin()
+        }
+        TBSenderAutomation.handleLaunchArguments(CommandLine.arguments)
+    }
+
+    /// Closing the window must not quit: the menu bar item is the app.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+}
+
 @main
 struct TBDisplaySenderApp: App {
+    @NSApplicationDelegateAdaptor(TBAppDelegate.self) private var appDelegate
     @StateObject private var service = TBDisplaySenderService.shared
-    private let statusItemController = TBDisplaySenderStatusItemController(service: TBDisplaySenderService.shared)
 
     var body: some Scene {
         WindowGroup("TargetBridge", id: "main") {
@@ -17,16 +45,7 @@ struct TBDisplaySenderApp: App {
             // back is this one line.
             TBMonitorsWindowView(service: service)
                 .frame(minWidth: 720, minHeight: 460)
-                .task {
-                    statusItemController.activate()
-                    // Track which output the user was on before selecting ours,
-                    // so we can hand it back rather than leaving them silent.
-                    // Only meaningful when our device exists to be selected.
-                    if service.audioDriverAvailable {
-                        TBDefaultOutputGuard.shared.begin()
-                    }
-                    TBSenderAutomation.handleLaunchArguments(CommandLine.arguments)
-                }
+                .task { service.refreshLocalInterfaces() }
                 .onOpenURL { url in
                     TBSenderAutomation.handle(url: url)
                 }
