@@ -186,6 +186,10 @@ struct TBMonitorPageView: View {
     @ObservedObject var session: TBDisplaySenderSession
     @State private var showDiagnostics = false
     @State private var configurationChecks: [TBConfigurationCheck] = []
+    /// True while a cable test started from this page is still running, so the
+    /// result can be surfaced where the user is actually looking.
+    @State private var cableTestReportPending = false
+    @State private var cableTestReport: String?
 
     var body: some View {
         Form {
@@ -197,6 +201,37 @@ struct TBMonitorPageView: View {
             diagnosticsSection
         }
         .formStyle(.grouped)
+        // The rate is only rendered inside the configuration check list, so a test
+        // run with that list closed wrote a number nowhere visible -- it surfaced
+        // later beside an unrelated button. Refresh the checks when they are open,
+        // otherwise say the result in a dialog. The value is stored either way, so
+        // opening the checks afterwards still shows it.
+        .onChange(of: session.isCableTesting) { _, running in
+            guard !running, cableTestReportPending else { return }
+            cableTestReportPending = false
+            let text = session.cableTestResult.map { rate in
+                session.cableTestDetail.map {
+                    String(format: "%.2f Gbit/s  (%@)", rate, $0)
+                } ?? String(format: "%.2f Gbit/s", rate)
+            } ?? TBDisplaySenderL10n.noTestResult(service.language)
+            if configurationChecks.isEmpty {
+                cableTestReport = text
+            } else {
+                configurationChecks = service.configurationChecks(for: session)
+            }
+        }
+        .alert(TBDisplaySenderL10n.cableTestButton(service.language),
+               isPresented: Binding(get: { cableTestReport != nil },
+                                    set: { if !$0 { cableTestReport = nil } })) {
+            Button("OK", role: .cancel) { cableTestReport = nil }
+            Button(TBDisplaySenderL10n.text("sender.diagnostics.check_configuration",
+                                            service.language)) {
+                configurationChecks = service.configurationChecks(for: session)
+                cableTestReport = nil
+            }
+        } message: {
+            Text(cableTestReport ?? "")
+        }
         .navigationTitle(service.sessionTitle(for: session))
         .navigationSubtitle(session.statusText)
     }
@@ -292,6 +327,7 @@ struct TBMonitorPageView: View {
                 Button(session.isCableTesting
                        ? TBDisplaySenderL10n.testingButton(service.language)
                        : TBDisplaySenderL10n.cableTestButton(service.language)) {
+                    cableTestReportPending = true
                     session.startCableTest()
                 }
                 .disabled(session.isCableTesting)
@@ -302,26 +338,6 @@ struct TBMonitorPageView: View {
                 Spacer()
             }
 
-            // The RESULT, not just the button.
-            //
-            // Porting the action without its output made the cable test look like
-            // it did nothing -- the same miss as the add-ons list, where the
-            // controls came across and the content did not. Dual-cable runs report
-            // a combined figure plus each link, so an underperforming cable is
-            // visible next to its partner.
-            LabeledContent(TBDisplaySenderL10n.cableTestButton(service.language)) {
-                if let rate = session.cableTestResult {
-                    Text(session.cableTestDetail.map {
-                        String(format: "%.2f Gbits/s  (%@)", rate, $0)
-                    } ?? String(format: "%.2f Gbits/s", rate))
-                        .foregroundStyle(.green)
-                } else {
-                    Text(session.isCableTesting
-                         ? TBDisplaySenderL10n.testingButton(service.language)
-                         : TBDisplaySenderL10n.noTestResult(service.language))
-                        .foregroundStyle(.secondary)
-                }
-            }
             // Rendered inline rather than in a sheet: these exist to be read next
             // to the settings they are complaining about.
             ForEach(configurationChecks) { check in
