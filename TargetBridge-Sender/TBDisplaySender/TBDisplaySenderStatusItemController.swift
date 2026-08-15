@@ -201,12 +201,10 @@ final class TBDisplaySenderStatusItemController: NSObject {
         }
 
         if rows.isEmpty {
-            menu.addItem(.separator())
             addSetupHelp(to: menu)
             return
         }
 
-        menu.addItem(.separator())
         for spec in rows {
             let view = TBMenuMonitorRowView(spec: spec,
                                             width: TBMenuMetrics.width,
@@ -258,13 +256,12 @@ final class TBDisplaySenderStatusItemController: NSObject {
         toggleRows.removeAll()
         monitorRows.removeAll()
 
-        let titleItem = NSMenuItem(title: "TargetBridge", action: nil, keyEquivalent: "")
-        titleItem.isEnabled = false
-        menu.addItem(titleItem)
-
-        let statusItem = NSMenuItem(title: service.summaryStatusText(), action: nil, keyEquivalent: "")
-        statusItem.isEnabled = false
-        menu.addItem(statusItem)
+        // No title, no summary line.
+        //
+        // "TargetBridge" restates the icon that was just clicked, and "1 active
+        // sessions of 1" is both the retired session vocabulary and a count the
+        // monitor rows below already show -- each carries its own name and live
+        // status. Two dead rows before the first useful one.
 
         // The monitor list: the reason the menu bar is useful on its own. Without
         // it there is no way to start streaming without opening the main window.
