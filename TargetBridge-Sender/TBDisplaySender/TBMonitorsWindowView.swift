@@ -431,8 +431,6 @@ struct TBMonitorPageView: View {
                    isOn: $session.preventDisplaySleep)
             Toggle(TBDisplaySenderL10n.autoRestartOnWake(service.language),
                    isOn: $session.autoRestartOnWake)
-            Toggle(TBDisplaySenderL10n.largeCursor(service.language),
-                   isOn: $session.largeCursor)
         }
     }
 
@@ -527,14 +525,12 @@ struct TBGeneralPageView: View {
                 Toggle(TBDisplaySenderL10n.showMenuBarIcon(service.language),
                        isOn: $service.showsMenuBarIcon)
             }
-            Section {
-                Toggle(TBDisplaySenderL10n.preventDisplaySleep(service.language),
-                       isOn: $service.preventDisplaySleep)
-                Toggle(TBDisplaySenderL10n.autoRestartOnWake(service.language),
-                       isOn: $service.autoRestartOnWake)
-            } header: {
-                Text("While streaming")
-            }
+            // Prevent-sleep and auto-restart are NOT here.
+            //
+            // They are per-monitor settings and already live on the monitor's
+            // page. Having both meant two switches for one behaviour, bound to
+            // different objects (service vs session), so changing one silently
+            // disagreed with the other.
             Section {
                 Toggle(TBDisplaySenderL10n.verboseDisplayLogging(service.language),
                        isOn: $service.verboseDisplayLogging)
