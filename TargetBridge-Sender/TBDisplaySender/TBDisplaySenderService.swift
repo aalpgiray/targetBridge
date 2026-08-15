@@ -3099,7 +3099,15 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 codec: codecName(for: helloCodecType),
                 audioFormat: receiverSupportsFloat32Audio ? "f32" : "s16"
             )
-        ) else { return }
+        ) else {
+            // A hello that fails to encode is the whole session: the receiver
+            // waits for it, never gets it, and the link dies ~100ms in looking
+            // like a network fault. Say so rather than returning in silence.
+            TBTelemetryReporter.emit("hello: FAILED to encode — session cannot start")
+            TBLog.connection.error("hello: failed to encode — the receiver will never see it")
+            return
+        }
+        TBTelemetryReporter.emit("hello: sending \(packet.count) bytes")
         send(packet)
     }
 
@@ -3193,6 +3201,16 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     self.drainPackets()
                 }
                 if error != nil || isDone {
+                    // Record which end hung up and in what state. A clean EOF
+                    // (isDone, no error) during the handshake is the signature
+                    // seen in the receiver's log -- connected, profile sent,
+                    // hello never seen, gone ~100ms later -- and without this
+                    // line the sender's account of it is a bare status change.
+                    TBTelemetryReporter.emit(
+                        "receive: ended — isDone=\(isDone) error=\(error.map { "\($0)" } ?? "none") "
+                        + "status=\(self.statusState) bytesBuffered=\(self.recvBuffer.count)")
+                    TBLog.connection.error(
+                        "receive: ended isDone=\(isDone, privacy: .public) error=\(error?.localizedDescription ?? "none", privacy: .public)")
                     if let error {
                         self.setStatus(.connectionClosed(error.localizedDescription))
                     } else if case .startingCapture = self.statusState {
@@ -4891,7 +4909,33 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func send(_ packet: Data) {
-        connection?.send(content: packet, completion: .contentProcessed({ _ in }))
+        // Report send failures instead of discarding them.
+        //
+        // This swallowed every error: `.contentProcessed({ _ in })` means a
+        // packet that never left the socket looked identical to one that did.
+        // The receiver's log showed it plainly -- it accepts the connection,
+        // sends its display profile, and then never sees `hello from sender`,
+        // so the sender tears the session down ~100ms in. Whatever stopped
+        // that first packet, the sender had no way to say so.
+        //
+        // Nil connection is its own case: send() called after teardown is a
+        // caller-ordering bug, not a network failure, and the two must not
+        // look the same.
+        guard let conn = connection else {
+            TBTelemetryReporter.emit("send: DROPPED — no connection (\(packet.count) bytes)")
+            TBLog.connection.error("send: dropped \(packet.count) bytes — connection is nil")
+            return
+        }
+        conn.send(content: packet, completion: .contentProcessed({ [weak self] error in
+            guard let error else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                TBTelemetryReporter.emit("send: FAILED — \(error)")
+                TBLog.connection.error(
+                    "send: failed after \(packet.count, privacy: .public) bytes — \(error.localizedDescription, privacy: .public)")
+                self.lastConnectionStateDetail = "send failed: \(error.localizedDescription)"
+            }
+        }))
     }
 
     func sendInputEvent(_ event: TBMonitorInputEvent) {

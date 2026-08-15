@@ -248,7 +248,17 @@ int tb_net_listen(uint16_t port) {
     if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
         perror("[net] bind"); close(fd); return -1;
     }
-    if (listen(fd, 1) < 0) {
+    /* Backlog 16, not 1. With a backlog of one, a single connection the sender
+     * dialled but never completed fills the queue, and the kernel answers every
+     * later dial with ECONNREFUSED -- while this process is alive and listening.
+     * From the far end that is indistinguishable from a dead receiver, which is
+     * exactly how it was misread: the recovery correlated with installing a new
+     * *sender* build, because that kills the sender holding the stale dial.
+     *
+     * The accept loop compounds it: main.c only accepts while client_fd < 0, so
+     * a dial arriving during a live session is never drained and the slot never
+     * frees. See the reap in main.c that pairs with this. */
+    if (listen(fd, 16) < 0) {
         perror("[net] listen"); close(fd); return -1;
     }
 

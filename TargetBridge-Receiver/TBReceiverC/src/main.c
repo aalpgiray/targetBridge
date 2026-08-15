@@ -2815,7 +2815,23 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Accept the client. One accept per iteration. */
+        /* Accept the client. One accept per iteration.
+         *
+         * While a session is live, still drain the backlog: a dial that arrives
+         * now is a sender that thinks it is not connected (it restarted, or its
+         * link dropped without a FIN). Leaving it queued costs a backlog slot
+         * permanently, and once the queue is full the kernel refuses every later
+         * dial -- a live receiver that looks dead from the far end. Close them
+         * so the queue stays empty; the idle watchdog drops the stale session
+         * and the next dial is then accepted normally. */
+        if (a.client_fd >= 0) {
+            int stale;
+            while ((stale = tb_net_accept(a.server_fd)) >= 0) {
+                fprintf(stderr, "[main] refused a second dial: session already live\n");
+                close(stale);
+            }
+        }
+
         if (a.client_fd < 0) {
             int c = tb_net_accept(a.server_fd);
             if (c >= 0) {
