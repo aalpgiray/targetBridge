@@ -37,6 +37,37 @@ targets:
         # Base plist merged with the auto-generated keys; declares the targetbridge:// URL scheme.
         INFOPLIST_FILE: TargetBridgeSupport/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # Give every build a distinct Mach-O LC_UUID.
+        #
+        # NECP -- the subsystem behind local network privacy -- identifies a
+        # program by its main executable UUID. When that identity goes bad the
+        # symptom is total and instant: every dial fails in ~35ms with ENETDOWN
+        # ("Network is down") while the link is provably fine. Measured against a
+        # freshly signed control bundle using identical NWConnection parameters,
+        # to the same address, from the same source IP -- the control connects
+        # immediately, the sender cannot. Not the address, not the route, not the
+        # receiver: the process identity.
+        #
+        # The build is otherwise deterministic, so rebuilding unchanged source
+        # reproduces the same UUID and the same poisoned identity. That is why
+        # "just rebuild it" only worked when a source file happened to change too,
+        # and why the fault appeared to return at random.
+        #
+        # macOS offers no supported way to reset local network privacy (Apple
+        # radar 134842755), so a fresh identity per build is the workaround
+        # available. It is not a fix for a defect in this app.
+        OTHER_LDFLAGS: "-Wl,-random_uuid"
+        # Put the code back in the main executable.
+        #
+        # Xcode's debug-dylib split leaves Contents/MacOS/TargetBridge as a 58KB
+        # stub that does nothing but load TargetBridge.debug.dylib. The stub's
+        # content never varies, so its LC_UUID came out identical on every build
+        # -- a full clean build included, and -random_uuid included, because the
+        # link is skipped when none of its inputs changed. NECP keys on the MAIN
+        # EXECUTABLE's UUID, so the identity it tracks could never move while the
+        # split was on. Measured: with -random_uuid the dylib's UUID changed per
+        # build and the stub's did not.
+        ENABLE_DEBUG_DYLIB: NO
     preBuildScripts:
       - name: Stamp Sender Build Info
         script: |
