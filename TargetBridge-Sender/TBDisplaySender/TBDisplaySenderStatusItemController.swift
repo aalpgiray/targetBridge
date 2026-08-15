@@ -570,25 +570,15 @@ final class TBDisplaySenderStatusItemController: NSObject {
             // gone from NSApp.windows, so the old loop had nothing to front and
             // this menu item silently did nothing. With the window closed and the
             // Dock icon hidden, that left no way back into the app at all.
-            let existing = NSApp.windows.first {
+            if let existing = NSApp.windows.first(where: {
                 $0.canBecomeMain && !($0 is NSPanel) && $0.contentView != nil
-            }
-            if let existing {
+            }) {
                 existing.makeKeyAndOrderFront(nil)
                 return
             }
-
-            // Nothing to front: ask SwiftUI to build the scene again. `newWindow`
-            // is the standard action for reopening a WindowGroup by id.
-            NSApp.sendAction(Selector(("newWindowForTab:")), to: nil, from: nil)
-            if NSApp.windows.first(where: { $0.canBecomeMain }) == nil {
-                // Last resort, and the one that always works: LaunchServices
-                // re-activates the app, which SwiftUI answers by restoring the
-                // WindowGroup.
-                if let url = Bundle.main.bundleURL as URL? {
-                    NSWorkspace.shared.open(url)
-                }
-            }
+            // Closed WindowGroup windows are destroyed, not hidden, so there is
+            // nothing to front -- only SwiftUI can rebuild the scene.
+            TBWindowOpener.shared.open?()
         }
     }
 

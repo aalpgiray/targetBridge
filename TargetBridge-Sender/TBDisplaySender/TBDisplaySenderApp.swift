@@ -8,6 +8,19 @@ import SwiftUI
 /// which, once the window's entry point moved INTO that menu, left the app running
 /// and completely unreachable. An NSApplicationDelegate runs at launch regardless
 /// of scenes, which is the only place this can safely live.
+/// Lets AppKit code reopen the SwiftUI scene.
+///
+/// `openWindow` only exists inside the SwiftUI environment, so a menu handler in
+/// an AppKit controller cannot call it. The scene stores it here on appear; the
+/// status item menu reads it. Without this, "Show main window" had nothing that
+/// could recreate a CLOSED WindowGroup window -- `newWindowForTab:` was a guess
+/// and did nothing, as the logs showed (windows=6 before and after).
+@MainActor
+final class TBWindowOpener {
+    static let shared = TBWindowOpener()
+    var open: (() -> Void)?
+}
+
 final class TBAppDelegate: NSObject, NSApplicationDelegate {
     private var statusItemController: TBDisplaySenderStatusItemController?
 
@@ -20,6 +33,37 @@ final class TBAppDelegate: NSObject, NSApplicationDelegate {
             TBDefaultOutputGuard.shared.begin()
         }
         TBSenderAutomation.handleLaunchArguments(CommandLine.arguments)
+        observeWindowCount()
+    }
+
+    /// No Dock icon unless a window is open.
+    ///
+    /// This was agreed early and then never implemented -- there was no
+    /// setActivationPolicy call anywhere in the app, so the icon stayed
+    /// permanently. `.accessory` hides it, `.regular` brings it back, and both
+    /// are safe to call at runtime.
+    private var windowObservers: [NSObjectProtocol] = []
+
+    private func observeWindowCount() {
+        let nc = NotificationCenter.default
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.willCloseNotification] {
+            windowObservers.append(nc.addObserver(forName: name, object: nil, queue: .main) { _ in
+                // willClose fires BEFORE the window leaves the list, so let the
+                // run loop settle before counting.
+                DispatchQueue.main.async { TBAppDelegate.syncActivationPolicy() }
+            })
+        }
+        TBAppDelegate.syncActivationPolicy()
+    }
+
+    static func syncActivationPolicy() {
+        let hasRealWindow = NSApp.windows.contains {
+            $0.isVisible && $0.canBecomeMain && !($0 is NSPanel)
+        }
+        let wanted: NSApplication.ActivationPolicy = hasRealWindow ? .regular : .accessory
+        if NSApp.activationPolicy() != wanted {
+            NSApp.setActivationPolicy(wanted)
+        }
     }
 
     /// Closing the window must not quit: the menu bar item is the app.
@@ -53,6 +97,7 @@ struct TBDisplaySenderApp: App {
             TBMonitorsWindowView(service: service)
                 .frame(minWidth: 720, minHeight: 460)
                 .task { service.refreshLocalInterfaces() }
+                .modifier(TBWindowOpenerInstaller())
                 .onOpenURL { url in
                     TBSenderAutomation.handle(url: url)
                 }
@@ -62,6 +107,18 @@ struct TBDisplaySenderApp: App {
         Settings {
             TBDisplaySenderSettingsView(service: service)
                 .frame(minWidth: 760, minHeight: 620)
+        }
+    }
+}
+
+
+/// Captures SwiftUI's openWindow action so AppKit can reopen the scene.
+private struct TBWindowOpenerInstaller: ViewModifier {
+    @Environment(\.openWindow) private var openWindow
+    func body(content: Content) -> some View {
+        content.onAppear {
+            TBWindowOpener.shared.open = { openWindow(id: "main") }
+            TBAppDelegate.syncActivationPolicy()
         }
     }
 }

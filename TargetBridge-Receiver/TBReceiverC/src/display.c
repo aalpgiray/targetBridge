@@ -442,7 +442,9 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
         tb_disp_fill_rect(ctx, 0, 0, W, H, 0.043, 0.043, 0.051, 1.0);
 
         const CGFloat icon = 96.0 * S;
-        const CGFloat icon_y = H / 2.0 + 40.0 * S;
+        /* Flipped context: y grows downward, so the icon sits ABOVE centre by
+         * subtracting, and the text below it by adding. */
+        const CGFloat icon_y = H / 2.0 - 110.0 * S;
         tb_disp_draw_brand_icon(ctx, cx - icon / 2.0, icon_y, icon);
 
         /* Centred by measuring, not by guessing an offset. The old code shifted
@@ -450,27 +452,30 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
          * centred the one string it was tuned against and drifted for every
          * translation. */
         tb_disp_draw_text_centered(ctx, "TargetBridge", title_font, 30.0 * S,
-                                   cx, icon_y - 46.0 * S, 0.98, 0.98, 1.0);
+                                   cx, icon_y + icon + 48.0 * S, 0.98, 0.98, 1.0);
         tb_disp_draw_text_centered(ctx, tb_i18n_get("receiver.splash.connecting"),
                                    body_font, 17.0 * S,
-                                   cx, icon_y - 78.0 * S, 0.58, 0.60, 0.66);
+                                   cx, icon_y + icon + 80.0 * S, 0.58, 0.60, 0.66);
         tb_disp_draw_text_centered(ctx, tb_i18n_get("receiver.splash.waiting_first_frame"),
                                    body_font, 14.0 * S,
-                                   cx, icon_y - 104.0 * S, 0.45, 0.47, 0.53);
+                                   cx, icon_y + icon + 108.0 * S, 0.45, 0.47, 0.53);
         tb_disp_draw_text_centered(ctx, TB_RECEIVER_VERSION, mono_font, 12.0 * S,
-                                   cx, 56.0 * S, 0.35, 0.36, 0.41);
+                                   cx, H - 56.0 * S, 0.35, 0.36, 0.41);
     } else {
     /* EVERYTHING scales.
      *
      * This panel used raw pixel values -- a 28pt title, 72pt margins -- while the
      * connecting splash beside it scaled by min_side/720. On a 5120x2880 panel
      * that made the connected view roughly a third the size it should be, which
-     * is most of why it read as cheap. One factor, applied to every dimension.  */
+     * is most of why it read as cheap. One factor, applied to every dimension.
+     *
+     * COORDINATES: the context is flipped above (translate by height, scale -1),
+     * so y grows DOWNWARD from the top edge. Laying it out as if y grew upward is
+     * what put the title at the bottom and the help text at the top. Flow down. */
     const CGFloat S = (CGFloat)(drawable_w < drawable_h ? drawable_w : drawable_h) / 720.0;
     const CGFloat W = (CGFloat)drawable_w;
     const CGFloat H = (CGFloat)drawable_h;
 
-    /* Sender's palette: near-black ground, one raised surface, hairline borders. */
     tb_disp_fill_rect(ctx, 0, 0, W, H, 0.043, 0.043, 0.051, 1.0);
 
     const CGFloat margin = 64.0 * S;
@@ -479,32 +484,31 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
     const CGFloat gap = 16.0 * S;
     const CGFloat content_w = W - margin * 2.0;
 
-    /* Header: name, then the address as the one thing worth reading from across
-     * a room. Everything else is support. */
-    CGFloat y = H - margin - 34.0 * S;
+    /* Header */
+    CGFloat y = margin + 34.0 * S;
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.title"), title_font, 34.0 * S,
                       margin, y, 0.98, 0.98, 1.0);
     tb_disp_draw_text(ctx, TB_RECEIVER_VERSION, mono_font, 15.0 * S,
-                      W - margin - 150.0 * S, y + 6.0 * S, 0.45, 0.47, 0.53);
-
-    y -= 30.0 * S;
+                      W - margin - 150.0 * S, y, 0.45, 0.47, 0.53);
+    y += 28.0 * S;
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.subtitle"), body_font, 17.0 * S,
                       margin, y, 0.58, 0.60, 0.66);
 
-    /* The address, given the weight it deserves. */
-    y -= 92.0 * S;
-    tb_disp_fill_rounded_rect(ctx, margin, y - 26.0 * S, content_w, 104.0 * S,
+    /* The address, given the weight it deserves: this is the one thing a person
+     * needs to read off this screen from across a room. */
+    y += 34.0 * S;
+    tb_disp_fill_rounded_rect(ctx, margin, y, content_w, 104.0 * S,
                               card_r, 0.10, 0.10, 0.12, 1.0);
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.ip_thunderbolt_bridge"),
-                      section_font, 14.0 * S, margin + pad, y + 44.0 * S,
+                      section_font, 14.0 * S, margin + pad, y + 30.0 * S,
                       0.50, 0.52, 0.58);
     tb_disp_draw_text(ctx, ip, mono_bold_font, 46.0 * S,
-                      margin + pad, y - 2.0 * S, 0.40, 0.85, 0.55);
+                      margin + pad, y + 80.0 * S, 0.40, 0.85, 0.55);
 
-    /* Two cards of detail, rounded to match every surface in the sender. */
+    /* Two cards of detail */
     const CGFloat card_w = (content_w - gap) / 2.0;
     const CGFloat card_h = 150.0 * S;
-    y -= card_h + gap + 26.0 * S;
+    y += 104.0 * S + gap;
 
     tb_disp_fill_rounded_rect(ctx, margin, y, card_w, card_h, card_r,
                               0.10, 0.10, 0.12, 1.0);
@@ -514,40 +518,38 @@ static void tb_disp_rebuild_status_texture(struct tb_display *d,
     const CGFloat lx = margin + pad;
     const CGFloat rx = margin + card_w + gap + pad;
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.status"), section_font, 13.0 * S,
-                      lx, y + card_h - 30.0 * S, 0.50, 0.52, 0.58);
+                      lx, y + 28.0 * S, 0.50, 0.52, 0.58);
     tb_disp_draw_text(ctx, status, body_font, 20.0 * S,
-                      lx, y + card_h - 58.0 * S, 0.94, 0.95, 0.98);
+                      lx, y + 56.0 * S, 0.94, 0.95, 0.98);
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.sender"), section_font, 13.0 * S,
-                      lx, y + card_h - 96.0 * S, 0.50, 0.52, 0.58);
+                      lx, y + 96.0 * S, 0.50, 0.52, 0.58);
     tb_disp_draw_text(ctx, sender, body_font, 18.0 * S,
-                      lx, y + card_h - 122.0 * S, 0.94, 0.95, 0.98);
+                      lx, y + 124.0 * S, 0.94, 0.95, 0.98);
 
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.display"), section_font, 13.0 * S,
-                      rx, y + card_h - 30.0 * S, 0.50, 0.52, 0.58);
+                      rx, y + 28.0 * S, 0.50, 0.52, 0.58);
     tb_disp_draw_text(ctx, panel, zh ? body_font : mono_font, 18.0 * S,
-                      rx, y + card_h - 58.0 * S, 0.94, 0.95, 0.98);
+                      rx, y + 56.0 * S, 0.94, 0.95, 0.98);
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.stream_profile"), section_font, 13.0 * S,
-                      rx, y + card_h - 96.0 * S, 0.50, 0.52, 0.58);
+                      rx, y + 96.0 * S, 0.50, 0.52, 0.58);
     tb_disp_draw_text(ctx, mode, zh ? body_font : mono_font, 18.0 * S,
-                      rx, y + card_h - 122.0 * S, 0.94, 0.95, 0.98);
+                      rx, y + 124.0 * S, 0.94, 0.95, 0.98);
 
-    /* Permissions only matter when something is missing, so they sit with the
-     * language line rather than in a card of their own. */
-    y -= 44.0 * S;
+    y += card_h + 40.0 * S;
     tb_disp_draw_text(ctx, permissions, body_font, 15.0 * S,
                       margin, y, 0.58, 0.60, 0.66);
-    y -= 26.0 * S;
+    y += 26.0 * S;
     tb_disp_draw_text(ctx, language, body_font, 15.0 * S,
                       margin, y, 0.58, 0.60, 0.66);
 
-    /* Help at the foot, quiet: this screen exists because nothing is streaming,
-     * so the next step is the most useful thing on it. */
+    /* Help at the foot: this screen exists because nothing is streaming, so the
+     * next step is the most useful thing on it. Measured up from the bottom. */
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_1"), body_font, 16.0 * S,
-                      margin, margin + 52.0 * S, 0.62, 0.64, 0.70);
+                      margin, H - margin - 52.0 * S, 0.62, 0.64, 0.70);
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_2"), body_font, 16.0 * S,
-                      margin, margin + 26.0 * S, 0.62, 0.64, 0.70);
+                      margin, H - margin - 26.0 * S, 0.62, 0.64, 0.70);
     tb_disp_draw_text(ctx, tb_i18n_get("receiver.ui.help_4"), body_font, 16.0 * S,
-                      margin, margin, 0.62, 0.64, 0.70);
+                      margin, H - margin, 0.62, 0.64, 0.70);
     }
 
     CGContextRelease(ctx);
