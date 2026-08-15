@@ -2612,7 +2612,11 @@ static void build_display_host(char *buf, size_t bufsz, const char *ip_fallback,
         short_host[i] = '\0';
         if (short_host[0] != '\0') {
             if (have_ip && ip_fallback && ip_fallback[0] != '\0') {
-                snprintf(buf, bufsz, "%s (%s)", short_host, ip_fallback);
+                /* ADDRESS FIRST. The person reading this screen is about to type
+                 * the address into the sender; the Bonjour hostname is noise in
+                 * front of it. It used to read "c188-149-147-188 (10.0.1.2)",
+                 * which buries the only actionable string on the display. */
+                snprintf(buf, bufsz, "%s", ip_fallback);
             } else {
                 snprintf(buf, bufsz, "%s", short_host);
             }
