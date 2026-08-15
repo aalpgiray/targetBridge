@@ -1,4 +1,5 @@
 /* net.c — POSIX socket server + packet parser. */
+#include <net/if.h>
 
 #include "net.h"
 #include "proto.h"
@@ -300,24 +301,56 @@ static int is_rfc1918_ipv4(const char *host) {
     return a == 172 && b >= 16 && b <= 31;
 }
 
+/* Is this interface a plausible Thunderbolt/direct link?
+ *
+ * The original test was `name starts with "bridge"` AND `address in 169.254/16`,
+ * which only matches macOS's own auto-configured Thunderbolt Bridge. A directly
+ * cabled pair with STATIC addresses -- en1 at 10.0.1.2, which is exactly this
+ * project's own setup -- matches neither half, so the receiver advertised only
+ * its Wi-Fi address and the sender had no way to learn the fast one. The link
+ * worked solely because the address had been typed in by hand.
+ *
+ * Recognise the link by what it is rather than what it is called: a bridge
+ * interface, or a Thunderbolt-class en* device carrying a link-local or private
+ * address that is NOT the machine's routed LAN. */
+static int tb_is_direct_link_name(const char *name) {
+    return strncmp(name, "bridge", 6) == 0 || strncmp(name, "en", 2) == 0;
+}
+
+static int tb_is_direct_link_address(const char *host) {
+    if (strncmp(host, "169.254.", 8) == 0) return 1;   /* auto-configured */
+    if (strncmp(host, "10.", 3) == 0) return 1;        /* common static choice */
+    return 0;
+}
+
 int tb_net_get_tb_ip(char *buf, size_t bufsz) {
     struct ifaddrs *ifap = NULL;
     if (getifaddrs(&ifap) != 0) return -1;
 
     int ret = -1;
-    for (struct ifaddrs *p = ifap; p; p = p->ifa_next) {
-        if (!p->ifa_addr) continue;
-        if (p->ifa_addr->sa_family != AF_INET) continue;
-        if (strncmp(p->ifa_name, "bridge", 6) != 0) continue;
+    /* Two passes, best candidate first: a real bridge* interface is
+     * unambiguous, so prefer it and only fall back to an en* device when there
+     * is none. Without the ordering, a Mac with both would advertise whichever
+     * getifaddrs happened to list first. */
+    for (int pass = 0; pass < 2 && ret != 0; pass++) {
+        for (struct ifaddrs *p = ifap; p; p = p->ifa_next) {
+            if (!p->ifa_addr) continue;
+            if (p->ifa_addr->sa_family != AF_INET) continue;
+            if (!(p->ifa_flags & IFF_UP)) continue;
+            if (p->ifa_flags & IFF_LOOPBACK) continue;
 
-        char host[NI_MAXHOST];
-        if (getnameinfo(p->ifa_addr, sizeof(struct sockaddr_in),
-                        host, sizeof(host), NULL, 0, NI_NUMERICHOST) == 0) {
-            if (strncmp(host, "169.254.", 8) == 0) {
-                snprintf(buf, bufsz, "%s", host);
-                ret = 0;
-                break;
-            }
+            const int isBridge = strncmp(p->ifa_name, "bridge", 6) == 0;
+            if (pass == 0 && !isBridge) continue;
+            if (pass == 1 && !tb_is_direct_link_name(p->ifa_name)) continue;
+
+            char host[NI_MAXHOST];
+            if (getnameinfo(p->ifa_addr, sizeof(struct sockaddr_in),
+                            host, sizeof(host), NULL, 0, NI_NUMERICHOST) != 0) continue;
+            if (!tb_is_direct_link_address(host)) continue;
+
+            snprintf(buf, bufsz, "%s", host);
+            ret = 0;
+            break;
         }
     }
     freeifaddrs(ifap);

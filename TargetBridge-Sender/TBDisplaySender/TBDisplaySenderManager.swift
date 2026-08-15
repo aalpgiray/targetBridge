@@ -602,6 +602,17 @@ final class TBDisplaySenderService: ObservableObject {
         localInterfaces.first(where: { $0.ip == ip })?.displayText(language) ?? ip
     }
 
+    /// A directly cabled peer link: auto-configured Thunderbolt Bridge, or a
+    /// statically addressed direct connection. Must agree with the receiver's
+    /// `tb_is_direct_link_*` in net.c — if the two ends disagree about which
+    /// interface is the fast one, discovery advertises one address and the sender
+    /// dials another.
+    func isDirectLinkInterface(name: String, ip: String) -> Bool {
+        if name.hasPrefix("bridge") { return ip.hasPrefix("169.254.") || ip.hasPrefix("10.") }
+        if name.hasPrefix("en") { return ip.hasPrefix("169.254.") || ip.hasPrefix("10.") }
+        return false
+    }
+
     func availableInterfaces(for transportKind: TBTransportKind) -> [TBLocalLinkInterface] {
         localInterfaces.filter { $0.transportKind == transportKind }
     }
@@ -945,7 +956,21 @@ final class TBDisplaySenderService: ObservableObject {
                 NI_NUMERICHOST
             ) == 0 else { continue }
             let ip = String(cString: buffer)
-            if name.hasPrefix("bridge"), ip.hasPrefix("169.254.") {
+            // A direct cable, classified by what it IS rather than what macOS
+            // happened to name it.
+            //
+            // This used to require `bridge*` AND a 169.254 address, i.e. only
+            // macOS's own auto-configured Thunderbolt Bridge. Configure the same
+            // cable with static addresses -- en1 at 10.0.1.1, which is this
+            // project's own setup -- and it matched neither half, so a Thunderbolt
+            // link was labelled "Network Link (experimental)" and the receiver's
+            // Thunderbolt address was never advertised or preferred. It worked
+            // only because the address had been typed in by hand.
+            //
+            // 10/8 is the giveaway: macOS never assigns it to a normal LAN client
+            // (DHCP hands out 192.168/16 or 172.16/12 at home), so a 10.x address
+            // on a directly cabled interface is a deliberate point-to-point link.
+            if isDirectLinkInterface(name: name, ip: ip) {
                 interfaces.append(TBLocalLinkInterface(name: name, ip: ip, transportKind: .thunderboltBridge))
                 continue
             }
