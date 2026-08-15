@@ -324,7 +324,16 @@ static void tb_receiver_input_log(const char *fmt, ...) {
 }
 
 static volatile sig_atomic_t g_term = 0;
-static void on_sigint(int s) { (void)s; g_term = 1; }
+static volatile sig_atomic_t g_term_signal = 0;
+/* Record WHICH signal asked us to stop.
+ *
+ * The receiver exited silently, so a restart mid-session was indistinguishable
+ * from a crash, a logout, or someone quitting it -- and the sender only sees the
+ * link go away. Knowing whether this was SIGTERM (something asked politely, e.g.
+ * an installer or launchctl) or SIGINT decides where to look next.
+ *
+ * async-signal-safe: just a flag. The reason is printed from the main loop. */
+static void on_sigint(int s) { g_term_signal = s; g_term = 1; }
 
 static uint64_t now_ms(void) {
     struct timespec ts;
@@ -3064,6 +3073,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    fprintf(stderr, "[main] exiting: %s\n",
+            g_term_signal == SIGTERM ? "SIGTERM (asked to stop)"
+            : g_term_signal == SIGINT ? "SIGINT (interrupted)"
+            : "loop ended without a signal");
     if (a.client_fd >= 0) close(a.client_fd);
     tb_receiver_stop_input_tap(&a);
     if (a.server_fd >= 0) close(a.server_fd);
