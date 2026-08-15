@@ -551,19 +551,77 @@ struct TBAddonsPageView: View {
     var body: some View {
         Form {
             Section {
+                if service.addons.isEmpty {
+                    Text("No add-ons installed.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(service.addons) { addon in
+                        addonRow(addon)
+                    }
+                }
+            } header: {
+                Text("Installed")
+            } footer: {
+                Text(service.anyConnected
+                     ? "Stop all monitors before enabling or disabling an add-on."
+                     : "Add-ons load from JSON manifests. Official ones ship with the app.")
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
                 HStack {
                     Button("Reload") { service.refreshAddons() }
                     Button("Open Folder") { service.openAddonsFolder() }
                     Spacer()
                 }
-            } footer: {
-                Text("Add-ons load from JSON manifests. Stop all monitors before "
-                     + "enabling or disabling one.")
-                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
         .navigationTitle("Add-ons")
+    }
+
+    /// One add-on: name, what it does, its badges, and the switch.
+    ///
+    /// The list is the whole point of this page -- a Reload button with nothing to
+    /// reload tells the user nothing about what is installed or whether it is on.
+    @ViewBuilder
+    private func addonRow(_ addon: TBAddonRecord) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(addon.name)
+                    Text(addon.summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { service.isAddonEnabled(addon) },
+                    set: { service.setAddonEnabled($0, for: addon) }))
+                    .labelsHidden()
+                    // Toggling mid-stream would reconfigure the pipeline under a
+                    // live session, which is why the old page disabled it too.
+                    .disabled(!service.isAddonCompatible(addon) || service.anyConnected)
+            }
+            HStack(spacing: 6) {
+                badge(addon.origin == .bundled ? "Bundled" : "Imported",
+                      tint: addon.origin == .bundled ? .cyan : .orange)
+                badge("Version \(addon.version)", tint: .secondary)
+                if addon.manifest.experimental { badge("Experimental", tint: .yellow) }
+                if !service.isAddonCompatible(addon) { badge("Incompatible", tint: .red) }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func badge(_ text: String, tint: Color) -> some View {
+        Text(text)
+            .font(.caption2.weight(.medium))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2)
+            .background(tint.opacity(0.18), in: Capsule())
+            .foregroundStyle(tint)
     }
 }
 
