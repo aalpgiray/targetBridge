@@ -25,6 +25,12 @@ enum TBSidebarItem: Hashable {
     case monitor(TBDisplaySenderSession.ID)
     case general
     case addons
+    /// One per ENABLED add-on, keyed by manifest id.
+    ///
+    /// Driven by the manifest's declared `capabilities` rather than a hardcoded
+    /// list, so an add-on's settings live under the add-on that owns them instead
+    /// of being scattered across General and every monitor page.
+    case addon(String)
     case about
 }
 
@@ -40,6 +46,12 @@ struct TBMonitorsWindowView: View {
             case .general: TBGeneralPageView(service: service)
             case .addons:  TBAddonsPageView(service: service)
             case .about:   TBAboutPageView(service: service)
+            case .addon(let id):
+                if let addon = service.addons.first(where: { $0.id == id }) {
+                    TBAddonDetailPageView(service: service, addon: addon)
+                } else {
+                    TBAddonsPageView(service: service)
+                }
             default:
                 if let session = selectedSession {
                     TBMonitorPageView(service: service, session: session)
@@ -74,6 +86,14 @@ struct TBMonitorsWindowView: View {
         }
     }
 
+    static func symbol(for addon: TBAddonRecord) -> String {
+        if addon.manifest.capabilities.contains(.audioDriver) { return "speaker.wave.2" }
+        if addon.manifest.capabilities.contains(.audioRelay) { return "waveform" }
+        if addon.manifest.capabilities.contains(.inputDockstation) { return "keyboard" }
+        if addon.manifest.capabilities.contains(.networkLink) { return "network" }
+        return "puzzlepiece.extension"
+    }
+
     private var selectedSession: TBDisplaySenderSession? {
         if case .monitor(let id) = selection {
             return service.sessions.first(where: { $0.id == id })
@@ -92,6 +112,12 @@ struct TBMonitorsWindowView: View {
             Section {
                 Label("General", systemImage: "gearshape").tag(TBSidebarItem.general)
                 Label("Add-ons", systemImage: "puzzlepiece.extension").tag(TBSidebarItem.addons)
+                // Enabled add-ons only: a disabled add-on contributes nothing, so a
+                // tab for it would be a page of controls that do not apply.
+                ForEach(service.addons.filter { service.isAddonEnabled($0) }) { addon in
+                    Label(addon.name, systemImage: Self.symbol(for: addon))
+                        .tag(TBSidebarItem.addon(addon.id))
+                }
                 Label("About", systemImage: "info.circle").tag(TBSidebarItem.about)
             }
         }
@@ -155,7 +181,6 @@ struct TBMonitorPageView: View {
             streamSection
             inputSection
             displaySection
-            soundSection
             behaviourSection
             diagnosticsSection
         }
@@ -394,28 +419,15 @@ struct TBMonitorPageView: View {
 
     // MARK: Sound
 
-    private var soundSection: some View {
-        Section {
-            Toggle(TBDisplaySenderL10n.streamAudio(service.language),
-                   isOn: $session.audioEnabled)
-            if session.isConnected {
-                LabeledContent("Volume") {
-                    Slider(value: $session.volume, in: 0...1).frame(width: 200)
-                }
-            }
-        } header: {
-            Text(TBDisplaySenderL10n.streamAudio(service.language))
-        } footer: {
-            // This is the master switch for BOTH audio paths: captured audio and
-            // the TargetBridge audio device. Turning it off drops driver samples
-            // too, silently -- the "selected and silent" failure that reads as a
-            // broken driver. The label alone did not say that.
-            Text(service.audioDriverAvailable
-                 ? "Sends this Mac's audio to the display. Also required for the TargetBridge audio device to play through it."
-                 : "Sends this Mac's audio to the display.")
-                .foregroundStyle(.secondary)
-        }
-    }
+    // Sound has no section here any more.
+    //
+    // Enabling the Audio Driver add-on IS enabling audio: `audioDriverAvailable`
+    // is literally `isAddonCapabilityEnabled(.audioDriver)`. A per-monitor switch
+    // on top of that was a second gate on an already-gated capability -- and the
+    // one that silently dropped driver samples, which reads as a broken driver.
+    // Volume went with it: macOS's own Sound control already drives the receiver
+    // when the device is selected, which is why the menu bar deliberately has no
+    // volume slider either.
 
     // MARK: Behaviour
 
@@ -622,6 +634,108 @@ struct TBAddonsPageView: View {
             .padding(.vertical, 2)
             .background(tint.opacity(0.18), in: Capsule())
             .foregroundStyle(tint)
+    }
+}
+
+/// One add-on's own page: what it is, whether it is on, and the settings it owns.
+///
+/// Composed from the manifest's declared capabilities, so an add-on's controls sit
+/// under the add-on rather than being spread across General and every monitor.
+struct TBAddonDetailPageView: View {
+    @ObservedObject var service: TBDisplaySenderService
+    let addon: TBAddonRecord
+    @State private var driverStatus = TBAudioDriverInstaller.status()
+    @State private var installerError: String?
+
+    private var isOn: Binding<Bool> {
+        Binding(get: { service.isAddonEnabled(addon) },
+                set: { service.setAddonEnabled($0, for: addon) })
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Enabled", isOn: isOn)
+                    // Reconfiguring the pipeline under a live session is why this
+                    // is locked while anything is streaming.
+                    .disabled(!service.isAddonCompatible(addon) || service.anyConnected)
+                LabeledContent("Version") {
+                    Text(addon.version).foregroundStyle(.secondary)
+                }
+                LabeledContent("Source") {
+                    Text(addon.origin == .bundled ? "Bundled" : "Imported")
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text(addon.name)
+            } footer: {
+                Text(addon.summary).foregroundStyle(.secondary)
+            }
+
+            if addon.manifest.capabilities.contains(.audioDriver) {
+                audioDriverSection
+            }
+
+            if let site = addon.manifest.documentationURL ?? addon.manifest.websiteURL,
+               let url = URL(string: site) {
+                Section { Link("Documentation", destination: url) }
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle(addon.name)
+    }
+
+    /// The audio driver installs a system component, so its page is about the
+    /// INSTALL -- not about switching audio on and off, which the Enabled toggle
+    /// above already decides.
+    @ViewBuilder
+    private var audioDriverSection: some View {
+        Section {
+            switch driverStatus {
+            case .notBundled:
+                Text("This build does not include the driver.")
+                    .foregroundStyle(.secondary)
+            case .notInstalled:
+                LabeledContent("System driver") {
+                    Text("Not installed").foregroundStyle(.orange)
+                }
+                Button("Install…") { runInstaller(install: true) }
+            case .installed(let version):
+                LabeledContent("System driver") {
+                    Text("Installed · \(version)").foregroundStyle(.secondary)
+                }
+                Button("Remove…", role: .destructive) { runInstaller(install: false) }
+            case .outdated(let installed, let bundled):
+                LabeledContent("System driver") {
+                    Text("\(installed) → \(bundled)").foregroundStyle(.orange)
+                }
+                Button("Update…") { runInstaller(install: true) }
+            }
+        } header: {
+            Text("Audio device")
+        } footer: {
+            Text("Installs a system audio driver so the display appears as an "
+                 + "ordinary macOS output device. Needs your password. Once selected "
+                 + "in Sound settings, the system volume control drives it.")
+                .foregroundStyle(.secondary)
+        }
+        .alert("Audio driver", isPresented: Binding(
+            get: { installerError != nil },
+            set: { if !$0 { installerError = nil } })) {
+            Button("OK", role: .cancel) { installerError = nil }
+        } message: {
+            Text(installerError ?? "")
+        }
+    }
+
+    private func runInstaller(install: Bool) {
+        do {
+            if install { try TBAudioDriverInstaller.install() }
+            else { try TBAudioDriverInstaller.uninstall() }
+        } catch {
+            installerError = error.localizedDescription
+        }
+        driverStatus = TBAudioDriverInstaller.status()
     }
 }
 

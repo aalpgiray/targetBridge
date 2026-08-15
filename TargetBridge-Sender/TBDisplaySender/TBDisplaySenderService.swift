@@ -1961,6 +1961,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             language: language
         )
         super.init()
+        // The saved name is keyed on the receiver address, and `receiverIP` is
+        // restored from defaults as an INITIAL VALUE -- so its didSet never fires
+        // at launch and the name was written but never read back. It looked like
+        // naming worked until the app was relaunched.
+        loadCustomNameForCurrentReceiver()
         registerWakeObservers()
         registerDisplayReconfigurationCallback()
     }
