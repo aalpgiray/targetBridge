@@ -5,6 +5,25 @@ struct TBDisplayProfileSettings: Equatable {
     let capturePreset: TBDisplayCapturePreset
     let matchRenderToStream: Bool
     let audioEnabled: Bool
+
+    /// Whether live stream settings still match this profile.
+    ///
+    /// Decides if a stored profile may be re-applied. Once the user has changed
+    /// the codec, the source or the render matching by hand, the profile is a
+    /// stale preset rather than an instruction, and re-applying it silently
+    /// discards their choice -- which is exactly what made the app appear to
+    /// forget its settings every time a stream stopped.
+    ///
+    /// `audioEnabled` is deliberately excluded: it is toggled independently of a
+    /// profile (the audio add-on owns it), so including it would make an
+    /// unrelated change look like divergence.
+    func matchesStreamSettings(captureSource: TBDisplayCaptureSource,
+                               capturePreset: TBDisplayCapturePreset,
+                               matchRenderToStream: Bool) -> Bool {
+        self.captureSource == captureSource
+            && self.capturePreset == capturePreset
+            && self.matchRenderToStream == matchRenderToStream
+    }
 }
 
 enum TBDisplayProfile: String, CaseIterable, Identifiable, Codable {

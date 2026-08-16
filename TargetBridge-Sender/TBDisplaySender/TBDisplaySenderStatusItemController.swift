@@ -165,6 +165,21 @@ final class TBDisplaySenderStatusItemController: NSObject {
         return service.sessions.first(where: { $0.isConnected && $0.virtualDisplayID == displayID })
     }
 
+    /// The streaming subtitle for a menu row: live, codec, frame rate.
+    ///
+    /// Deliberately short. The row is one line under the monitor's name inside a
+    /// menu, so it gets the state and the two facts that change -- how it is
+    /// encoded and how fast -- and nothing else. The resolution and the capture
+    /// source are already on the monitor's page in the window, where there is
+    /// room to read them.
+    private func menuSubtitle(for session: TBDisplaySenderSession) -> String {
+        var parts = [TBDisplaySenderL10n.statusChipLive(service.language)]
+        parts.append(session.capturePreset.codecName)
+        let fps = session.liveMetrics.senderFPS
+        if fps > 0 { parts.append("\(fps) fps") }
+        return parts.joined(separator: " · ")
+    }
+
     /// One row per discovered receiver, plus any connected session that discovery
     /// is not currently reporting (a manually entered address, or a receiver that
     /// has stopped advertising while still streaming).
@@ -182,7 +197,14 @@ final class TBDisplaySenderStatusItemController: NSObject {
             rows.append(TBMenuMonitorSpec(
                 symbol: "display",
                 title: service.sessionTitle(for: session),
-                subtitle: session.statusText,
+                // Short form, not session.statusText.
+                //
+                // statusText spells the whole state out -- "Extended Desktop
+                // active (5120 x 2880 @ ...)" -- which the window has room for
+                // and a menu row does not: it truncated mid-word under the
+                // monitor's name. The row already says which monitor this is, so
+                // the only news here is that it is live and how it is encoded.
+                subtitle: menuSubtitle(for: session),
                 isStreaming: session.isStreaming,
                 isError: false,
                 onTap: { [weak session] in session?.stop() }))
