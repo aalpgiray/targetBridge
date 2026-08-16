@@ -216,7 +216,8 @@ final class TBDisplaySenderStatusItemController: NSObject {
             if addresses.contains(where: { seenIP.contains($0) }) { continue }
             rows.append(TBMenuMonitorSpec(
                 symbol: "display",
-                title: receiver.displayText,
+                // The name alone — displayText's address list overflows the row.
+                title: receiver.shortDisplayName,
                 subtitle: TBDisplaySenderL10n.statusChipIdle(service.language),
                 isStreaming: false,
                 isError: false,

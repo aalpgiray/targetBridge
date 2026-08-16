@@ -605,7 +605,18 @@ final class TBDisplaySenderService: ObservableObject {
                 ?? availableInterfaces(for: session.transportKind).first?.ip
                 ?? ""
         }
-        restoreDisplayProfile(for: session)
+        // Deliberately does NOT restore a stored display profile.
+        //
+        // This runs on every discovery refresh, so restoring here meant a saved
+        // profile re-imposed itself again and again -- reverting the codec to
+        // HEVC and switching render matching back on, most visibly right after a
+        // stream stopped, and taking the display arrangement with it because
+        // macOS saw the mode change.
+        //
+        // Guarding on "have the settings diverged from the profile?" does not fix
+        // it: the first overwrite makes them match, so every later refresh sees
+        // agreement and overwrites again. The only durable answer is that a
+        // profile applies when the user picks one, and never on its own.
         objectWillChange.send()
     }
 
@@ -635,51 +646,6 @@ final class TBDisplaySenderService: ObservableObject {
 
         let receiverIP = session.receiverIP.trimmingCharacters(in: .whitespacesAndNewlines)
         return receiverIP.isEmpty ? nil : "ip:\(receiverIP)"
-    }
-
-    /// Whether this session's stream settings still match the profile that was
-    /// stored for its receiver.
-    ///
-    /// Once the user changes the codec or the render matching by hand, the stored
-    /// profile is a stale preset, not an instruction. Re-applying it is what made
-    /// the app "forget": stopping a stream flipped the preset back to HEVC and
-    /// turned Match Render on again, and macOS then saw a different mode and lost
-    /// the display arrangement with it.
-    private func sessionMatchesStoredProfile(_ session: TBDisplaySenderSession,
-                                             _ profile: TBDisplayProfile) -> Bool {
-        profile.settings.matchesStreamSettings(
-            captureSource: session.captureSource,
-            capturePreset: session.capturePreset,
-            matchRenderToStream: session.matchRenderToStream)
-    }
-
-    private func restoreDisplayProfile(for session: TBDisplaySenderSession) {
-        guard let receiverKey = receiverProfileKey(for: session),
-              let rawValue = persistedDisplayProfiles[receiverKey],
-              let profile = TBDisplayProfile(rawValue: rawValue)
-        else {
-            return
-        }
-
-        // Only re-apply a profile the session has not already diverged from.
-        //
-        // This ran on every discovery refresh, including the one right after a
-        // stream stops, and it overwrote the codec, the capture source and the
-        // render matching with whatever preset was stored for the receiver --
-        // silently undoing a deliberate choice. The stored "work5K" profile
-        // carries capturePreset .native5k and matchRenderToStream true, so a user
-        // running lossless with matching off got flipped back to HEVC with
-        // matching on every single time they stopped presenting.
-        //
-        // A profile is a starting point, not a policy. Once the settings differ
-        // from it, the user's choice is the newer information and wins.
-        guard sessionMatchesStoredProfile(session, profile) else {
-            TBTelemetryReporter.emit(
-                "profile: keeping the current settings — they no longer match stored '\(profile.rawValue)'")
-            return
-        }
-
-        applyDisplayProfile(profile, to: session)
     }
 
     /// What to call this monitor, best name first.

@@ -98,3 +98,38 @@ final class TBReceiverDiscoveryModelTests: XCTestCase {
         XCTAssertEqual(receiver.displayText, "192.168.1.64 · iMac 5K (5120x2880)")
     }
 }
+
+// MARK: - The name used where there is one line to spend
+
+/// Cover for the menu bar row that truncated mid-address.
+///
+/// `displayText` lists every address a receiver advertises, which is what the
+/// window's pickers need to tell two receivers apart and far more than a menu row
+/// can render: "Atess-iMac (TB 10.0.1.2 · NET 192.1..." was the visible result.
+extension TBReceiverDiscoveryModelTests {
+
+    func testTheShortNamePrefersTheHostAndDropsEveryAddress() {
+        let receiver = makeReceiver(
+            thunderboltIP: "10.0.1.2",
+            networkIP: "192.168.0.192",
+            panelSummary: "iMac (2560x1440)",
+            hostName: "Atess-iMac.local.")
+        XCTAssertEqual(receiver.shortDisplayName, "Atess-iMac")
+        XCTAssertTrue(receiver.displayText.contains("10.0.1.2"),
+                      "displayText keeps the addresses the pickers rely on")
+    }
+
+    func testTheShortNameFallsBackToTheAdvertisedNameWithoutAHost() {
+        let receiver = makeReceiver(receiverName: "Studio Display",
+                                    thunderboltIP: "10.0.1.2",
+                                    hostName: nil)
+        XCTAssertEqual(receiver.shortDisplayName, "Studio Display")
+    }
+
+    func testTheShortNameFallsBackToTheAddressWhenNothingIsNamed() {
+        let receiver = makeReceiver(receiverName: "",
+                                    preferredIP: "10.0.1.2",
+                                    hostName: nil)
+        XCTAssertEqual(receiver.shortDisplayName, "10.0.1.2")
+    }
+}

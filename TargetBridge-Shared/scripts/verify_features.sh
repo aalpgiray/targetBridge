@@ -89,6 +89,14 @@ want "parser cost regression test"      1 "backlog_cost_stays_linear" TargetBrid
 want "threaded receive"                 1 "link_reader_main"       TargetBridge-Receiver/TBReceiverC/src
 want "video queue (never block reader)" 1 "TB_VIDEO_QUEUE"         TargetBridge-Receiver/TBReceiverC/src
 want "async present"                    1 "TB_ASYNC_PRESENT"       TargetBridge-Receiver/TBReceiverC/src
+# The video layer must come down with the session.
+#
+# The Metal plane sits OVER the SDL window and keeps the last frame it drew.
+# close_client reset the decoder, the parser and the audio ring but left the
+# plane up, so the idle screen rendered underneath a stale frame: the receiver
+# looked frozen and only a kill would clear it. Nothing errors when this
+# regresses -- the picture simply stops changing.
+want "video layer released on teardown" 1 "tb_metal_plane_set_hidden" TargetBridge-Receiver/TBReceiverC/src/main.c
 
 echo "== audio ===================================================="
 want "virtual output driver"            1 "libASPL\|TargetBridgeAudioDevice" TargetBridge-AudioDriver TargetBridge-Sender
@@ -153,6 +161,17 @@ gone() {
 gone "damage rects stay removed (sender)" "TBDamageRects\|dpcmRects\|carriedDirty" TargetBridge-Sender/TBDisplaySender TargetBridge-Sender/TBDisplayShared
 gone "damage wire types stay removed"     "rawDamage\|rawDPCMRect"                 TargetBridge-Sender/TBDisplayShared
 gone "damage handlers stay removed (rx)"  "handle_raw_damage\|handle_raw_dpcm_rect" TargetBridge-Receiver/TBReceiverC/src
+
+# A stored display profile must never re-apply itself.
+#
+# restoreDisplayProfile ran from applyDiscoveredReceiver, which fires on every
+# discovery refresh, so a saved profile re-imposed its codec, capture source and
+# render matching over whatever the user had chosen -- most visibly right after a
+# stream stopped. Guarding on "have the settings diverged?" did NOT fix it: the
+# first overwrite makes them match again, so the next refresh overwrites too.
+# Profiles now apply only when the user picks one. Asserting the absence, because
+# the failure is silent: settings simply revert, and nothing errors.
+gone "profiles never re-apply themselves"  "restoreDisplayProfile"  TargetBridge-Sender/TBDisplaySender
 
 echo "== diagnostics =============================================="
 want "receiver log shipping"            1 "tb_logship"             TargetBridge-Receiver/TBReceiverC/src

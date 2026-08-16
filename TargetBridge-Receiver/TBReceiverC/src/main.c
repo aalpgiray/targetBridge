@@ -2589,6 +2589,21 @@ static void close_client(struct app *a) {
     SDL_EnableScreenSaver();
     tb_receiver_refresh_input_capture(a);
     tb_disp_set_connection_state(a->disp, 0);
+    /* Take the video layer down with the session.
+     *
+     * The Metal plane is layered OVER the SDL window and holds the last frame it
+     * drew. Teardown left it visible, so the idle screen was rendered underneath
+     * a stale frame that never went away: the receiver looked frozen, and the
+     * only way out was killing it. Everything else here was already reset -- the
+     * decoder, the parser, the audio ring -- but the thing actually on screen
+     * was not.
+     *
+     * set_hidden(1) releases the plane outright (it calls
+     * tb_metal_plane_shutdown), and the render path re-creates it lazily on the
+     * next session's first frame -- display.c already guards every render with
+     * `if (!tb_metal_plane_available()) tb_metal_plane_init(d->win)`. There is no
+     * set_hidden(0) to pair with this, and none is needed. */
+    tb_metal_plane_set_hidden(1);
     tb_disp_set_cursor(a->disp, 0, 0, 1, 1, 0, 0);
     tb_refresh_idle_localized_strings(a);
     a->last_clipboard_text[0] = '\0';

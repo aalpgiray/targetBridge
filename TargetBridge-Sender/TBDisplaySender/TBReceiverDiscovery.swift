@@ -30,6 +30,19 @@ struct TBDiscoveredReceiver: Identifiable, Equatable {
         }
     }
 
+    /// Just the monitor's name, for places with one line to spend.
+    ///
+    /// `displayText` spells out every address it knows -- "Atess-iMac (TB 10.0.1.2
+    /// · NET 192.168.0.192) · iMac (2560x1440)" -- which is what the pickers in
+    /// the window need to tell two receivers apart, and far more than a menu row
+    /// can show: it truncated mid-address. In the menu the addresses are not the
+    /// point, and the row carries its state on the line underneath.
+    var shortDisplayName: String {
+        if let host = shortHostName, !host.isEmpty { return host }
+        if !receiverName.isEmpty { return receiverName }
+        return preferredIP
+    }
+
     var displayText: String {
         let addressSummary: String
         switch (thunderboltIP.isEmpty, networkIP.isEmpty) {
