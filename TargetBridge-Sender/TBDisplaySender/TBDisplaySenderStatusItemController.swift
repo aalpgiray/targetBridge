@@ -72,7 +72,16 @@ final class TBDisplaySenderStatusItemController: NSObject {
     private func ensureStatusItem() {
         guard statusItem == nil else { return }
 
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // Fixed length, not variableLength.
+        //
+        // variableLength sizes the item from its button's content, and an
+        // image-only button whose image fails to size can collapse to nothing:
+        // the item reports placed=true, visible=true and a plausible 40x22 frame
+        // while the window server draws no pixels. Measured exactly that -- the
+        // app was doing everything right and the icon was still absent through a
+        // reinstall, a defaults reset, a SystemUIServer restart and a logout.
+        // A fixed width cannot collapse.
+        let item = NSStatusBar.system.statusItem(withLength: 30)
         item.button?.toolTip = TBDisplaySenderL10n.topBarToolTip(service.language)
 
         // Assign one menu instance for the lifetime of the status item and
@@ -85,6 +94,39 @@ final class TBDisplaySenderStatusItemController: NSObject {
         item.menu = menu
         statusItem = item
         applyStatusAppearance()
+        // Say whether the item actually landed on screen.
+        //
+        // "The icon is gone" has three different causes that look identical from
+        // outside the process -- never created, created but macOS put it where it
+        // cannot be seen, or created and dropped for want of menu bar space -- and
+        // guessing between them from the window list got it wrong twice.
+        // button.window is nil when AppKit has not placed it at all.
+        // Measured AFTER layout, not at creation: at creation the window is
+        // 40x0 because AppKit has not sized it yet, and reading it there says
+        // "zero height" about a perfectly healthy item.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak item] in
+            guard let item else { return }
+            let win = item.button?.window
+            let frame = win?.frame ?? .zero
+            let screen = win?.screen?.frame ?? .zero
+            TBTelemetryReporter.emit(
+                "status item: placed=\(win != nil) visible=\(item.isVisible) "
+                + "frame=\(Int(frame.origin.x)),\(Int(frame.origin.y)) "
+                + "\(Int(frame.width))x\(Int(frame.height)) "
+                + "onScreen=\(Int(screen.origin.x)),\(Int(screen.origin.y)) "
+                + "\(Int(screen.width))x\(Int(screen.height)) "
+                // The frame being right is not enough: an item can be correctly
+                // placed and still draw nothing. Report what the button actually
+                // holds, and whether its window is on screen at all.
+                + "img=\(item.button?.image != nil) "
+                + "imgSize=\(item.button?.image?.size ?? .zero) "
+                + "title=\"\(item.button?.title ?? "")\" "
+                + "attr=\(item.button?.attributedTitle.length ?? -1) "
+                + "imgPos=\(String(describing: item.button?.imagePosition)) "
+                + "alpha=\(win?.alphaValue ?? -1) "
+                + "winVisible=\(win?.isVisible ?? false) "
+                + "hidden=\(item.button?.isHidden ?? true)")
+        }
     }
 
     private func removeStatusItem() {
@@ -121,8 +163,16 @@ final class TBDisplaySenderStatusItemController: NSObject {
         // which once made the icon vanish exactly while streaming.
         let image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "TargetBridge")
         image?.isTemplate = true
-        if image == nil { button.title = "TB" }
         button.image = image
+        // Always leave something drawable behind the image.
+        //
+        // If the symbol ever fails to load, an image-only button has zero content
+        // and the item renders as empty space -- indistinguishable from "the icon
+        // is gone", which is precisely the failure this cost hours to find.
+        if image == nil {
+            button.title = "TB"
+            button.imagePosition = .noImage
+        }
 
         if streaming, fps > 0 {
             // attributedTitle WITH an explicit dynamic colour.
@@ -142,27 +192,15 @@ final class TBDisplaySenderStatusItemController: NSObject {
                     .foregroundColor: NSColor.labelColor,
                 ])
             button.imagePosition = .imageRight
-        } else {
+        } else if image != nil {
             button.attributedTitle = NSAttributedString(string: "")
             button.imagePosition = .imageOnly
         }
+        // No else: with a nil image the fallback title set above is the ONLY
+        // drawable content, and forcing .imageOnly here would blank the item.
         button.contentTintColor = nil
         button.toolTip = TBDisplaySenderL10n.topBarToolTip(service.language)
-    }
 
-    /// The session shown on the screen this menu was opened from, if any.
-    ///
-    /// macOS puts the menu bar on every display, so opening the menu ON a streamed
-    /// display identifies that display -- no picker, no mode, no state to track.
-    /// Returns nil when opened from the Mac's own screen, where "which monitor" has
-    /// no answer and the menu should simply list them.
-    private func sessionForMenuScreen() -> TBDisplaySenderSession? {
-        guard let screen = statusItem?.button?.window?.screen,
-              let number = screen.deviceDescription[
-                NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
-        else { return nil }
-        let displayID = CGDirectDisplayID(number.uint32Value)
-        return service.sessions.first(where: { $0.isConnected && $0.virtualDisplayID == displayID })
     }
 
     /// The streaming subtitle for a menu row: live, codec, frame rate.
@@ -297,9 +335,20 @@ final class TBDisplaySenderStatusItemController: NSObject {
         // Opened ON one of our displays: show just that display's controls, since
         // that is unambiguously the one being looked at. Opened from this Mac's own
         // screen: show them all, because there is nothing to disambiguate against.
-        let allConnected = service.sessions.filter { $0.isConnected }
-        let focused = sessionForMenuScreen()
-        let connectedSessions = focused.map { [$0] } ?? allConnected
+        // Always every monitor, never just the one whose screen the item is on.
+        //
+        // The menu used to filter to the item's own screen, on the theory that
+        // opening it ON a streamed display identifies that display. The theory is
+        // fine; the input is not. There is only ONE status item, macOS decides
+        // which display it appears on, and `button.window.screen` goes stale or
+        // nil while the menu bar is being rearranged -- so dragging OTHER items
+        // around was enough to make this resolve to the wrong screen and show a
+        // menu with the wrong monitor, or none.
+        //
+        // Filtering also hid the other monitors outright, which is a real cost
+        // for a feature that was never verified to work. Listing them all is
+        // correct on every screen and has no state to get wrong.
+        let connectedSessions = service.sessions.filter { $0.isConnected }
         if !connectedSessions.isEmpty {
             menu.addItem(.separator())
             for session in connectedSessions {

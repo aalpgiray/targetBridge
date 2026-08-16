@@ -68,8 +68,24 @@ enum TBSenderAutomation {
             Task { await connect(params) }
         case "disconnect":
             disconnect(params)
+        case "show", "window", "settings":
+            // The way back in when there is no way in.
+            //
+            // Turning the menu bar icon off while no window is open leaves the app
+            // with no entry point at all: accessory activation policy means no Dock
+            // icon, the icon it would be reached by is gone, and `open -a` on a
+            // running accessory app fronts nothing. The only recovery was killing
+            // it, which drops a live stream -- for a setting the user can toggle by
+            // accident.
+            //
+            // Restoring the icon here too, not just showing the window: arriving
+            // via this URL means the normal route was already unreachable.
+            Task { @MainActor in
+                TBDisplaySenderService.shared.showsMenuBarIcon = true
+                TBAppDelegate.showMainWindow()
+            }
         default:
-            NSLog("[automation] unknown action '\(action)' (expected connect|disconnect)")
+            NSLog("[automation] unknown action '\(action)' (expected connect|disconnect|show)")
         }
     }
 

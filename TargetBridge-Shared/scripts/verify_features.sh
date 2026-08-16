@@ -173,6 +173,15 @@ gone "damage handlers stay removed (rx)"  "handle_raw_damage\|handle_raw_dpcm_re
 # the failure is silent: settings simply revert, and nothing errors.
 gone "profiles never re-apply themselves"  "restoreDisplayProfile"  TargetBridge-Sender/TBDisplaySender
 
+# The menu lists every monitor, never just the one on the item's own screen.
+#
+# There is ONE status item; macOS decides which display shows it, and
+# button.window.screen goes stale or nil while the menu bar is being rearranged.
+# Filtering the menu by that reading meant dragging OTHER menu bar items was
+# enough to make it resolve to the wrong screen -- showing the wrong monitor's
+# controls, or none at all -- and it hid the other monitors even when it worked.
+gone "menu never filters by its own screen" "sessionForMenuScreen" TargetBridge-Sender/TBDisplaySender
+
 echo "== diagnostics =============================================="
 want "receiver log shipping"            1 "tb_logship"             TargetBridge-Receiver/TBReceiverC/src
 want "sender-side log sink"             1 "TBReceiverLogSink"      TargetBridge-Sender/TBDisplaySender
