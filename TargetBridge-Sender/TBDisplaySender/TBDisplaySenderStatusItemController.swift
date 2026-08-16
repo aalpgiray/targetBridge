@@ -81,7 +81,15 @@ final class TBDisplaySenderStatusItemController: NSObject {
         // app was doing everything right and the icon was still absent through a
         // reinstall, a defaults reset, a SystemUIServer restart and a logout.
         // A fixed width cannot collapse.
-        let item = NSStatusBar.system.statusItem(withLength: 30)
+        // variableLength, but never allowed to reach zero.
+        //
+        // Plain variableLength sizes from the button's content and was measured
+        // collapsing to nothing -- the item landed at 0,-6, the bottom-left
+        // corner, while reporting placed=true and visible=true. A hard 30pt fixed
+        // that but then CLIPPED the frame rate: the glyph fits, "60 " does not.
+        // So: size to content, and enforce a floor in applyStatusAppearance once
+        // the content is known.
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.toolTip = TBDisplaySenderL10n.topBarToolTip(service.language)
 
         // Assign one menu instance for the lifetime of the status item and
@@ -200,6 +208,11 @@ final class TBDisplaySenderStatusItemController: NSObject {
         // drawable content, and forcing .imageOnly here would blank the item.
         button.contentTintColor = nil
         button.toolTip = TBDisplaySenderL10n.topBarToolTip(service.language)
+
+        // The floor. Ask the button what it needs, then never accept less than
+        // the glyph's own width -- a zero here is what put the item off-screen.
+        let needed = button.intrinsicContentSize.width
+        statusItem?.length = needed.isFinite && needed > 24 ? needed : 30
 
     }
 
