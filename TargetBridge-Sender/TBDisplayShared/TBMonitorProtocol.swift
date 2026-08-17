@@ -238,7 +238,50 @@ enum TBMonitorProtocol {
         mutable[2] = UInt8((framed >>  8) & 0xFF)
         mutable[3] = UInt8( framed        & 0xFF)
         mutable[4] = type.rawValue
-        return Data(bytes: base, count: totalCount)
+        // MEASURED: this copy is the candidate for the sender's unexplained CPU.
+        //
+        // Encode is already on the GPU and the instrumented stages total ~2ms a
+        // frame, yet the process burns ~64% CPU with three quarters of it in user
+        // time -- so the cost is outside the timed stages. At 5K lossless this
+        // copies the whole encoded frame (~15-30MB) per frame, ~4 slices, 60fps:
+        // on the order of 1-2 GB/s of memcpy plus an allocation per slice.
+        //
+        // The copy is not gratuitous: the GPU encoder recycles the band slot the
+        // moment the callback returns, so the bytes must be taken before then.
+        // Removing it needs a refcounted buffer pool, which is only worth the risk
+        // if this is actually expensive. Hence the timer rather than a rewrite.
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        let out = Data(bytes: base, count: totalCount)
+        TBPacketCopyStats.note(nanos: DispatchTime.now().uptimeNanoseconds - t0,
+                               bytes: totalCount)
+        return out
+    }
+
+    /// Running cost of the packet copy, reported once a second alongside the
+    /// other stage timings so it can be compared against them directly.
+    enum TBPacketCopyStats {
+        private static let lock = NSLock()
+        nonisolated(unsafe) private static var nanos: UInt64 = 0
+        nonisolated(unsafe) private static var bytes: Int = 0
+        nonisolated(unsafe) private static var calls: Int = 0
+        nonisolated(unsafe) private static var lastReport: UInt64 = 0
+
+        static func note(nanos n: UInt64, bytes b: Int) {
+            lock.lock()
+            nanos += n; bytes += b; calls += 1
+            let now = DispatchTime.now().uptimeNanoseconds
+            if lastReport == 0 { lastReport = now }
+            let elapsed = now - lastReport
+            guard elapsed >= 1_000_000_000 else { lock.unlock(); return }
+            let ms = Double(nanos) / 1_000_000.0
+            let mb = Double(bytes) / 1_048_576.0
+            let pct = Double(nanos) / Double(elapsed) * 100.0
+            let n = calls
+            nanos = 0; bytes = 0; calls = 0; lastReport = now
+            lock.unlock()
+            TBLog.connection.info("packet copy: \(String(format: "%.1f", ms), privacy: .public) ms/s (\(String(format: "%.1f", pct), privacy: .public)% of one core) | \(String(format: "%.0f", mb), privacy: .public) MB/s | \(n, privacy: .public) copies")
+            TBReceiverLogSink.shared.note("packet copy: \(String(format: "%.1f", ms)) ms/s (\(String(format: "%.1f", pct))% of one core) | \(String(format: "%.0f", mb)) MB/s | \(n) copies")
+        }
     }
 
     /// Bytes of the TBD2 slice header, between the packet header and the blob.
