@@ -1352,6 +1352,16 @@ private final class TBVideoPipeline: @unchecked Sendable {
             if nextSendHostTime < now { nextSendHostTime = now + period }
         }
 
+        // Everything past the decimation gate, timed as one region.
+        //
+        // The capture callback measured 1.5% and the discarded frames 0.0% -- the
+        // throttle returns before doing work, exactly as its comment claims. So the
+        // sender's ~64% is spent on the ~60 frames a second that DO pass this point:
+        // texture wrap, GPU encode submit, packet build, socket write. Timing the
+        // whole region says how much of the process is this path at all, which is
+        // what two killed hypotheses (the packet copy, wasted captures) did not.
+        let tPass = DispatchTime.now().uptimeNanoseconds
+        defer { TBCaptureCostStats.notePassed(nanos: DispatchTime.now().uptimeNanoseconds - tPass) }
         let frameEnteredAt = Self.hostNow()
         let planar = CVPixelBufferGetPlaneCount(pixelBuffer) >= 2
 
@@ -2441,8 +2451,25 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return
             }
             guard type == .screen else { return }
-            guard Self.shouldProcessFrame(sampleBuffer) else { return }
+            // Split the callback into "frames we threw away" and "frames we kept".
+            //
+            // 179 of every 240 deliveries are rejected by the throttle, but
+            // ScreenCaptureKit has already done its work by the time we see them:
+            // the IOSurface exists, the CMSampleBuffer is built, the callback is
+            // dispatched. If that delivery cost is significant then raising
+            // TBVirtualRefresh buys nothing and the throttle is paying for frames
+            // it never uses. If it is trivial, the cost is in onFrame and the
+            // encode path. Measured separately, because a single timer over the
+            // whole callback cannot tell those apart.
+            let tCB = DispatchTime.now().uptimeNanoseconds
+            guard Self.shouldProcessFrame(sampleBuffer) else {
+                TBCaptureCostStats.noteRejected(
+                    nanos: DispatchTime.now().uptimeNanoseconds - tCB)
+                return
+            }
             onFrame?(sampleBuffer)
+            TBCaptureCostStats.noteKept(
+                nanos: DispatchTime.now().uptimeNanoseconds - tCB)
         }
 
         nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
