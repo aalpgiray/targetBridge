@@ -2704,6 +2704,10 @@ int main(int argc, char **argv) {
     /* Vitals for the machine nobody is sitting at. Its stderr is shipped to the
      * sender, so this lands next to the sender's own telemetry. */
     tb_health_start();
+    /* Before anything renders: keeps the loop running when the user switches to
+     * another app on this Mac. Without it the loop is suspended and the receiver
+     * appears to freeze on return. */
+    tb_health_hold_awake();
 
     {
         const char *pace = getenv("TB_PACE");

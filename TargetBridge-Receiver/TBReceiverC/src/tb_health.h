@@ -50,6 +50,20 @@ extern "C" {
  * costs nothing to put it somewhere it cannot matter. */
 void tb_health_start(void);
 
+/* Hold off App Nap and other background throttling for the whole process.
+ *
+ * A display receiver is doing user-initiated work even when it is not the front
+ * app: the picture must keep arriving while the user clicks something else on
+ * this Mac. Without this, macOS suspends the render loop the moment the app goes
+ * to the background -- measured at 92% of a 23-second window spent outside the
+ * loop, cursor latency 18 SECONDS against a normal 4ms, the video queue filling
+ * to 20/24 with 3600 dropped frames, and Metal left holding surfaces that were
+ * never returned. From the user's side the receiver simply freezes on return and
+ * only a relaunch clears it.
+ *
+ * Safe to call more than once; the assertion is held until the process exits. */
+void tb_health_hold_awake(void);
+
 /* Per-stage CPU accounting for the receive path.
  *
  * "63% of a core" is an aggregate, and an aggregate has never once been enough

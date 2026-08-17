@@ -185,6 +185,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>CFBundleExecutable</key><string>TBReceiver</string>
 	<key>CFBundleIdentifier</key><string>com.targetbridge.receiver</string>
 	<key>CFBundleName</key><string>TargetBridge Receiver</string>
+	<!-- Belt and braces with tb_health_hold_awake(): the runtime assertion is
+	     the real mechanism, but this covers the window before it is called and
+	     any path that resets the activity. A live display must not be napped. -->
+	<key>NSAppSleepDisabled</key><true/>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>$VERSION</string>
 	<key>CFBundleVersion</key><string>$VERSION</string>

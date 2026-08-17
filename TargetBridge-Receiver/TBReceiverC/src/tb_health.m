@@ -244,6 +244,21 @@ static void *tb_health_main(void *unused) {
     return NULL;
 }
 
+void tb_health_hold_awake(void) {
+    static id<NSObject> activity = nil;
+    if (activity) return;
+    /* userInitiated: this is work the user asked for and is waiting on.
+     * latencyCritical: the frame cadence is the product -- timer coalescing and
+     * CPU throttling are exactly what must not happen here. */
+    activity = [[NSProcessInfo processInfo]
+        beginActivityWithOptions:(NSActivityUserInitiated |
+                                  NSActivityLatencyCritical)
+                          reason:@"TargetBridge is presenting a live display"];
+    /* No explicit retain: ARC keeps the static strong reference alive, and the
+     * assertion lasts as long as the object does -- i.e. the whole process. */
+    fprintf(stderr, "[health] holding off App Nap (userInitiated|latencyCritical)\n");
+}
+
 void tb_health_start(void) {
     static pthread_t thread;
     static int started = 0;
