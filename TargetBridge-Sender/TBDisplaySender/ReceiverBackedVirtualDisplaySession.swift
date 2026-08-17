@@ -90,6 +90,25 @@ final class ReceiverBackedVirtualDisplaySession {
         //   defaults write com.targetbridge.sender TBVirtualRefresh -float 120
         // Anything <= 0 (the default) keeps the receiver's own rate.
         //
+        // OVERSAMPLING IS NOT WORTH IT. Measured with powermetrics on the real
+        // link, same content, 5K lossless at a locked 60 fps out:
+        //
+        //            240 Hz in     60 Hz in
+        //   CPU       2342 mW      1522 mW   (-35%)
+        //   GPU       3945 mW      1688 mW   (-57%)
+        //   combined  6287 mW      3210 mW   (-49%)
+        //
+        // Half the machine's power for at most a few milliseconds of extra
+        // freshness on the frame the slot schedule happens to pick. Leave this
+        // unset unless you are chasing a specific judder problem.
+        //
+        // Why the sender's own timers missed it: the capture callback reported
+        // `rejected 0.0%` for the ~180 frames a second the throttle discards, and
+        // that is true -- discarding is free ON THE CPU, in this process. The cost
+        // is the compositor and the texture path producing those frames at all,
+        // which lives in WindowServer and the GPU. No timer inside this app can
+        // see it; powermetrics can.
+        //
         // CGVirtualDisplay may simply refuse a mode it does not like, which
         // shows up as the display coming back at its old rate — check the log
         // line below rather than assuming it took.
