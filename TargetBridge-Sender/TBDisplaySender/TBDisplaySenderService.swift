@@ -720,6 +720,26 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// A latency win that costs usability is not a win. N=4 comes back when the
     /// async encode has bought the headroom back and the degradation is
     /// diagnosed. `TBSliceCount -int 4` to try it.
+    ///
+    /// SETTLED 2026-08-17: slicing is a NET LOSS on this link, and N=1 is right.
+    /// Measured end to end -- first byte off the socket to frame on the compositor,
+    /// same receiver build, same measurement point on both the sliced and unsliced
+    /// paths:
+    ///
+    ///          latency avg   worst
+    ///   N=1      2.98 ms    7.71 ms
+    ///   N=8      5.19 ms   13.95 ms
+    ///
+    /// 74% worse on average, near 2x at the tail. The flow-shop model that
+    /// predicted ~11.8 ms recoverable assumed transmission dominates encode; this
+    /// link is the opposite. A whole 5K frame crosses Thunderbolt in ~3 ms, so
+    /// there is nothing to overlap against, while 8 slices cost 16 GPU round trips
+    /// per frame instead of 2 (~0.26 ms each).
+    ///
+    /// This also explains why N=4 and N=8 were reverted twice for "reasons not yet
+    /// diagnosed": they were simply slower, and no instrument measured it. The
+    /// receiver now reports `[latency] frame recv->present`, so the next person can
+    /// check in one minute rather than reasoning from a model.
     var dpcmSliceCount = max(1, (UserDefaults.standard.object(forKey: "TBSliceCount") as? Int) ?? 1)
     private var dpcmFrameID: UInt32 = 0
     /// Encoding runs on the GPU. The reference C encoder costs ~118 ms/frame at

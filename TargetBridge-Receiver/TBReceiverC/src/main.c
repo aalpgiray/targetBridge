@@ -160,6 +160,10 @@ struct app {
         const uint8_t *payload;   /* points into buf */
         size_t         len;
         uint8_t        type;      /* RAW_FRAME, RAW_DPCM[_SLICE] */
+        /* When this packet came off the socket. The frame path bypasses
+         * on_packet, so g_pkt_recv_ms is never set for it -- without carrying the
+         * stamp here, a recv->present measurement silently measures nothing. */
+        double         recv_ms;
     }                vq[TB_VIDEO_QUEUE];
     int              vq_head;
     int              vq_count;
@@ -195,6 +199,12 @@ struct app {
      * previous frame's pixels in that strip — which looks exactly like a glitch,
      * so it has to be measured rather than assumed. */
     uint32_t         dpcm_got_mask;
+    /* Frame assembly latency, reported with the [slices] line once a second. */
+    double           dpcm_frame_first_band_ms;
+    double           dpcm_asm_ms_sum;
+    double           dpcm_asm_ms_max;
+    uint32_t         dpcm_asm_n;
+    uint32_t         frame_lat_last_report;
     uint32_t         dpcm_frames_total;
     uint32_t         dpcm_frames_short;
     uint32_t         dpcm_bands_lost;
@@ -1144,11 +1154,47 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
  * tb_dpcm_parse, which checks every declared length against the actual one and
  * re-derives the offset table from the width plane. That check is what allows
  * the decode kernel to run with no bounds tests at all. */
+/* Declared here: both frame handlers below time presentation with it. */
+static double now_ms_f(void);
+static double g_pkt_recv_ms;
+
+/* Frame latency: first byte of this frame off the socket -> frame presented.
+ *
+ * Called from BOTH the sliced and the unsliced handler with the same clock and
+ * the same start point (the reader thread's receive stamp), which is the only way
+ * to compare N=1 against N>1. The first version of this lived inside the sliced
+ * path only and therefore could not measure the thing it was built to compare.
+ *
+ * Excludes capture, encode and the network hop on purpose: the sender's clock is
+ * on another machine and unsynchronised, so including them would report skew. */
+static void tb_note_frame_latency(struct app *a, double first_byte_ms) {
+    if (first_byte_ms <= 0.0) return;
+    const double span = now_ms_f() - first_byte_ms;
+    /* A negative or absurd span means the start stamp was not this frame's. */
+    if (span < 0.0 || span > 200.0) return;
+    a->dpcm_asm_ms_sum += span;
+    if (span > a->dpcm_asm_ms_max) a->dpcm_asm_ms_max = span;
+    a->dpcm_asm_n++;
+
+    /* Reported from HERE, not from the [slices] line, because [slices] only fires
+     * on the sliced packet path -- so at TBSliceCount=1 the number the whole
+     * exercise exists to compare would never print. Both handlers reach this. */
+    const uint32_t now_s = SDL_GetTicks() / 1000;
+    if (now_s != a->frame_lat_last_report && a->dpcm_asm_n >= 30) {
+        a->frame_lat_last_report = now_s;
+        fprintf(stderr, "[latency] frame recv->present %.2f avg / %.2f worst ms | n=%u\n",
+                a->dpcm_asm_ms_sum / a->dpcm_asm_n, a->dpcm_asm_ms_max, a->dpcm_asm_n);
+        a->dpcm_asm_ms_sum = a->dpcm_asm_ms_max = 0.0; a->dpcm_asm_n = 0;
+    }
+}
+
 static void handle_raw_dpcm(struct app *a, const uint8_t *payload, size_t len) {
+    const double first_byte = g_pkt_recv_ms;
     if (tb_disp_render_dpcm(a->disp, payload, len) != 0) {
         a->frames_dropped++;
         return;
     }
+    tb_note_frame_latency(a, first_byte);
     a->have_video_frame = 1;
     tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
     a->frames++;
@@ -1192,6 +1238,17 @@ static void handle_raw_dpcm_slice(struct app *a, const uint8_t *p, size_t len) {
         a->dpcm_frame_id = frame_id;
     }
 
+    /* Frame assembly latency: first band off the socket -> frame on the
+     * compositor.
+     *
+     * This is the half slicing exists to shrink, and the only half we can honestly
+     * measure: the sender's clock is on another machine and unsynchronised, so a
+     * capture->display figure would report clock skew as much as latency. With
+     * N bands the upload of band 0 overlaps the arrival of band 1..N-1, so this
+     * number should FALL as N rises -- if it does not, slicing is not buying what
+     * it costs (encode grows ~0.26ms per slice, two GPU round trips each). */
+    if (index == 0) a->dpcm_frame_first_band_ms = g_pkt_recv_ms > 0.0 ? g_pkt_recv_ms : now_ms_f();
+
     const int is_last = (index + 1 == count);
     if (tb_disp_render_dpcm_slice(a->disp, p + TB_DPCM_SLICE_HEADER,
                                   len - TB_DPCM_SLICE_HEADER,
@@ -1204,6 +1261,8 @@ static void handle_raw_dpcm_slice(struct app *a, const uint8_t *p, size_t len) {
     }
 
     if (is_last) {
+        tb_note_frame_latency(a, a->dpcm_frame_first_band_ms);
+        a->dpcm_frame_first_band_ms = 0.0;
         const uint32_t want = (count >= 32) ? 0xFFFFFFFFu : ((1u << count) - 1u);
         const uint32_t got  = a->dpcm_got_mask;
         a->dpcm_frames_total++;
@@ -1321,10 +1380,8 @@ static void tb_set_system_volume(double level) {
  * on_packet is a parser callback with a fixed signature, so this cannot be an
  * argument. Set by the queue drain, where a packet CAN have waited; left at 0 on
  * the direct parser path, where it cannot have, and read as "now" there. */
-static double g_pkt_recv_ms = 0.0;
 
 /* Defined further down; needed here for the direct-parser path's "now". */
-static double now_ms_f(void);
 
 static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud) {
     struct app *a = (struct app *)ud;
@@ -2320,6 +2377,7 @@ static void *link_reader_main(void *ud) {
                         } else {
                             struct tb_video_slot *slot =
                                 &a->vq[(a->vq_head + a->vq_count) % TB_VIDEO_QUEUE];
+                            slot->recv_ms = now_ms_f();
                             slot->buf     = held;
                             slot->cap     = held_cap;
                             slot->payload = r->pending_payload;
@@ -2520,6 +2578,7 @@ static int pump_network(struct app *a) {
         pthread_mutex_lock(&a->net_lock);
         if (a->vq_count > 0) {
             struct tb_video_slot *slot = &a->vq[a->vq_head];
+            g_pkt_recv_ms = slot->recv_ms;
             owned     = slot->buf;
             owned_cap = slot->cap;
             payload   = slot->payload;
