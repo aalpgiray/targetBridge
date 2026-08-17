@@ -103,7 +103,12 @@ final class TBCapturePresetTests: XCTestCase {
     /// deliberate act rather than a side effect.
     func testLosslessWireTypesKeepTheirNumbers() {
         XCTAssertEqual(TBMonitorPacketType.rawDPCM.rawValue, 0x25)
-        XCTAssertEqual(TBMonitorPacketType.rawDPCMSlice.rawValue, 0x26)
         XCTAssertEqual(TBMonitorPacketType.rawFrame.rawValue, 0x22)
+        // 0x26 rawDPCMSlice is retired, like 0x27 before it. Slicing was measured
+        // on the real link and lost: N=1 2.98ms vs N=8 5.19ms recv->present, so it
+        // paid GPU round trips for transmission overlap this wire does not have.
+        // Asserting the number stays UNUSED, so a future packet cannot quietly
+        // reuse it and disagree with a receiver built before the removal.
+        XCTAssertNil(TBMonitorPacketType(rawValue: 0x26), "0x26 rawDPCMSlice is retired")
     }
 }

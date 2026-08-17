@@ -28,7 +28,6 @@ enum TBMonitorPacketType: UInt8 {
     /// slowest stage, so everything else hides behind it and frame latency
     /// roughly halves. Free in bytes: tiles were already independent, so a band
     /// encodes to exactly what the same rows cost inside a whole frame.
-    case rawDPCMSlice = 0x26
     case heartbeat = 0x30
     case teardown = 0x31
     case cursor = 0x32
@@ -116,7 +115,6 @@ struct TBMonitorDisplayProfile: Codable {
     var supportsDPCM: Bool?
     /// Whether the receiver can place a band at a row offset and present only on
     /// the last one. Absent means whole frames only.
-    var supportsDPCMSlices: Bool?
     /// Whether the receiver can place a region by column as well as row, i.e.
     /// accept damage rects. Absent means no, which is also what an older
     /// receiver says by saying nothing.
@@ -284,39 +282,6 @@ enum TBMonitorProtocol {
         }
     }
 
-    /// Bytes of the TBD2 slice header, between the packet header and the blob.
-    static let sliceHeaderSize = 28
-
-    /// Write the slice header into space the encoder reserved ahead of the blob,
-    /// then frame the whole thing. `base` points at the packet header, so the
-    /// slice header follows it and the blob follows that — one contiguous buffer,
-    /// one copy.
-    static func framedSlicePacket(base: UnsafePointer<UInt8>,
-                                  totalCount: Int,
-                                  captureTimeNanos: UInt64,
-                                  frameID: UInt32,
-                                  frameW: UInt32, frameH: UInt32,
-                                  y0: UInt32,
-                                  index: UInt16, count: UInt16) -> Data {
-        let p = UnsafeMutablePointer(mutating: base) + headerSize
-        var o = 0
-        func put32(_ v: UInt32) {
-            p[o] = UInt8((v >> 24) & 0xFF); p[o+1] = UInt8((v >> 16) & 0xFF)
-            p[o+2] = UInt8((v >> 8) & 0xFF); p[o+3] = UInt8(v & 0xFF); o += 4
-        }
-        func put16(_ v: UInt16) {
-            p[o] = UInt8((v >> 8) & 0xFF); p[o+1] = UInt8(v & 0xFF); o += 2
-        }
-        put32(UInt32(truncatingIfNeeded: captureTimeNanos >> 32))
-        put32(UInt32(truncatingIfNeeded: captureTimeNanos))
-        put32(frameID)
-        put32(frameW)
-        put32(frameH)
-        put32(y0)
-        put16(index)
-        put16(count)
-        return framedPacket(type: .rawDPCMSlice, base: base, totalCount: totalCount)
-    }
     static func makePacket(type: TBMonitorPacketType, payload: Data) -> Data {
         var packet = Data()
         appendBE32(&packet, UInt32(1 + payload.count))

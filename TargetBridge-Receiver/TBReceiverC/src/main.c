@@ -193,22 +193,15 @@ struct app {
     int              pace_enabled;
     uint32_t         connecting_since;/* when this client last had no video */
     uint32_t         dpcm_frame_id;   /* frame currently being assembled from slices */
-    int              dpcm_seq_warned;
     /* Which bands of the current frame actually decoded. A frame presents on its
      * last band whether or not the others arrived, and a missing band leaves the
      * previous frame's pixels in that strip — which looks exactly like a glitch,
      * so it has to be measured rather than assumed. */
-    uint32_t         dpcm_got_mask;
     /* Frame assembly latency, reported with the [slices] line once a second. */
-    double           dpcm_frame_first_band_ms;
     double           dpcm_asm_ms_sum;
     double           dpcm_asm_ms_max;
     uint32_t         dpcm_asm_n;
     uint32_t         frame_lat_last_report;
-    uint32_t         dpcm_frames_total;
-    uint32_t         dpcm_frames_short;
-    uint32_t         dpcm_bands_lost;
-    uint32_t         dpcm_last_report;
     uint64_t         frames_dropped;
 
     /* Recycled buffers handed back to readers so nothing allocates (or
@@ -1206,103 +1199,6 @@ static inline uint32_t be32(const uint8_t *p) {
          | ((uint32_t)p[2] <<  8) | (uint32_t)p[3];
 }
 
-/* TB_PKT_RAW_DPCM_SLICE — one band of a frame. See proto.h for the header.
- *
- * Bands are decoded as they arrive and only the last presents, so the GPU works
- * on band k while band k+1 is still on the wire. Every field is checked here
- * because the blob's own validation covers the blob, not the placement: a band
- * claiming the wrong y0 would be written to the wrong rows and still look like a
- * picture. */
-
-static void handle_raw_dpcm_slice(struct app *a, const uint8_t *p, size_t len) {
-    if (len < TB_DPCM_SLICE_HEADER) { a->frames_dropped++; return; }
-
-    const uint32_t frame_id = be32(p + 8);
-    const uint32_t frame_w  = be32(p + 12);
-    const uint32_t frame_h  = be32(p + 16);
-    const uint32_t y0       = be32(p + 20);
-    const uint16_t index    = (uint16_t)((p[24] << 8) | p[25]);
-    const uint16_t count    = (uint16_t)((p[26] << 8) | p[27]);
-
-    if (count == 0 || index >= count) { a->frames_dropped++; return; }
-    if (frame_w == 0 || frame_h == 0 || frame_w > 16384 || frame_h > 16384) { a->frames_dropped++; return; }
-    if (y0 >= frame_h) { a->frames_dropped++; return; }
-
-    /* TCP delivers in order, so out-of-sequence means a genuine break — a
-     * reconnect, or a sender bug. Log once rather than per frame. */
-    if (frame_id != a->dpcm_frame_id) {
-        if (index != 0 && !a->dpcm_seq_warned) {
-            a->dpcm_seq_warned = 1;
-            fprintf(stderr, "[dpcm] frame %u started at slice %u of %u\n", frame_id, index, count);
-        }
-        a->dpcm_frame_id = frame_id;
-    }
-
-    /* Frame assembly latency: first band off the socket -> frame on the
-     * compositor.
-     *
-     * This is the half slicing exists to shrink, and the only half we can honestly
-     * measure: the sender's clock is on another machine and unsynchronised, so a
-     * capture->display figure would report clock skew as much as latency. With
-     * N bands the upload of band 0 overlaps the arrival of band 1..N-1, so this
-     * number should FALL as N rises -- if it does not, slicing is not buying what
-     * it costs (encode grows ~0.26ms per slice, two GPU round trips each). */
-    if (index == 0) a->dpcm_frame_first_band_ms = g_pkt_recv_ms > 0.0 ? g_pkt_recv_ms : now_ms_f();
-
-    const int is_last = (index + 1 == count);
-    if (tb_disp_render_dpcm_slice(a->disp, p + TB_DPCM_SLICE_HEADER,
-                                  len - TB_DPCM_SLICE_HEADER,
-                                  (int)frame_w, (int)frame_h, 0, (int)y0, is_last) != 0) {
-        a->frames_dropped++;
-        /* Fall through: the frame still presents on its last band, so a lost
-         * band must be counted, not silently forgotten. */
-    } else if (index < 32) {
-        a->dpcm_got_mask |= (1u << index);
-    }
-
-    if (is_last) {
-        tb_note_frame_latency(a, a->dpcm_frame_first_band_ms);
-        a->dpcm_frame_first_band_ms = 0.0;
-        const uint32_t want = (count >= 32) ? 0xFFFFFFFFu : ((1u << count) - 1u);
-        const uint32_t got  = a->dpcm_got_mask;
-        a->dpcm_frames_total++;
-        if ((got & want) != want) {
-            a->dpcm_frames_short++;
-            for (int b = 0; b < count && b < 32; ++b)
-                if (!(got & (1u << b))) a->dpcm_bands_lost++;
-        }
-        a->dpcm_got_mask = 0;
-
-        const uint32_t now_s = SDL_GetTicks() / 1000;
-        if (now_s != a->dpcm_last_report && a->dpcm_frames_total >= 30) {
-            a->dpcm_last_report = now_s;
-            /* queue depth and overflow say whether the reader is getting ahead
-             * of the renderer — the condition that used to wedge the session. */
-            pthread_mutex_lock(&a->net_lock);
-            const int qd = a->vq_count;
-            const uint64_t qo = a->vq_overflow;
-            a->vq_overflow = 0;
-            pthread_mutex_unlock(&a->net_lock);
-            fprintf(stderr,
-                    "[slices] %u frames, %u incomplete (%.1f%%), %u bands lost | queue %d/%d, %llu overflow\n",
-                    a->dpcm_frames_total, a->dpcm_frames_short,
-                    100.0 * a->dpcm_frames_short / a->dpcm_frames_total,
-                    a->dpcm_bands_lost, qd, TB_VIDEO_QUEUE,
-                    (unsigned long long)qo);
-            a->dpcm_frames_total = a->dpcm_frames_short = a->dpcm_bands_lost = 0;
-        }
-    }
-    /* Set before the last-band gate: the main loop uses this to decide whether
-     * the stream is live, and a frame mid-assembly is very much live. */
-    a->have_video_frame = 1;
-
-    if (!is_last) return;
-
-    tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
-    a->frames++;
-}
-
-
 static void ring_read(struct app *a, Uint8 *dst, int len) {
     int first = AUDIO_BUF_CAP - a->audio_buf_tail;
     if (first >= len) {
@@ -1468,9 +1364,6 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         break;
     case TB_PKT_RAW_DPCM:
         handle_raw_dpcm(a, payload, len);
-        break;
-    case TB_PKT_RAW_DPCM_SLICE:
-        handle_raw_dpcm_slice(a, payload, len);
         break;
     case TB_PKT_CURSOR:
         /* Latency of the half we own: off the socket to on the compositor,
@@ -2209,7 +2102,7 @@ static void send_receiver_info(struct app *a) {
         "{\"receiverName\":\"%s\",\"panelWidth\":%u,\"panelHeight\":%u,"
         "\"modeWidth\":%u,\"modeHeight\":%u,\"refreshRate\":60,"
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
-        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsFloat32Audio\":true,\"supportsDPCM\":%s,\"supportsDPCMSlices\":%s,\"supportsDPCMRects\":%s,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s,"
+        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsFloat32Audio\":true,\"supportsDPCM\":%s,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s,"
         "\"supportsNightShift\":%s,\"supportsTrueTone\":%s}",
         escaped_name,
         panel_w,
@@ -2219,10 +2112,6 @@ static void send_receiver_info(struct app *a) {
         capture_w,
         capture_h,
         tb_dec_supports_hevc_hwdecode() ? "true" : "false",
-        tb_disp_supports_dpcm() ? "true" : "false",
-        tb_disp_supports_dpcm() ? "true" : "false",
-        /* Rects need exactly what slices need — the same GPU decoder placing a
-         * region at an offset — so they ride on the same capability. */
         tb_disp_supports_dpcm() ? "true" : "false",
         tb_receiver_input_monitoring_trusted() ? "true" : "false",
         tb_receiver_accessibility_trusted() ? "true" : "false",
@@ -2257,7 +2146,7 @@ static void reader_on_packet(uint8_t type, const uint8_t *payload, size_t len, v
     struct app *a = r->app;
 
     if (type == TB_PKT_RAW_FRAME ||
-        type == TB_PKT_RAW_DPCM || type == TB_PKT_RAW_DPCM_SLICE) {
+        type == TB_PKT_RAW_DPCM) {
         /* Keep this packet without copying it: ask the parser to yield its
          * buffer. The `payload` pointer stays valid inside that buffer, which
          * the reader loop collects and publishes right after commit returns. */
@@ -2343,7 +2232,7 @@ static void *link_reader_main(void *ud) {
                         // A whole frame supersedes anything queued; a BAND is an
                         // increment, and discarding one loses those pixels for good.
                         const int is_increment =
-                            (r->pending_type == TB_PKT_RAW_DPCM_SLICE);
+                            0;   /* slicing removed: no partial-frame gate */
 
                         if (!is_increment) {
                             while (a->vq_count > 0) {
@@ -2542,8 +2431,7 @@ static int pump_network(struct app *a) {
             pthread_mutex_lock(&a->net_lock);
             const int depth = a->vq_count;
             const struct tb_video_slot *head = depth > 0 ? &a->vq[a->vq_head] : NULL;
-            const int gate = head && head->type == TB_PKT_RAW_DPCM_SLICE &&
-                             head->len >= TB_DPCM_SLICE_HEADER && depth <= 2;
+            const int gate = 0;   /* slicing removed */
             uint64_t capture_ns = 0;
             int is_last = 0;
             if (gate) {
@@ -2595,7 +2483,6 @@ static int pump_network(struct app *a) {
          * the fullscreen gate never opens. */
         a->session_active = 1;
         if (ptype == TB_PKT_RAW_DPCM)           handle_raw_dpcm(a, payload, plen);
-        else if (ptype == TB_PKT_RAW_DPCM_SLICE) handle_raw_dpcm_slice(a, payload, plen);
         else                              handle_raw_frame(a, payload, plen);
         worked = 1;
 

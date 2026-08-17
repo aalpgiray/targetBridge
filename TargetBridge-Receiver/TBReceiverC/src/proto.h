@@ -85,10 +85,7 @@
  * byte-for-byte identical to a whole-frame encode at every slice count tried,
  * both depths, and the reassembled pixels are bit-identical.
  *
- * Sent only to a receiver advertising "supportsDPCMSlices". A receiver that
  * understands 0x25 but not this keeps getting whole frames. */
-#define TB_PKT_RAW_DPCM_SLICE   0x26
-#define TB_DPCM_SLICE_HEADER    28
 
 #define TB_PKT_HEARTBEAT        0x30
 #define TB_PKT_TEARDOWN         0x31

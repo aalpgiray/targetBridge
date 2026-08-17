@@ -525,10 +525,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// inside a 60 Hz period, and the receiver decodes into VRAM where there is
     /// no CPU-side image for a rectangle to patch.
     var dpcmEnabled = false
-    /// Whether the receiver can place bands at a row offset. Slices are only
-    /// worth sending to a receiver that can overlap them; one that cannot keeps
-    /// getting whole frames.
-    var dpcmSlicesEnabled = false
 
     /// Cap on frames actually sent, independent of how fast we capture.
     ///
@@ -697,50 +693,21 @@ private final class TBVideoPipeline: @unchecked Sendable {
             + " -> shift \(String(format: "%.2f", step * 1000.0))ms"
             + " (step \(phaseStepsApplied)/\(Self.phaseMaxSteps))")
     }
-    /// Bands per frame. 18 or 20 measured best on this hardware: encode grows
-    /// ~0.26 ms per slice (two GPU round trips each), so past ~20 it overtakes the
-    /// wire and becomes the slowest stage, and the makespan turns back up.
-    /// Must divide the frame into whole 8-row tiles.
-    /// `defaults write com.targetbridge.sender TBSliceCount -int 18` to try it,
-    /// 1 to go back. A runtime knob rather than a constant because the gain is a
-    /// model prediction until it is measured on the link, and because a bad value
-    /// should be one command to undo rather than a reinstall.
-    /// 4, measured 2026-08-06: zero incomplete frames over long runs, full rate,
-    /// and ~9 ms of the ~11.8 ms the flow-shop model says slicing can recover —
-    /// 79% of the win. 8 and 18 degrade on this receiver for reasons not yet
-    /// diagnosed, so 4 is the value that is actually known to work rather than
-    /// the one the model prefers. `defaults write com.targetbridge.sender
-    /// TBSliceCount -int 1` returns to whole frames.
-    /// Back to 1 on 2026-08-06. N=4 measures clean — zero incomplete frames over
-    /// long runs — and is worth ~9 ms, but in real use it still shows visible
-    /// glitches and the frame rate degrades until the sender is restarted, and
-    /// neither is understood yet. `process` also goes from 9.2 ms to 15-17,
-    /// leaving almost nothing spare in a 16.7 ms budget.
+    /// Slicing was removed on 2026-08-17 after it was finally measured.
     ///
-    /// A latency win that costs usability is not a win. N=4 comes back when the
-    /// async encode has bought the headroom back and the degradation is
-    /// diagnosed. `TBSliceCount -int 4` to try it.
-    ///
-    /// SETTLED 2026-08-17: slicing is a NET LOSS on this link, and N=1 is right.
-    /// Measured end to end -- first byte off the socket to frame on the compositor,
-    /// same receiver build, same measurement point on both the sliced and unsliced
-    /// paths:
-    ///
-    ///          latency avg   worst
-    ///   N=1      2.98 ms    7.71 ms
-    ///   N=8      5.19 ms   13.95 ms
+    /// The receiver reports `[latency] frame recv->present`, and with it:
+    ///   N=1  2.98 ms avg /  7.71 ms worst
+    ///   N=8  5.19 ms avg / 13.95 ms worst
     ///
     /// 74% worse on average, near 2x at the tail. The flow-shop model that
     /// predicted ~11.8 ms recoverable assumed transmission dominates encode; this
-    /// link is the opposite. A whole 5K frame crosses Thunderbolt in ~3 ms, so
-    /// there is nothing to overlap against, while 8 slices cost 16 GPU round trips
-    /// per frame instead of 2 (~0.26 ms each).
+    /// link is the opposite -- a whole 5K frame crosses Thunderbolt in ~3 ms, so
+    /// band arrival has almost nothing to overlap against, while 8 slices cost 16
+    /// GPU round trips per frame instead of 2 (~0.26 ms each).
     ///
-    /// This also explains why N=4 and N=8 were reverted twice for "reasons not yet
-    /// diagnosed": they were simply slower, and no instrument measured it. The
-    /// receiver now reports `[latency] frame recv->present`, so the next person can
-    /// check in one minute rather than reasoning from a model.
-    var dpcmSliceCount = max(1, (UserDefaults.standard.object(forKey: "TBSliceCount") as? Int) ?? 1)
+    /// That also settles why N=4 and N=8 were reverted twice for "reasons not yet
+    /// diagnosed": they were slower, and nothing measured latency. The TBSliceCount
+    /// flag, the sliced wire type (0x26) and the receiver's reassembly are all gone.
     private var dpcmFrameID: UInt32 = 0
     /// Encoding runs on the GPU. The reference C encoder costs ~118 ms/frame at
     /// 5K single-threaded; this measures 5.7 ms, and more to the point it leaves
@@ -1267,7 +1234,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         let samples = latSamples
         let inflight = pendingCount()
         let budget = preset.maxPendingVideoPackets
-            * ((dpcmEnabled && dpcmSlicesEnabled) ? max(1, dpcmSliceCount) : 1)
+
 
         oversampleSkips = 0
         tbIdleFramesSeen = 0
@@ -1392,7 +1359,7 @@ private final class TBVideoPipeline: @unchecked Sendable {
         // permanently tripped and nearly every later frame was dropped before it
         // was even encoded. Scale the budget by the band count so the intent —
         // three frames, not three packets — survives.
-        let packetsPerFrame = (dpcmEnabled && dpcmSlicesEnabled) ? max(1, dpcmSliceCount) : 1
+        let packetsPerFrame = 1   // one whole frame per packet; slicing removed
         let inFlightBudget = preset.maxPendingVideoPackets * packetsPerFrame
         // Reserve the WHOLE frame, not one packet.
         //
@@ -1513,17 +1480,13 @@ private final class TBVideoPipeline: @unchecked Sendable {
                 // while band k+1 is still on the wire. N=1 is the whole-frame
                 // case and behaves exactly as before.
                 //
-                // Bands must be whole 8-row tiles, so the count has to divide the
-                // frame that way; anything else falls back to one band rather
-                // than silently sending a geometry the receiver will reject.
-                // Every frame is a whole frame, sent as bands.
-                let wantSlices = dpcmSlicesEnabled ? max(1, dpcmSliceCount) : 1
-                let bandRows = height / wantSlices
-                let sliceCount = (wantSlices > 1 && bandRows % Int(TB_DPCM_TILE) == 0
-                                  && bandRows * wantSlices == height) ? wantSlices : 1
-                let rowsPerBand = height / sliceCount
+                // One band per frame. Slicing was removed after measurement: it
+                // pays GPU round trips to buy transmission overlap that does not
+                // exist on this link. See the note on TBSliceCount's removal in
+                // git history -- N=1 2.98ms vs N=8 5.19ms, recv->present.
+                let sliceCount = 1
+                let rowsPerBand = height
                 let reserve = TBMonitorProtocol.headerSize
-                    + (sliceCount > 1 ? TBMonitorProtocol.sliceHeaderSize : 0)
 
                 dpcmFrameID &+= 1
                 let captureNanos = UInt64(max(0, CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds) * 1_000_000_000)
@@ -1552,8 +1515,6 @@ private final class TBVideoPipeline: @unchecked Sendable {
                     pixelBuffer: pixelBuffer,
                     captureNanos: captureNanos,
                     frameID: dpcmFrameID,
-                    sliceCount: sliceCount,
-                    rowsPerBand: rowsPerBand,
                     width: width,
                     height: height,
                     send: { [weak self] packet in
@@ -2307,7 +2268,6 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// older format instead of noise.
     private var receiverSupportsFloat32Audio = false
     private var receiverSupportsDPCM = false
-    private var receiverSupportsDPCMSlices = false
     private var activeProfile: TBMonitorDisplayProfile?
     private var activeCodecType: CMVideoCodecType?
     private var activeCodecName: String?
@@ -3727,10 +3687,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // value is stored and applied at construction; the optional assignment
         // covers a profile that turns up on an already-running pipeline.
         receiverSupportsDPCM = profile.supportsDPCM ?? false
-        receiverSupportsDPCMSlices = profile.supportsDPCMSlices ?? false
         pipeline?.dpcmEnabled = receiverSupportsDPCM
-        pipeline?.dpcmSlicesEnabled = receiverSupportsDPCMSlices
-        TBLog.connection.info("receiver caps: dpcm=\(self.receiverSupportsDPCM, privacy: .public) slices=\(self.receiverSupportsDPCMSlices, privacy: .public) float32Audio=\(self.receiverSupportsFloat32Audio, privacy: .public)")
+        TBLog.connection.info("receiver caps: dpcm=\(self.receiverSupportsDPCM, privacy: .public) float32Audio=\(self.receiverSupportsFloat32Audio, privacy: .public)")
         // The shipped-log file is a rolling record across sessions, so mark
         // where this one starts; without it a reader cannot tell one run's
         // output from the next.
@@ -3859,7 +3817,6 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 }
             )
             pipeline.dpcmEnabled = receiverSupportsDPCM
-            pipeline.dpcmSlicesEnabled = receiverSupportsDPCMSlices
             guard pipeline.start() else { return false }
             startAudioDeviceCaptureIfNeeded()
             self.pipeline = pipeline

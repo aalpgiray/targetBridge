@@ -66,10 +66,9 @@ want "sender async encode context"      1 "TBDPCMAsyncEncode"  TargetBridge-Send
 want "GPU decode on the receiver"       1 "render_dpcm_slice"  TargetBridge-Receiver/TBReceiverC/src
 # All three live in one file, so check each name rather than counting files.
 want "wire packet: whole frame"          1 "rawDPCM\b"          TargetBridge-Sender/TBDisplayShared
-want "wire packet: slice"                1 "rawDPCMSlice"       TargetBridge-Sender/TBDisplayShared
 want "wire packet: receiver log"         1 "receiverLog"        TargetBridge-Sender/TBDisplayShared
 want "wire packet: phase report"         1 "phaseReport"        TargetBridge-Sender/TBDisplayShared
-want "receiver packet handlers"         1 "RAW_DPCM_SLICE"     TargetBridge-Receiver/TBReceiverC/src
+want "receiver packet handlers"         1 "TB_PKT_RAW_DPCM"    TargetBridge-Receiver/TBReceiverC/src
 want "codec built into the receiver"    1 "tb_dpcm"            TargetBridge-Receiver/TBReceiverC/Makefile
 
 echo "== the settings that produced 60 fps ========================"
@@ -181,6 +180,16 @@ gone "profiles never re-apply themselves"  "restoreDisplayProfile"  TargetBridge
 # enough to make it resolve to the wrong screen -- showing the wrong monitor's
 # controls, or none at all -- and it hid the other monitors even when it worked.
 gone "menu never filters by its own screen" "sessionForMenuScreen" TargetBridge-Sender/TBDisplaySender
+
+# Slicing stays removed. Measured 2026-08-17, recv->present on the real link:
+# N=1 2.98ms avg / 7.71ms worst, N=8 5.19ms / 13.95ms -- 74% worse on average and
+# near 2x at the tail. The flow-shop model that motivated it assumed transmission
+# dominates encode; a 5K frame crosses Thunderbolt in ~3ms, so band arrival has
+# nothing to overlap against while 8 slices cost 16 GPU round trips instead of 2.
+# NOTE: tb_metal_plane_render_dpcm_slice is NOT slicing -- its x0/y0/is_last are
+# how the decoder places any region, and every frame goes through it.
+gone "sliced wire type stays retired"      "rawDPCMSlice\|RAW_DPCM_SLICE" TargetBridge-Sender/TBDisplayShared TargetBridge-Receiver/TBReceiverC/src
+gone "slice count flag stays removed"      "TBSliceCount -int\|dpcmSliceCount" TargetBridge-Sender/TBDisplaySender
 
 echo "== diagnostics =============================================="
 want "receiver log shipping"            1 "tb_logship"             TargetBridge-Receiver/TBReceiverC/src

@@ -26,8 +26,6 @@ final class TBDPCMFrameContext {
     let pixelBuffer: CVPixelBuffer
     let captureNanos: UInt64
     let frameID: UInt32
-    let sliceCount: Int
-    let rowsPerBand: Int
     let width: Int
     let height: Int
     let send: (Data) -> Void
@@ -43,8 +41,6 @@ final class TBDPCMFrameContext {
          pixelBuffer: CVPixelBuffer,
          captureNanos: UInt64,
          frameID: UInt32,
-         sliceCount: Int,
-         rowsPerBand: Int,
          width: Int,
          height: Int,
          send: @escaping (Data) -> Void,
@@ -53,8 +49,6 @@ final class TBDPCMFrameContext {
         self.pixelBuffer = pixelBuffer
         self.captureNanos = captureNanos
         self.frameID = frameID
-        self.sliceCount = sliceCount
-        self.rowsPerBand = rowsPerBand
         self.width = width
         self.height = height
         self.send = send
@@ -96,7 +90,7 @@ final class TBDPCMFrameContext {
 /// submitted. Packets are built and handed to the socket from here.
 ///
 /// `bands` is valid only for the duration of this call; the encoder recycles the
-/// slot the moment it returns. `framedSlicePacket` copies into a Data, so that
+/// slot the moment it returns. `framedPacket` copies into a Data, so that
 /// is respected by construction.
 let tbDPCMAsyncDone: tb_dpcm_gpu_done = { ctx, ok, band, index, last in
     guard let ctx else { return }
@@ -108,18 +102,8 @@ let tbDPCMAsyncDone: tb_dpcm_gpu_done = { ctx, ok, band, index, last in
     if ok != 0, let entry = band?.pointee, let blob = entry.blob {
         let i = Int(index)
         let packet: Data
-        if frame.sliceCount > 1 {
-            packet = TBMonitorProtocol.framedSlicePacket(
-                base: blob, totalCount: entry.len,
-                captureTimeNanos: frame.captureNanos,
-                frameID: frame.frameID,
-                frameW: UInt32(frame.width), frameH: UInt32(frame.height),
-                y0: UInt32(i * frame.rowsPerBand),
-                index: UInt16(i), count: UInt16(frame.sliceCount))
-        } else {
             packet = TBMonitorProtocol.framedPacket(
                 type: .rawDPCM, base: blob, totalCount: entry.len)
-        }
         frame.send(packet)
         frame.bytesSent += entry.len
     }

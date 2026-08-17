@@ -1411,9 +1411,14 @@ static void tb_present_armed_frame(void) {
 }
 
 int tb_metal_plane_render_dpcm(const uint8_t *blob, size_t len) {
-    /* A whole frame is the single-slice case: one band, at row 0, presented
-     * immediately. Kept as one code path so the sliced path is the tested one
-     * even when the sender is not slicing. */
+    /* A whole frame is the single-band case: one band, at row 0, presented
+     * immediately.
+     *
+     * The sliced WIRE format (packet 0x26) was removed on 2026-08-17 after
+     * measurement -- N=1 2.98ms vs N=8 5.19ms recv->present, so slicing cost more
+     * than it bought on this link. This function is NOT part of that removal: the
+     * x0/y0/is_last arguments are how the decoder places any region, and every
+     * frame still goes through it. Deleting it deletes the decoder. */
     return tb_metal_plane_render_dpcm_slice(blob, len, 0, 0, 0, 0, 1);
 }
 
