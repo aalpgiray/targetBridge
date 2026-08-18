@@ -90,28 +90,37 @@ final class ReceiverBackedVirtualDisplaySession {
         //   defaults write com.targetbridge.sender TBVirtualRefresh -float 120
         // Anything <= 0 (the default) keeps the receiver's own rate.
         //
-        // OVERSAMPLING IS NOT WORTH IT. Measured with powermetrics on the real
-        // link, same content, 5K lossless at a locked 60 fps out:
+        // OVERSAMPLING COSTS ABOUT 9%, AND BUYS A TIGHTER LATENCY TAIL.
         //
-        //            240 Hz in     60 Hz in
-        //   CPU       2342 mW      1522 mW   (-35%)
-        //   GPU       3945 mW      1688 mW   (-57%)
-        //   combined  6287 mW      3210 mW   (-49%)
+        // Measured with powermetrics on the real link, SAME content on the panel,
+        // keep-warm off in both samples, 5K lossless locked at 60 fps out:
         //
-        // Half the machine's power for at most a few milliseconds of extra
-        // freshness on the frame the slot schedule happens to pick. Leave this
-        // unset unless you are chasing a specific judder problem.
+        //                      120 Hz in    240 Hz in
+        //   combined power       7385 mW      8082 mW   (+9%)
+        //   emit on-cadence      100/100/96%  100/100/98%
+        //   latency avg          3.06-3.12ms  2.94-3.13ms
+        //   latency worst        5.12-6.71ms  4.21-5.18ms
         //
-        // Why the sender's own timers missed it: the capture callback reported
-        // `rejected 0.0%` for the ~180 frames a second the throttle discards, and
-        // that is true -- discarding is free ON THE CPU, in this process. The cost
-        // is the compositor and the texture path producing those frames at all,
-        // which lives in WindowServer and the GPU. No timer inside this app can
-        // see it; powermetrics can.
+        // An earlier version of this comment claimed 240 Hz cost HALF the machine's
+        // power "for nothing" (6287 vs 3209 mW). That comparison was invalid: the
+        // two samples had different keep-warm state and different screen activity,
+        // so it measured the content, not the setting. Under controlled conditions
+        // the difference is 9%, almost all of it GPU -- the compositor produces the
+        // extra frames and the texture path handles them even though the send
+        // throttle discards most.
         //
-        // CGVirtualDisplay may simply refuse a mode it does not like, which
-        // shows up as the display coming back at its old rate — check the log
-        // line below rather than assuming it took.
+        // "For nothing" was also wrong. Oversampling gives the slot schedule more
+        // than one arrival to choose from, which is what holds the emit cadence at
+        // 60 with no jitter, and it measurably tightens the worst-case latency.
+        //
+        // 60 Hz in is a defensible default -- 97-99% on-cadence, ~3.5ms latency --
+        // and 120 Hz buys most of the benefit for most of the cost. This is a
+        // judgement, not a rule.
+        //
+        // METHOD NOTE, because this was got wrong twice: a power comparison here is
+        // only valid with identical panel content and identical keep-warm state in
+        // both samples. In-process timers cannot see any of this -- the cost lives
+        // in WindowServer and on the GPU. Use powermetrics.
         let refreshOverride = UserDefaults.standard.double(forKey: "TBVirtualRefresh")
         let preferredRefreshRate = refreshOverride > 0
             ? refreshOverride
