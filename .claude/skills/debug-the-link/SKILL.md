@@ -89,3 +89,42 @@ State which measurement supports a claim, and say when one does not exist yet.
 `phase locked` after a single episode is n=1, and the same shape has been observed
 without the feature enabled. Two episodes agreeing is a signature; one is a
 coincidence with a story attached.
+
+## ENETDOWN on a healthy link — the state of it, 2026-08-18
+
+Symptom: every dial fails in ~35ms with `POSIXErrorCode 50: Network is down`
+while the receiver is provably accepting. Six occurrences in one day.
+
+PROVEN, by measurement:
+  - It is not the network. `nc` to the same host:port from the same source IP
+    succeeds while the sender is refused. Ping 0.4ms, 0% loss.
+  - It is not the receiver. It accepts on 54321 throughout.
+  - It is not the address, the route, the interface, or the source pin.
+  - It is PER-PROCESS-IDENTITY. A freshly signed control bundle using identical
+    NWConnection parameters connects instantly while the sender cannot.
+  - A rebuild always clears it, and only because the build produces a new
+    LC_UUID. NECP keys on the main executable's UUID. Before
+    ENABLE_DEBUG_DYLIB: NO, rebuilding unchanged source reproduced the SAME uuid
+    (the debug stub never relinks), which is why "just rebuild" used to work only
+    when a source file happened to change too.
+
+FALSIFIED — do not re-chase these:
+  - "It degrades with streaming duration." No. Identities have died in 4 min and
+    13 min, and one survived 17 hours -- but that one was IDLE overnight, not
+    streaming, and failed on its first dial afterwards.
+  - "Rapid connect/disconnect churn poisons it." Fitted the short-lived cases and
+    was then contradicted by the idle-overnight case.
+  - "macOS throttles heavy apps' networking." No such mechanism exists. App Nap,
+    thermal throttling and jetsam do not revoke network access.
+  - Local Network privacy state: the app's LC_UUID is present and unique, the
+    designated requirement is stable (cert-signed), no duplicate UUID on the
+    machine. LaunchServices had 19 stale registrations; cleaning them to 2
+    changed nothing.
+
+STILL UNKNOWN: what poisons the identity. There is no measured variable that
+predicts both the failures and the survivals.
+
+WHAT TO DO WHEN IT HAPPENS: rebuild the sender (any source change, or just
+`touch` a file) and install. That is a workaround for OS-side state we cannot
+reset -- Apple provides no supported way to clear local network privacy on macOS
+(radar 134842755) -- not a fix.

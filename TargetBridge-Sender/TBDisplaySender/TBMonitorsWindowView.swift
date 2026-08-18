@@ -252,12 +252,24 @@ struct TBMonitorPageView: View {
         .navigationSubtitle(session.statusText)
     }
 
+    /// Held so the name field can be explicitly UNfocused on appear.
+    @FocusState private var nameFieldFocused: Bool
+
     // MARK: Connect
 
     private var connectionSection: some View {
         Section {
+            // Not focused on open.
+            //
+            // This is the first TextField on the page, so SwiftUI hands it initial
+            // focus and the monitor gets renamed by any stray keystroke -- a space
+            // or an arrow key while reading the page is enough, and the name is
+            // persisted per receiver, so the accident sticks. Editing a name is a
+            // deliberate act; the field waits to be clicked.
             TextField("Name", text: $session.customName,
                       prompt: Text(service.sessionTitle(for: session)))
+                .focused($nameFieldFocused)
+                .onAppear { nameFieldFocused = false }
             LabeledContent(TBDisplaySenderL10n.receiverIP(service.language)) {
                 Text(session.receiverIP.isEmpty
                      ? "—"
