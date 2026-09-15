@@ -15,6 +15,9 @@ with the format and the reasons for its shape in
 [`tb_dpcm.h`](../TargetBridge-Shared/codec/tb_dpcm.h). Codec changes are only
 real when they stay bit-exact against that CPU reference.
 
+This path has been in daily use for more than a month. The frame rate stays
+constant. It is used for games as well as ordinary desktop work.
+
 ## The constraint is time, and time is bytes
 
 A 5120×2880 BGRA frame is about 59 MB. At 60 Hz you have 16.7 ms.
