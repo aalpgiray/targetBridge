@@ -57,6 +57,15 @@ final class TBMonitorProtocolTests: XCTestCase {
         """.utf8)
         let profile = try JSONDecoder().decode(TBMonitorDisplayProfile.self, from: olderProfile)
         XCTAssertNil(profile.supportsRawNV12)
+        XCTAssertNil(profile.supportsDPCM)
+    }
+
+    func testLosslessDPCMWireTypeStaysInStep() {
+        // Contract with proto.h: TB_PKT_RAW_DPCM. A renumbering has to be a
+        // deliberate act rather than a side effect, or sender and receiver
+        // disagree silently.
+        XCTAssertEqual(TBMonitorPacketType.rawDPCM.rawValue, 0x25)
+        XCTAssertEqual(TBMonitorPacketType.rawFrame.rawValue, 0x22)
     }
 
     func testDrainPacketRoundTrip() throws {

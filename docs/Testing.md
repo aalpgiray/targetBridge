@@ -20,12 +20,19 @@ xcodebuild test -project TargetBridge.xcodeproj -scheme TBDisplaySender -destina
 
 Test sources live in `TargetBridge-Sender/TBDisplaySenderTests/`.
 
-## 2. Receiver parser tests (C)
+## 2. Receiver parser and DPCM codec tests (C)
 
 Unit tests for the streaming packet parser in `net.c` — fragmented and
 contiguous feeds, the NUL-sentinel guarantee, corrupt/oversized length
 rejection, and multi-megabyte payloads fed in socket-sized chunks.
-Pure POSIX: needs **no ffmpeg, SDL, or pkgconf**.
+
+The same `make test` also builds `test_dpcm` against
+`TargetBridge-Shared/codec/tb_dpcm.c`: lossless round-trips at 8- and 10-bit,
+partial tiles, mixed bit widths, and rejection of malformed blobs. That C
+codec is the correctness oracle for the Metal encoder and decoder; see
+[docs/dpcm.md](dpcm.md).
+
+Pure POSIX: needs **no ffmpeg, SDL, pkgconf, or GPU**.
 
 ```bash
 cd TargetBridge-Receiver/TBReceiverC

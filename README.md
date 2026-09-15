@@ -48,6 +48,7 @@ keeping the established multi-Mac workspace features:
 ## Feature Guides
 
 - Overview hub: [docs/Features.md](docs/Features.md)
+- Lossless tile-DPCM (how 5K60 lossless actually works): [docs/dpcm.md](docs/dpcm.md)
 - Mirror mode and Extended Desktop: [docs/Features.md#display-modes](docs/Features.md#display-modes)
 - Guided configuration check: [docs/Features.md#guided-configuration-check](docs/Features.md#guided-configuration-check)
 - Multi-receiver layouts: [docs/Features.md#multi-receiver-workflows](docs/Features.md#multi-receiver-workflows)
@@ -63,7 +64,7 @@ keeping the established multi-Mac workspace features:
 
 - Sender can stream either a mirrored desktop or an extended virtual display. See [Display Modes](docs/Features.md#display-modes).
 - One sender can drive multiple receiver Macs over separate cables. See [Multi-Receiver Workflows](docs/Features.md#multi-receiver-workflows).
-- Stream profiles range from `2560 x 1440` to `5120 x 2880` with H.264/HEVC selection based on capability. `5K 60` is an experimental profile for recent Apple Silicon; `5K 48` remains recommended for reliable daily work. See [Display Modes](docs/Features.md#display-modes).
+- Stream profiles range from `2560 x 1440` to `5120 x 2880` with H.264/HEVC selection based on capability. `5K 60` is an experimental *lossy* HEVC profile for recent Apple Silicon; `5K 48` remains recommended for reliable HEVC work sessions. The lossless 5K path is tile-DPCM (TBD2), not HEVC — see [How TargetBridge DPCM works](docs/dpcm.md).
 - Receiver discovery is automatic over Bonjour. Extended-display arrangement is remembered per receiver when possible. See [Display Modes](docs/Features.md#display-modes).
 - Thunderbolt Bridge remains the primary low-latency path, with `Network Link` available as an experimental addon-gated transport. See [Network Link](docs/Features.md#network-link-experimental).
 
@@ -122,6 +123,7 @@ If you build from source, app outputs go into `build/` folder.
 - Remote connection & automation: [docs/Automation.md](docs/Automation.md)
 - Addon manifests and capability model: [docs/Addons.md](docs/Addons.md)
 - Audio transport internals: [docs/audio.md](docs/audio.md)
+- Lossless tile-DPCM (TBD2) — how 5K60 lossless actually works: [docs/dpcm.md](docs/dpcm.md)
 - Hardware, cables, adapters, and Thunderbolt Bridge networking: [docs/Hardware.md](docs/Hardware.md)
 - Translation workflow: [docs/Translations.md](docs/Translations.md)
 - Testing without hardware (unit tests, mock sender, loopback smoke): [docs/Testing.md](docs/Testing.md)

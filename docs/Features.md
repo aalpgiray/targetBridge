@@ -19,6 +19,19 @@ Related reading:
 - [docs/QuickStart-IT.md](docs/QuickStart-IT.md)
 - [docs/QuickStart-ZH.md](docs/QuickStart-ZH.md)
 
+## Lossless 5K (tile-DPCM)
+
+HEVC `5K 60` is an experimental lossy profile. The lossless path is a
+different codec: independent 8×8-tile DPCM (TBD2) encoded and decoded on
+the GPU, carried as packet type `0x25`.
+
+It needs Metal on both ends (a compute decoder plus a Metal render plane on
+the receiver), Thunderbolt Bridge, and a receiver that advertises
+`supportsDPCM`. The CPU files in `TargetBridge-Shared/codec/` are the
+bit-exact oracle, not the live encoder.
+
+See [docs/dpcm.md](docs/dpcm.md) for how it works.
+
 ## Display Profiles
 
 Each sender session offers three ready-to-use display profiles before connecting:

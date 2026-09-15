@@ -9,6 +9,13 @@ enum TBMonitorPacketType: UInt8 {
     case frame = 0x21
     case rawFrame = 0x22   // Uncompressed NV12 planes (raw passthrough mode)
     case audioFrame = 0x23
+    /// A whole frame, losslessly compressed with tile-DPCM (see tb_dpcm.h).
+    ///
+    /// Covers fullscreen video and fast scrolling, where most of the screen
+    /// really is new every frame. Only sent to a receiver that advertised
+    /// `supportsDPCM`, which it does only if its Metal decoder actually built.
+    /// A silent peer keeps getting `rawFrame` (0x22).
+    case rawDPCM = 0x25
     case heartbeat = 0x30
     case teardown = 0x31
     case cursor = 0x32
@@ -42,6 +49,11 @@ struct TBMonitorDisplayProfile: Codable {
     var captureHeight: Int
     var supportsHEVCDecode: Bool?
     var supportsRawNV12: Bool?
+    /// Whether the receiver can decode tile-DPCM frames on its GPU. Absent means
+    /// no, which is also what an older receiver says by saying nothing. The
+    /// receiver only claims this if the Metal compute pipeline actually built,
+    /// since decoding on a CPU is far too slow at 5K to stand in.
+    var supportsDPCM: Bool?
     var inputMonitoringTrusted: Bool?
     var accessibilityTrusted: Bool?
 }

@@ -21,6 +21,12 @@
  *             [Y plane: yStride*height][CbCr plane: uvStride*(height/2)]
  *   (see handle_raw_frame in main.c; sender-side sendRawFrame)
  *
+ * type 0x25 = full frame, losslessly compressed with tile-DPCM (TBD2).
+ *   payload = one TBD2 blob and nothing else — its own header carries the
+ *   dimensions. See TargetBridge-Shared/codec/tb_dpcm.h and docs/dpcm.md.
+ *   Only sent to a receiver that advertised "supportsDPCM" in its display
+ *   profile. A silent peer is an old peer and keeps getting TB_PKT_RAW_FRAME.
+ *
  * type 0x30 = heartbeat (JSON)
  * type 0x31 = teardown (JSON)
  * type 0x32 = cursor position (JSON)
@@ -47,6 +53,10 @@
 #define TB_PKT_FRAME            0x21
 #define TB_PKT_RAW_FRAME        0x22  /* uncompressed NV12 planes (raw passthrough) */
 #define TB_PKT_AUDIO_FRAME      0x23
+/* Full frame, losslessly compressed with tile-DPCM (TBD2; see tb_dpcm.h).
+ * Payload is one TBD2 blob. Only sent when the receiver advertised
+ * "supportsDPCM", which it does only if a Metal decoder actually built. */
+#define TB_PKT_RAW_DPCM         0x25
 #define TB_PKT_HEARTBEAT        0x30
 #define TB_PKT_TEARDOWN         0x31
 #define TB_PKT_CURSOR           0x32
