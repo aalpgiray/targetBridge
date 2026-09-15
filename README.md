@@ -64,7 +64,7 @@ keeping the established multi-Mac workspace features:
 
 - Sender can stream either a mirrored desktop or an extended virtual display. See [Display Modes](docs/Features.md#display-modes).
 - One sender can drive multiple receiver Macs over separate cables. See [Multi-Receiver Workflows](docs/Features.md#multi-receiver-workflows).
-- Stream profiles range from `2560 x 1440` to `5120 x 2880` with H.264/HEVC selection based on capability. `5K 60` is an experimental *lossy* HEVC profile for recent Apple Silicon; `5K 48` remains recommended for reliable HEVC work sessions. The lossless 5K path is tile-DPCM (TBD2), not HEVC — see [How TargetBridge DPCM works](docs/dpcm.md).
+- Stream profiles range from `2560 x 1440` to `5120 x 2880` with H.264/HEVC selection based on capability. `5K 60` is an experimental *lossy* HEVC profile for recent Apple Silicon; `5K 48` remains recommended for reliable HEVC work sessions. The lossless 5K *codec* (TBD2) is documented in [How TargetBridge DPCM works](docs/dpcm.md). The live Metal stack is not in this teaching slice; the running system is [aalpgiray/targetBridge](https://github.com/aalpgiray/targetBridge).
 - Receiver discovery is automatic over Bonjour. Extended-display arrangement is remembered per receiver when possible. See [Display Modes](docs/Features.md#display-modes).
 - Thunderbolt Bridge remains the primary low-latency path, with `Network Link` available as an experimental addon-gated transport. See [Network Link](docs/Features.md#network-link-experimental).
 

@@ -16,7 +16,16 @@ with the format and the reasons for its shape in
 real when they stay bit-exact against that CPU reference.
 
 This path has been in daily use for more than a month. The frame rate stays
-constant. It is used for games as well as ordinary desktop work.
+constant. It is used for games as well as ordinary desktop work. That running
+system is the fork
+([aalpgiray/targetBridge](https://github.com/aalpgiray/targetBridge)), not
+this teaching slice.
+
+**Building the tree this page ships in does not give you a functional 5K60
+link.** The C codec below is the bit-exact oracle and the wire contract for
+packet `0x25`. The live Metal encoder, Metal decoder, capture path, and
+present path are on that fork's `main`. Check that out if you want the
+product; read this page if you want to understand the codec.
 
 ## The constraint is time, and time is bytes
 
@@ -174,7 +183,9 @@ The functions in `tb_dpcm.c` are correctness oracles, not the live path.
 A 166 ms decode cannot stand in for 16.7 ms. The receiver only advertises
 that it can take DPCM if a Metal compute pipeline actually built.
 
-The live streaming path therefore requires:
+Those GPU pieces are **not** in this teaching tree. They live on
+[the fork](https://github.com/aalpgiray/targetBridge). The live streaming
+path, as it actually runs there, requires:
 
 1. **Apple Silicon sender** — ScreenCaptureKit produces the packed 32-bit
    frame (BGRA8888 or `l10r`). Production encode runs on the **sender GPU**
@@ -194,6 +205,8 @@ The live streaming path therefore requires:
 The C encoder is a two-pass implementation (measure bit widths, then emit)
 so it does not hold a 44 MB residual buffer. That is a fine oracle and a
 terrible per-frame 5K implementation.
+
+This page's `make test` exercises the oracle only.
 
 ## The wire
 
@@ -247,5 +260,8 @@ That runs the packet parser tests and `test_dpcm`: round-trips at both
 depths, partial tiles, mixed bit widths, and a parser that must reject
 malformed blobs (the GPU decoder trusts it).
 
-That suite proves the format. It does not prove a 5K60 link. The link still
-needs the Metal encode/decode path above, on the real cable.
+That suite proves the format. It does not prove a 5K60 link, and it does not
+build one. The Metal encoder, the sender encode path, the receiver Metal
+plane, and the capture/present wiring are on
+[aalpgiray/targetBridge](https://github.com/aalpgiray/targetBridge) `main`.
+Build that if you want the running system.

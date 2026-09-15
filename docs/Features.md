@@ -28,7 +28,9 @@ the GPU, carried as packet type `0x25`.
 It needs Metal on both ends (a compute decoder plus a Metal render plane on
 the receiver), Thunderbolt Bridge, and a receiver that advertises
 `supportsDPCM`. The CPU files in `TargetBridge-Shared/codec/` are the
-bit-exact oracle, not the live encoder.
+bit-exact oracle, not the live encoder. The live stack is the running fork
+([aalpgiray/targetBridge](https://github.com/aalpgiray/targetBridge)); this
+tree's DPCM files do not by themselves produce a 5K60 link.
 
 See [docs/dpcm.md](docs/dpcm.md) for how it works.
 

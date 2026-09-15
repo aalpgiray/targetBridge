@@ -29,7 +29,8 @@ rejection, and multi-megabyte payloads fed in socket-sized chunks.
 The same `make test` also builds `test_dpcm` against
 `TargetBridge-Shared/codec/tb_dpcm.c`: lossless round-trips at 8- and 10-bit,
 partial tiles, mixed bit widths, and rejection of malformed blobs. That C
-codec is the correctness oracle for the Metal encoder and decoder; see
+codec is the correctness oracle for the Metal encoder and decoder (those
+shaders are on the running fork, not in this teaching slice); see
 [docs/dpcm.md](dpcm.md).
 
 Pure POSIX: needs **no ffmpeg, SDL, pkgconf, or GPU**.
