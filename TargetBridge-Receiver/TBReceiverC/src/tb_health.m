@@ -247,16 +247,57 @@ static void *tb_health_main(void *unused) {
 void tb_health_hold_awake(void) {
     static id<NSObject> activity = nil;
     if (activity) return;
-    /* userInitiated: this is work the user asked for and is waiting on.
+    /* userInitiatedAllowingIdleSystemSleep: this is work the user asked for
+     * and is waiting on -- but plain NSActivityUserInitiated is a composite
+     * flag (raw value 0x00FFFFFF) that ALSO carries
+     * NSActivityIdleSystemSleepDisabled (bit 1 << 20), which blocks the whole
+     * Mac from idle-sleeping. Measured, not assumed: an activity begun with
+     * plain NSActivityUserInitiated shows up in `pmset -g assertions` as
+     * PreventUserIdleSystemSleep even with no client ever connected, because
+     * this function is called unconditionally at process startup. The
+     * "Allowing" variant is the one combination that keeps App Nap off this
+     * process without also pinning the owner's Mac awake while idle -- see
+     * tb_health_session_begin() below for the part that DOES intentionally
+     * block system sleep, and only while a client session is live.
      * latencyCritical: the frame cadence is the product -- timer coalescing and
      * CPU throttling are exactly what must not happen here. */
     activity = [[NSProcessInfo processInfo]
-        beginActivityWithOptions:(NSActivityUserInitiated |
+        beginActivityWithOptions:(NSActivityUserInitiatedAllowingIdleSystemSleep |
                                   NSActivityLatencyCritical)
                           reason:@"TargetBridge is presenting a live display"];
     /* No explicit retain: ARC keeps the static strong reference alive, and the
      * assertion lasts as long as the object does -- i.e. the whole process. */
-    fprintf(stderr, "[health] holding off App Nap (userInitiated|latencyCritical)\n");
+    fprintf(stderr, "[health] holding off App Nap (userInitiatedAllowingIdleSystemSleep|latencyCritical) -- does not block system sleep\n");
+}
+
+/* Session-scoped system-sleep hold: NSActivityUserInitiated (the plain,
+ * blocking variant) held ONLY while a client is connected. See tb_health.h
+ * for why this must be separate from tb_health_hold_awake() above.
+ *
+ * The nil check on tb_health_session_activity guards against a double-
+ * acquire: main.c's accept loop only reaches the connect path when
+ * client_fd < 0, and client_fd is only set back to -1 inside close_client()
+ * (which calls tb_health_session_end() first), so two connects without an
+ * intervening disconnect cannot happen structurally. This check is the belt
+ * to that suspenders -- a second tb_health_session_begin() call before the
+ * matching end is a no-op rather than a leaked, unbalanced assertion, and a
+ * tb_health_session_end() with nothing held is equally a no-op rather than a
+ * crash on an over-release. */
+static id<NSObject> tb_health_session_activity = nil;
+
+void tb_health_session_begin(void) {
+    if (tb_health_session_activity) return;
+    tb_health_session_activity = [[NSProcessInfo processInfo]
+        beginActivityWithOptions:NSActivityUserInitiated
+                          reason:@"TargetBridge has an active client session"];
+    fprintf(stderr, "[health] client session started -- holding system sleep (NSActivityUserInitiated)\n");
+}
+
+void tb_health_session_end(void) {
+    if (!tb_health_session_activity) return;
+    [[NSProcessInfo processInfo] endActivity:tb_health_session_activity];
+    tb_health_session_activity = nil;
+    fprintf(stderr, "[health] client session ended -- system sleep no longer held\n");
 }
 
 void tb_health_start(void) {

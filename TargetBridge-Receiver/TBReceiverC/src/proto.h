@@ -132,6 +132,21 @@
  * Purely advisory: a sender that ignores this type loses the correction and
  * nothing else. */
 #define TB_PKT_PHASE            0x43
+/* Sender-authoritative panel sleep, sender -> receiver: JSON
+ * {"asleep":bool,"reason":"displaySleep"|"systemSleep"}. Sent on transitions
+ * only, while the link is up.
+ *
+ * The receiver holds PreventUserIdleDisplaySleep for the whole session, so a
+ * connected 5K iMac never sleeps no matter what the sender's Mac is doing.
+ * This is the sender saying explicitly "let the panel go down", and on the
+ * matching false "hold it up again".
+ *
+ * One direction of trust only: the receiver acts on an explicit true and never
+ * infers sleep from silence, a timeout or a missed packet. A sender that does
+ * not send this type leaves the old always-on behaviour untouched, which is
+ * the only safe reading of "no signal" -- guessing here would blank the panel
+ * of someone who is working. */
+#define TB_PKT_SENDER_DISPLAY_SLEEP 0x3A
 
 #define TB_HDR_BYTES        5   /* 4 length + 1 type */
 

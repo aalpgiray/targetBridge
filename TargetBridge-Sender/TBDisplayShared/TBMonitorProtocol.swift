@@ -78,6 +78,20 @@ enum TBMonitorPacketType: UInt8 {
     /// Payload is little-endian, header then premultiplied RGBA8 rows:
     ///   uint16 width, uint16 height, int16 hotspotX, int16 hotspotY, pixels…
     case cursorImage = 0x42
+
+    /// Whether the sender's display is down, sender -> receiver.
+    ///
+    /// The receiver holds its panel awake for the whole session, so a connected
+    /// 5K iMac never sleeps — significant power on a panel nobody is looking at,
+    /// indefinitely. This is the sender's explicit signal to let that panel go
+    /// down, and on the matching `asleep: false` to hold it up again.
+    ///
+    /// Transitions only, never a heartbeat: the receiver must not infer sleep
+    /// from silence or a stale signal, because the failure that buys is a panel
+    /// that sleeps while the user is working. A receiver sent no such packet (an
+    /// older sender) keeps today's always-on behaviour, which is the safe
+    /// direction to be wrong in.
+    case senderDisplaySleep = 0x3A
 }
 
 struct TBMonitorHelloReceiver: Codable {
@@ -190,6 +204,14 @@ struct TBMonitorDisplayTweaks: Codable {
 
 struct TBMonitorClipboard: Codable {
     var text: String
+}
+
+/// Payload for `senderDisplaySleep`: whether the sender's display is down, and
+/// which kind of down it is. `reason` is diagnostic only — the receiver keys
+/// entirely off `asleep`, so a future reason string cannot change its behaviour.
+struct TBMonitorSenderDisplaySleep: Codable {
+    var asleep: Bool
+    var reason: String
 }
 
 /// Framing-level corruption that cannot be recovered by waiting for more

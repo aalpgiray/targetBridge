@@ -329,6 +329,18 @@ struct TBMonitorPageView: View {
                     Text(iface.displayText(service.language)).tag(iface.ip)
                 }
             }
+            // `.simultaneousGesture` rather than `.onTapGesture`: a plain tap
+            // gesture here would claim the click and the picker's own
+            // AppKit-backed pop-up would never open. Simultaneous lets both
+            // fire — the refresh alongside the native open, not instead of
+            // it. Catches the exact case from tonight's screenshot: the user
+            // opens this dropdown moments after wake, before the periodic
+            // `interfaceRefreshTimer` (up to ~4s stale) or the wake retry
+            // loop would otherwise have caught Thunderbolt Bridge coming
+            // back.
+            .simultaneousGesture(TapGesture().onEnded {
+                service.refreshLocalInterfaces()
+            })
 
             if !service.discoveredReceivers.isEmpty {
                 Picker(TBDisplaySenderL10n.discoveredReceiver(service.language),
@@ -345,6 +357,11 @@ struct TBMonitorPageView: View {
                         Text(receiver.displayText).tag(receiver.id)
                     }
                 }
+                // Same rationale as the local-interface picker above: refresh
+                // on open, alongside (not instead of) the native pop-up.
+                .simultaneousGesture(TapGesture().onEnded {
+                    service.refreshLocalInterfaces()
+                })
             }
 
             TextField(TBDisplaySenderL10n.receiverIP(service.language),

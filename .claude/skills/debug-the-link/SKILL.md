@@ -64,6 +64,69 @@ Run in this order. It finds in ten minutes what reasoning did not find in two da
 self-describing bug report: still waiting, and we quit. `.waiting` is recoverable,
 not fatal.
 
+## A protective condition gated on the wrong signal (2026-09-20)
+
+Symptom: every connect died within ~1s of "sent display profile", 100%
+reproducible, immediately after deploying a receiver-side grace period meant
+to protect a freshly-live session from being killed by the sender's own
+overlapping reconnect dial (see main.c's accept-loop comment, `have_video_frame
+&& since_last_recv_ms < TB_NEW_SESSION_GRACE_MS`).
+
+PROVEN, by measurement (parallel `log stream` + ssh `tail -f` on
+receiver-local.log, correlated by timestamp):
+  - The receiver's own log showed the FULL handshake completing normally
+    (`client connected` -> `session started` -> `sent display profile`) and
+    then, before any video frame, a second dial landing and immediately
+    winning: `new dial while session live: old link is dead, replacing
+    session` -- the receiver's OWN accept loop, not the sender, tore the live
+    handshake down.
+  - The condition required `a.have_video_frame` to be true before the grace
+    period would protect a session at all. A session still in its handshake
+    (hello sent, caps exchanged, capture pipeline not yet started, zero
+    frames decoded) had `have_video_frame == 0`, so ANY second dial in that
+    window -- including a harmless one-shot control connection unrelated to
+    streaming (the sender's `sendLanguageUpdate()` opens and closes a bare
+    NWConnection to the same port) -- read as proof the real session was dead
+    and killed it.
+  - Confirmed independently on a second capture (sleep/wake test): repeated
+    clean EOFs (`isDone=true error=none`) landing within ~1s of connect at
+    varying handshake stages (creatingVirtualDisplay, startingCapture,
+    captureStartedWaitingFirstFrame) -- consistent with the receiver actively
+    closing right after accept, not a network-level failure, and consistent
+    with intermittent/racy rather than 100% once the reconnect backoff
+    happened to avoid landing a second dial inside the unprotected window.
+  - Once a session lived long enough to decode one frame, `have_video_frame`
+    flipped true and the SAME session became protected — this is why the link
+    worked for extended, confirmed 60fps streams earlier the same night with
+    the exact same deploy: the failure needed a second dial to land inside
+    the narrow pre-first-frame window, which is timing-dependent.
+
+LESSON: when a new "is this session real" check ANDs together a boolean
+milestone (has it produced output yet) with a recency clock, audit what
+happens before that milestone is ever reached — a freshly-accepted session is
+maximally real and maximally vulnerable in exactly that window, and gating
+protection on a milestone it hasn't hit yet inverts the intended effect. The
+recency clock alone (time since last real bytes, stamped at accept) was
+already a correct, self-terminating freshness signal — a genuinely dead
+session still ages past the grace window the same way, so it was safe to drop
+the boolean AND entirely rather than special-casing the pre-first-frame
+period.
+
+FALSIFIED as the cause — do not re-chase for this incident:
+  - `normalizeSessionInterfaces()` / the 4s `interfaceRefreshTimer` racing the
+    sender's own state during an active connection. It fires constantly
+    (every 4s, confirmed in the receiver log as bursts of "new dial arrived
+    ...ms after current session's last data") but every one of those bursts
+    was correctly rejected by the (even the old, buggy) grace-period check
+    once a session had a frame — proof this mechanism was not the live
+    session's killer, only an unrelated noisy neighbor that happened to be
+    new the same night and looked suspicious.
+  - The sender tearing itself down for a new reason in `normalizeSessionInterfaces`
+    or the interface-preservation logic — the sender-side `log stream` showed
+    a clean `connect: ready` -> `hello` sequence with no sender-initiated
+    teardown call anywhere near the failure; the receiver's log was the only
+    side that recorded an explicit teardown decision.
+
 ## Already falsified — do not re-chase
 
 For connect failures: the firewall, TCC, entitlements, a reboot, six reinstalls,

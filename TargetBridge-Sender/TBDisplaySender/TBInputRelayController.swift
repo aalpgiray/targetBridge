@@ -293,9 +293,21 @@ final class TBInputRelayController {
         }
     }
 
+    /// Keep this process responsive to input-relay events (keyboard/mouse
+    /// pass-through to whichever Mac has focus) even when TargetBridge is not
+    /// the frontmost app, without blocking system sleep.
+    ///
+    /// `.userInitiatedAllowingIdleSystemSleep` alone is the fix: mixing it with
+    /// `.idleSystemSleepDisabled` (as this used to) put a system-sleep-BLOCKING
+    /// flag in the same option set as the one flag whose entire purpose is to
+    /// ALLOW idle system sleep — `IOPMAssertionCreate`/`ProcessInfo` OR the
+    /// flags together, so the blocking flag always won and the "Allowing"
+    /// half of the name was a lie in practice. `.idleDisplaySleepDisabled` is
+    /// dropped for the same class of reason: nothing about relaying input
+    /// requires the SCREEN to stay lit, only the process to stay scheduled.
     private func beginKeepAwakeActivity() {
         activityToken = ProcessInfo.processInfo.beginActivity(
-            options: [.idleDisplaySleepDisabled, .idleSystemSleepDisabled, .userInitiatedAllowingIdleSystemSleep],
+            options: [.userInitiatedAllowingIdleSystemSleep],
             reason: Self.keepAwakeReason
         )
     }

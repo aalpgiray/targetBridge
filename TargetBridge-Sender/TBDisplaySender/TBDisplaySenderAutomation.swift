@@ -66,8 +66,23 @@ enum TBSenderAutomation {
         switch action {
         case "connect":
             Task { await connect(params) }
+#if DEBUG
+            scheduleDebugSimulation(params)
+#endif
         case "disconnect":
             disconnect(params)
+#if DEBUG
+        // Display-sleep fault injection: drives the sender's real pause/wake
+        // paths over a live session without sleeping the Mac's display.
+        // See `simulateDisplaySleepStreamStop` in TBDisplaySenderService.swift
+        // (on TBDisplaySenderSession) for why this exists. Debug builds only.
+        case "simulate-display-sleep-stop":
+            Task { @MainActor in simulateOnTargetSession(params) { $0.simulateDisplaySleepStreamStop() } }
+        case "simulate-screens-did-sleep":
+            Task { @MainActor in simulateOnTargetSession(params) { $0.simulateScreensDidSleep() } }
+        case "simulate-display-wake":
+            Task { @MainActor in simulateOnTargetSession(params) { $0.simulateDisplayWake() } }
+#endif
         case "show", "window", "settings":
             // The way back in when there is no way in.
             //
@@ -176,6 +191,59 @@ enum TBSenderAutomation {
         guard !service.sessions.isEmpty, let safeIndex = index, safeIndex < service.sessions.count else { return nil }
         return service.sessions[safeIndex]
     }
+
+#if DEBUG
+    /// Schedules the display-sleep fault injection relative to launch, for a
+    /// session driven headlessly:
+    ///
+    ///   TargetBridge --connect --receiver <ip> --localip <ip> --transport net \
+    ///                --simulate-display-sleep-after 12 --simulate-display-wake-after 22
+    ///
+    /// Exists alongside the `targetbridge://simulate-*` URLs because those only
+    /// work when this build is the registered handler for the scheme — with the
+    /// app also installed in /Applications, `open -a <build>` delivers the URL
+    /// to the installed copy, not the one under test. Debug builds only.
+    private static func scheduleDebugSimulation(_ params: [String: String]) {
+        if let seconds = params["simulate-display-sleep-after"].flatMap(Double.init) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+                Task { @MainActor in
+                    simulateOnTargetSession(params) { $0.simulateDisplaySleepStreamStop() }
+                }
+            }
+        }
+        if let seconds = params["simulate-display-wake-after"].flatMap(Double.init) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+                Task { @MainActor in
+                    simulateOnTargetSession(params) { $0.simulateDisplayWake() }
+                }
+            }
+        }
+    }
+
+    /// Resolves the session a `simulate-*` action targets (default: the first)
+    /// and runs one injection entry point on it. Debug builds only.
+    private static func simulateOnTargetSession(_ params: [String: String],
+                                                _ body: (TBDisplaySenderSession) -> Void) {
+        let service = TBDisplaySenderService.shared
+        // `resolveSessionIndex` is tri-state: `nil` = the named session is
+        // invalid, `.some(nil)` = no session was requested (target all), and
+        // `.some(i)` = that one. With nothing named, target the first — the
+        // earlier version read `.some(nil)` as a failure and silently did
+        // nothing, which is exactly what a fault-injection hook must not do.
+        guard let resolved = resolveSessionIndex(params["session"],
+                                                 sessionCount: service.sessions.count,
+                                                 createDefaultIfNeeded: false) else {
+            NSLog("[automation] simulate: invalid session '\(params["session"] ?? "")'")
+            return
+        }
+        let index = resolved ?? 0
+        guard service.sessions.indices.contains(index) else {
+            NSLog("[automation] simulate: no session to target (\(service.sessions.count) session(s))")
+            return
+        }
+        body(service.sessions[index])
+    }
+#endif
 
     /// Resolves a 1-based session number from automation input.
     /// - Returns:

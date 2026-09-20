@@ -31,6 +31,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreAudio/CoreAudio.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
 
 /* kAudioObjectPropertyElementMain is the macOS 12+ SDK spelling; older SDKs
  * only define kAudioObjectPropertyElementMaster (both are numerically 0). */
@@ -67,6 +68,51 @@
  * heartbeats every 2s and streams frames continuously, so 10s of silence
  * (5 missed heartbeats) means it died without a FIN. */
 #define TB_SENDER_IDLE_TIMEOUT_MS 10000
+
+/* Grace period after a session is accepted (cold accept or replacing a
+ * dead one) during which it will not itself be torn down just because
+ * another dial shows up. Measured live: the sender's own reconnect logic
+ * can fire two overlapping dials from one retry burst, and the second one
+ * arrived only 13ms after the first session's first frame -- a fraction of
+ * a network round-trip, nothing like a real second failure.
+ *
+ * Freshness is measured off last_recv_ms, not connecting_since, on purpose:
+ * connecting_since is stamped with SDL_GetTicks() at accept (a different
+ * clock than the now_ms()/CLOCK_MONOTONIC used everywhere else in the loop,
+ * including here), and once have_video_frame goes true the render-status
+ * branch below re-stamps connecting_since to "now" on *every* tick, not
+ * just when a new frame lands -- so a session that has ever decoded one
+ * frame reads as "just started" forever, dead or alive, until the passive
+ * TB_SENDER_IDLE_TIMEOUT_MS reaper finally closes it. Reusing it here as
+ * the sole signal would make any post-first-frame session immune to fast
+ * replacement, reintroducing a bounded (10s) version of tonight's original
+ * stale-socket lockout. last_recv_ms has neither problem: it is set with
+ * now_ms() at accept and after that only advances when the socket actually
+ * produced bytes (see drain_socket()/pump_network() below), which is
+ * exactly "provably not delivering frames" stated as a duration instead of
+ * a bool.
+ *
+ * 2s is two orders of magnitude above the measured 13ms race window
+ * (ample margin for scheduler/GC-style jitter) yet a fifth of
+ * TB_SENDER_IDLE_TIMEOUT_MS: a session that goes genuinely silent right
+ * after being protected is still replaceable on the very next dial once
+ * 2s of true silence has elapsed -- faster than waiting for the passive
+ * 10s idle reaper, not slower, so this cannot re-lock out a dead sender. */
+#define TB_NEW_SESSION_GRACE_MS 2000
+
+/* While idle (no client attached), re-publish Bonjour on this tick so a
+ * sender that lost the receiver mid-session -- for any reason, sleep, cable
+ * pull, crash, the receiver does not need to know which -- sees it reappear
+ * in a browse without a human restarting either app. bonjour_update() is the
+ * same idempotent deinit+re-register the interface-change path already calls
+ * (see ~line 2936), so this reuses that call rather than adding a new one.
+ * 5s matches this file's other passive-tick idiom (tb_health.m's
+ * TB_HEALTH_INTERVAL_MS, confirmed live in receiver-local.log as "[health]
+ * thermal nominal..." every ~5s) -- frequent enough that a sender's own
+ * Bonjour browse (which re-resolves on every service announcement) notices
+ * within one health tick, not so frequent it spams mDNSResponder while
+ * nothing has changed. */
+#define TB_IDLE_ANNOUNCE_INTERVAL_MS 5000
 
 #define TB_CTRL_QUEUE_MAX 512
 
@@ -225,6 +271,7 @@ struct app {
     uint64_t last_fps_tick_ms;
     uint64_t last_fps_count;
     uint64_t last_ip_check_ms;
+    uint64_t last_idle_announce_ms; /* last idle-tick bonjour_update() while client_fd < 0 */
     /* Idle watchdog: last time the sender sent anything. Reader threads stamp
      * this asynchronously, so it can be *newer* than the `t` sampled at the top
      * of a loop iteration — every comparison must be underflow-safe. */
@@ -1269,6 +1316,58 @@ static void tb_set_system_volume(double level) {
     }
 }
 
+/* ---- Whole-machine sleep on the sender's full-system-sleep signal ------ */
+
+/* Ask the kernel to sleep THIS machine (the iMac), because the sender's whole
+ * Mac is going to sleep, not just its display.
+ *
+ * Called only for reason == "systemSleep". A display-only sleep must not come
+ * here: the receiver's job then is just to stop holding the panel awake and let
+ * this machine's own idle timer take it down, which is what the existing
+ * SDL_EnableScreenSaver() already does. Sleeping the whole iMac because the
+ * MacBook's screen went off would be the feature firing on the wrong signal.
+ *
+ * IOPMLib.h documents the rule for this call as "caller must be root or the
+ * console user". MEASURED on this iMac (iMac20,1, macOS 26.6.2) on 2026-09-19:
+ * an unprivileged uid-501 process -- an ssh session, which is not even the GUI
+ * session -- got kIOReturnSuccess (0x0) and the machine entered Sleep state
+ * ~15 s later, with pmset logging `Sleep Entering Sleep state due to 'Software
+ * Sleep pid=<probe>'`. So the receiver, which runs as uid 501 in the Aqua
+ * session, needs no privilege escalation and no privileged helper.
+ *
+ * The call does NOT block: it returned immediately (output file mtime == call
+ * time) and powerd's own display-off / dark-wake-linger timers delayed the
+ * actual Sleep entry by ~15 s. Safe to call from the packet handler on the
+ * event-loop thread.
+ *
+ * The connect port is opened per call and closed again: this fires at most once
+ * per sleep so there is no state worth caching. IOPMFindPowerManagement() is
+ * the documented route and performs the user-client open itself. The
+ * IOServiceOpen route does NOT work here: IORegistryEntryFromPath() could not
+ * resolve IOPMrootDomain on any of the plane strings tried ("IOPower:" and
+ * "IOService:", with and without a leading plane name; all returned 0), and
+ * there is no kIOPMSleepSystemConnectType constant anywhere in the SDK headers
+ * -- only the kPMSleepSystem *selector* in IOPMLibDefs.h. */
+static void request_system_sleep(void) {
+    io_connect_t pm = IOPMFindPowerManagement(MACH_PORT_NULL);
+    if (pm == MACH_PORT_NULL) {
+        fprintf(stderr, "[sleep] IOPMFindPowerManagement failed; iMac not put to sleep\n");
+        return;
+    }
+    IOReturn r = IOPMSleepSystem(pm);
+    fprintf(stderr, "[sleep] IOPMSleepSystem -> 0x%08x %s\n", (unsigned)r,
+            r == kIOReturnSuccess ? "(system sleep requested)"
+                                  : "(FAILED; iMac stays awake)");
+    fprintf(stderr, "[sleep] sender's Mac is going to sleep; iMac follows. "
+                    "Nothing here restarts the receiver afterwards: the LaunchAgent "
+                    "runs only at login and this Mac does not log out to sleep, so "
+                    "the human presses the power button to wake it. Measured "
+                    "2026-09-19: this process SURVIVES that sleep and returns to its "
+                    "listen loop, but the display-link TCP session does not -- the "
+                    "sender has to dial in again.\n");
+    IOServiceClose(pm);
+}
+
 /* ---- Callbacks: parser → decoder ------------------------------------- */
 
 /* Arrival time of the packet on_packet is currently handling.
@@ -1498,6 +1597,78 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
         tb_receiver_apply_input_control_mode(a, payload, len);
         break;
     case TB_PKT_HEARTBEAT:
+        break;
+    case TB_PKT_SENDER_DISPLAY_SLEEP:
+        {
+            /* Sender-authoritative panel sleep: the sender's screen has gone
+             * down (or its whole Mac has), so this panel no longer needs to be
+             * held awake for it.
+             *
+             * ONLY an explicit asleep:true releases the assertion, and only
+             * SDL_EnableScreenSaver() releases it -- there is no timer, no
+             * missing-packet path and no inference from silence anywhere in
+             * this file, deliberately. The failure mode this feature can have
+             * is a panel that sleeps while somebody is working, which is far
+             * worse than a panel that stays on. So a sender that never sends
+             * this, or whose signal stops arriving, keeps today's always-on
+             * behaviour; the disconnect path still re-enables the screen saver
+             * when the session is torn down.
+             *
+             * Called on the main thread like every other on_packet case
+             * (drain_socket inline, pump_network from the main loop), which is
+             * the same thread the connect path asserts on.
+             *
+             * Two different sleeps arrive on this one packet, and they must do
+             * different things (see request_system_sleep above):
+             *   reason "displaySleep" -> release the panel assertion ONLY.
+             *     macOS then takes the panel down on its own idle timer.
+             *   reason "systemSleep"  -> the sender's whole Mac is sleeping, so
+             *     this whole iMac sleeps too.
+             * An absent or unrecognised reason keeps today's behaviour (panel
+             * assertion only), so an older sender cannot make this machine
+             * sleep by accident.
+             *
+             * Sleeping here means this receiver is then asleep with the machine
+             * and gets no wake packet: pmset shows the display-sleep/wake
+             * packets keep the TCP session alive across a display sleep, but a
+             * full system sleep drops it (measured 2026-09-19: the receiver
+             * process survived and went back to listening, the sender's session
+             * did not). The LaunchAgent only runs at login and sleeping does
+             * not log out, so nothing restarts the receiver: the human presses
+             * the iMac's power button and the sender dials in again. That is
+             * the accepted trade for the iMac following the MacBook to sleep. */
+            int asleep = 0;
+            if (!extract_json_bool_field(payload, len, "\"asleep\"", &asleep)) break;
+            char reason[24];
+            reason[0] = '\0';
+            extract_json_string_field(payload, len, "\"reason\"", reason, sizeof(reason));
+            if (asleep) {
+                SDL_EnableScreenSaver();
+                fprintf(stderr, "[main] sender display asleep; panel may sleep\n");
+                /* Full sleep on ANY asleep:true, not just reason "systemSleep".
+                 *
+                 * The two reasons exist because the sender can tell which kind
+                 * of sleep it is asking for -- but on a real, fast system sleep
+                 * the display-sleep notification can fire first (or alone) and
+                 * win the sender's own transitions-only guard, so "systemSleep"
+                 * sometimes never arrives at all (measured 2026-09-20: a real
+                 * `Entering Sleep state due to 'Idle Sleep'` produced only a
+                 * displaySleep packet here). Racing to tell the two apart is
+                 * not worth it: whatever the reason, nothing is being shown on
+                 * this panel while the sender's display is off, so there is no
+                 * cost to sleeping the whole machine instead of just the panel
+                 * -- the visible result is identical (dark screen) and full
+                 * sleep saves more power. If the sender's display comes back
+                 * quickly the wake packet never gets here because sleeping
+                 * takes the network with it, so this is a deliberate trade: the
+                 * human presses the iMac's power button after every full sleep,
+                 * same as for a real systemSleep reason. */
+                request_system_sleep();
+            } else {
+                SDL_DisableScreenSaver();
+                fprintf(stderr, "[main] sender display awake; holding panel awake\n");
+            }
+        }
         break;
     case TB_PKT_TEST_DATA:
         /* Performance test data; discard */
@@ -2522,6 +2693,7 @@ static void drop_pending_network(struct app *a) {
 }
 
 static void close_client(struct app *a) {
+    tb_health_session_end();
     tb_mic_capture_stop();
     g_mic_app = NULL;
     link_reader_stop(a->reader1);
@@ -2733,6 +2905,7 @@ int main(int argc, char **argv) {
 
     a.last_fps_tick_ms = now_ms();
     a.last_ip_check_ms = 0;
+    a.last_idle_announce_ms = now_ms(); /* bonjour_update() already called once at line ~2881 */
 
     /* Wall-clock accounting: every millisecond of the loop lands in exactly one
      * bucket, so the bottleneck is read off rather than guessed at. Note the
@@ -2780,25 +2953,103 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* Idle Bonjour re-announce: while no client is attached, re-publish on
+         * a plain timer so a sender that lost this receiver -- sleep, cable
+         * pull, crash, first boot, any reason, this loop does not need to
+         * know which -- sees a fresh announcement to react to. Same call the
+         * interface-change branch above already makes; deliberately not
+         * gated on anything having changed, since bonjour_update() is cheap
+         * (one deinit + one DNSServiceRegister) and simplicity here beats
+         * tracking a dirty flag. Stops entirely once a client is attached,
+         * so a busy link sees zero extra churn. */
+        if (a.client_fd < 0 && t - a.last_idle_announce_ms >= TB_IDLE_ANNOUNCE_INTERVAL_MS) {
+            a.last_idle_announce_ms = t;
+            bonjour_update(&a, TB_PORT);
+        }
+
         /* Accept the client. One accept per iteration.
          *
-         * While a session is live, still drain the backlog: a dial that arrives
-         * now is a sender that thinks it is not connected (it restarted, or its
-         * link dropped without a FIN). Leaving it queued costs a backlog slot
-         * permanently, and once the queue is full the kernel refuses every later
-         * dial -- a live receiver that looks dead from the far end. Close them
-         * so the queue stays empty; the idle watchdog drops the stale session
-         * and the next dial is then accepted normally. */
+         * This link is single-sender/single-receiver: a dial that arrives while
+         * a session looks live is never a genuine second concurrent client. It
+         * is either the same sender's auto-reconnect redialing after its old
+         * link died (the old client_fd is stale, just not yet reaped by the
+         * idle watchdog below) or a restart -- either way the old session is
+         * dead and this dial is its replacement. Drain the whole backlog,
+         * keeping only the newest dial (closing any earlier ones queued behind
+         * it -- they are superseded before ever being used), then tear the old
+         * session down through the normal close_client() path and let the
+         * accept branch just below pick the surviving fd up as the new live
+         * session, exactly like a fresh connect.
+         *
+         * Measured live tonight: that rule is too eager for one case. A brand
+         * new session can start streaming, and a *second*, overlapping dial
+         * from the sender's own reconnect logic (retrying against its own
+         * fresh connection, not against a genuinely dead one) can land only
+         * milliseconds later -- 13ms after the first frame in the incident
+         * that found this. Treating that second dial as proof the just-started
+         * session is dead kills a working link. The distinguishing signal is
+         * recency of real data: a session that has delivered its first frame
+         * within the last TB_NEW_SESSION_GRACE_MS is proven live, so the new
+         * dial is superseded and dropped instead. A session with no frame yet,
+         * or one that has gone quiet for longer than the grace window, has not
+         * proven anything (or has stopped proving it) and is replaced exactly
+         * as before -- this is what keeps a genuinely dead old session from
+         * ever locking out reconnects. */
+        int replacement_fd = -1;
         if (a.client_fd >= 0) {
             int stale;
             while ((stale = tb_net_accept(a.server_fd)) >= 0) {
-                fprintf(stderr, "[main] refused a second dial: session already live\n");
-                close(stale);
+                if (replacement_fd >= 0) {
+                    fprintf(stderr, "[main] closing superseded dial (newer one already queued)\n");
+                    close(replacement_fd);
+                }
+                replacement_fd = stale;
+            }
+            if (replacement_fd >= 0) {
+                uint64_t since_last_recv_ms = t > a.last_recv_ms ? t - a.last_recv_ms : 0;
+                /* NOT gated on a.have_video_frame.
+                 *
+                 * Measured live 2026-09-20: a session still in its handshake
+                 * (accepted, hello/caps exchanged, no video frame decoded
+                 * yet -- captureStartedWaitingFirstFrame and earlier on the
+                 * sender) is exactly as real and exactly as worth protecting
+                 * as one that has already decoded a frame, but the
+                 * `have_video_frame` condition here left it completely
+                 * unprotected: any dial landing during that handshake window
+                 * -- even a stray one-shot control connection unrelated to
+                 * streaming, like the sender's own periodic UI-language-push
+                 * probe (TBDisplaySenderManager.sendLanguageUpdate(), which
+                 * opens and closes a bare NWConnection to this same port) --
+                 * read as "old link is dead, replacing session" and killed
+                 * the real, live handshake outright. last_recv_ms is set to
+                 * the accept time itself and only ever advances on real
+                 * received bytes (see drain_socket()/pump_network()), so
+                 * `since_last_recv_ms < GRACE` is already a correct, tight
+                 * freshness signal on its own immediately after accept, with
+                 * or without a decoded frame: a session that is genuinely
+                 * dead (never sent anything, or has gone silent) ages past
+                 * the grace window on this same clock exactly as before and
+                 * becomes replaceable again, so this does not resurrect the
+                 * original stale-socket lockout the grace period exists to
+                 * avoid -- it only stops protection from silently switching
+                 * off for the ~1s a real session spends connecting before
+                 * its first frame. */
+                if (since_last_recv_ms < TB_NEW_SESSION_GRACE_MS) {
+                    fprintf(stderr,
+                            "[main] new dial arrived %llu ms after current session's last data and it looks alive; "
+                            "keeping current session, dropping new dial\n",
+                            (unsigned long long)since_last_recv_ms);
+                    close(replacement_fd);
+                    replacement_fd = -1;
+                } else {
+                    fprintf(stderr, "[main] new dial while session live: old link is dead, replacing session\n");
+                    close_client(&a);   /* also calls tb_health_session_end() for the old session */
+                }
             }
         }
 
         if (a.client_fd < 0) {
-            int c = tb_net_accept(a.server_fd);
+            int c = replacement_fd >= 0 ? replacement_fd : tb_net_accept(a.server_fd);
             if (c >= 0) {
                 a.client_fd = c;
                 a.have_video_frame = 0;
@@ -2810,6 +3061,12 @@ int main(int argc, char **argv) {
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] client connected\n");
+                /* System sleep is legitimate to block only while a client is
+                 * actually presenting a picture; a live TCP accept is the
+                 * start of that session, and close_client() -- the single
+                 * teardown path for every disconnect reason below -- pairs
+                 * this with tb_health_session_end(). */
+                tb_health_session_begin();
                 tb_parser_free(&a.parser);
                 tb_parser_init(&a.parser, on_packet, &a);
                 /* Threaded receive is OFF by default: measured on the 5K iMac

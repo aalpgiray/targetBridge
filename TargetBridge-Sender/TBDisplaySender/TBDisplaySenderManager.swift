@@ -87,7 +87,10 @@ final class TBDisplaySenderService: ObservableObject {
     }
     @Published var preventDisplaySleep: Bool = {
         if UserDefaults.standard.object(forKey: "fd.tbdisplaysender.preventDisplaySleep") == nil {
-            return true
+            // Default OFF: this Mac behaves like a normal Mac (its screen and its
+            // whole system may sleep per Energy Saver) unless the user asks for it
+            // to be held awake. The receiver follows the sender either way.
+            return false
         }
         return UserDefaults.standard.bool(forKey: "fd.tbdisplaysender.preventDisplaySleep")
     }() {
@@ -149,12 +152,26 @@ final class TBDisplaySenderService: ObservableObject {
     private var activationObserver: NSObjectProtocol?
     private var clipboardTimer: Timer?
     private var lastClipboardChangeCount: Int = NSPasteboard.general.changeCount
+    /// Periodic catch-all for interface changes that are not a sleep/wake at
+    /// all — Thunderbolt Bridge renegotiating after the cable is reseated,
+    /// coming up slowly on its own, or any other transition nobody sent a
+    /// notification for. `handleSystemWake`'s retry loop covers the
+    /// wake-specific race; this covers everything else, on the same
+    /// `Timer` + `Task { @MainActor }` shape as `startClipboardMonitoring`
+    /// above rather than a new mechanism. 4s: frequent enough that Thunderbolt
+    /// coming back reflects in the UI within one tick of the "typically a few
+    /// seconds" window measured for that renegotiation, cheap enough (one
+    /// `getifaddrs()` snapshot plus a Bonjour browser restart, the same work
+    /// the manual "Refresh IP" button already does) not to matter at that
+    /// rate.
+    private var interfaceRefreshTimer: Timer?
 
     private init() {
         discoveryCancellable = receiverDiscovery.$receivers.sink { [weak self] receivers in
             guard let self else { return }
             discoveredReceivers = receivers
             pushLanguageUpdateToDiscoveredReceivers()
+            reconnectSessionsMatchingRediscoveredReceivers(receivers)
             objectWillChange.send()
         }
         addonCancellable = addonStore.$addons.sink { [weak self] addons in
@@ -171,6 +188,7 @@ final class TBDisplaySenderService: ObservableObject {
         refreshAudioDriverListener()
         observeAudioDeviceSelection()
         startClipboardMonitoring()
+        startInterfaceRefreshMonitoring()
         activationObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification,
             object: nil,
@@ -917,6 +935,27 @@ final class TBDisplaySenderService: ObservableObject {
         }
     }
 
+    /// Same shape as `startClipboardMonitoring` above: a repeating `Timer`
+    /// hopping straight back to `@MainActor` (this class already runs there,
+    /// but the hop matches every other timer callback in this file and keeps
+    /// the pattern uniform for reviewers).
+    ///
+    /// This is the general-purpose fix for a Thunderbolt Bridge interface
+    /// that comes and goes outside a sleep/wake cycle at all — cable reseated,
+    /// slow renegotiation, anything `handleSystemWake`'s wake-triggered retry
+    /// loop (see `TBDisplaySenderService.handleSystemWake`) would not be
+    /// running for because no wake notification fired. `refreshLocalInterfaces()`
+    /// is the exact same call the manual "Refresh IP" button and both wake
+    /// handlers already make — nothing new, just run on a cadence.
+    private func startInterfaceRefreshMonitoring() {
+        interfaceRefreshTimer?.invalidate()
+        interfaceRefreshTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshLocalInterfaces()
+            }
+        }
+    }
+
     private func pollClipboardIfNeeded() {
         guard let session = sessions.first(where: { $0.inputControlRole == .senderMaster && ($0.isConnected || $0.isStreaming) }) else {
             lastClipboardChangeCount = NSPasteboard.general.changeCount
@@ -981,8 +1020,24 @@ final class TBDisplaySenderService: ObservableObject {
                 let fallbackIP = suggestedInterfaceForNewSession(transportKind: session.transportKind)?.ip
                     ?? available.first?.ip
                     ?? ""
-                // Deliberately not touching preferredLocalInterfaceIP: this is a
-                // stand-in while the real one is away, not a new choice.
+                // A pending automatic link-loss reconnect (`stop(isRecoverable:
+                // true)` already fired and `scheduleLinkLossReconnect` owns
+                // this session now) needs `localInterfaceIP` to stay non-empty
+                // no matter what this pass finds, because that loop's own
+                // redial guard aborts the ENTIRE retry loop -- not just this
+                // attempt -- the moment it sees an empty string. Measured
+                // live: this fires from the very interface drop that made the
+                // stop() recoverable in the first place (Thunderbolt Bridge
+                // renegotiating), landing in the window where `available` is
+                // genuinely empty and `fallbackIP` would otherwise be `""`.
+                // Leaving the stale last-known address in place costs
+                // nothing -- a dead address fails a dial exactly like an
+                // empty one -- but keeps the loop alive long enough for the
+                // restore branch above to fix it for real once the interface
+                // comes back.
+                if fallbackIP.isEmpty, session.isAwaitingLinkLossReconnect {
+                    continue
+                }
                 session.localInterfaceIP = fallbackIP
             }
         }
@@ -997,6 +1052,42 @@ final class TBDisplaySenderService: ObservableObject {
             for ip in candidateIPs where !ip.isEmpty && sentTo.insert(ip).inserted {
                 sendLanguageUpdate(to: ip, languageCode: languageCode)
             }
+        }
+    }
+
+    /// Fires the faster Bonjour-rediscovery reconnect path for any idle
+    /// session whose saved `receiverIP` matches a receiver that just
+    /// (re)appeared in this browse tick.
+    ///
+    /// Matches by IP (`preferredIP`/`thunderboltIP`/`networkIP`, whichever the
+    /// receiver announced) rather than `selectedReceiverID`: that ID embeds
+    /// the Bonjour service name (`TBDiscoveredReceiver.id`), which is exactly
+    /// the kind of thing sleep/wake or a reannounce can legitimately not
+    /// reproduce byte-for-byte, where the IP the session already dials is the
+    /// simpler, already-present identity requested for this check.
+    ///
+    /// Every element of `receivers` here is by definition "just (re)appeared"
+    /// in the sense this task cares about: `$receivers` only re-publishes on
+    /// a find/resolve/TXT-update/remove from the passive browser, so a
+    /// session sitting idle with a match in this list means the receiver's
+    /// Bonjour registration was just (re)created — cold start, idle-tick
+    /// re-announce while the receiver has no client, or interface-change path
+    /// (see receiver main.c) — not that it merely sat unchanged in a cache.
+    /// The per-session guards inside `attemptReconnectIfIdleAfterRediscovery()`
+    /// (not connected/streaming, no connection in flight, not cable-testing)
+    /// are what keeps this idempotent against firing on every ordinary browse
+    /// tick while a session is already live.
+    private func reconnectSessionsMatchingRediscoveredReceivers(_ receivers: [TBDiscoveredReceiver]) {
+        guard !receivers.isEmpty, !sessions.isEmpty else { return }
+        var seenIPs = Set<String>()
+        for receiver in receivers {
+            for ip in [receiver.preferredIP, receiver.thunderboltIP, receiver.networkIP] where !ip.isEmpty {
+                seenIPs.insert(ip)
+            }
+        }
+        guard !seenIPs.isEmpty else { return }
+        for session in sessions where !session.receiverIP.isEmpty && seenIPs.contains(session.receiverIP) {
+            session.attemptReconnectIfIdleAfterRediscovery()
         }
     }
 

@@ -2188,7 +2188,39 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
     }
     @Published var largeCursor: Bool
-    @Published var preventDisplaySleep: Bool = true
+    /// Keep this Mac's DISPLAY from idle-sleeping while streaming.
+    ///
+    /// This Mac's SYSTEM sleep is never blocked by TargetBridge, in any state
+    /// of this toggle — see `activityOptions()`. What this toggle controls is
+    /// narrower: with it ON, `.idleDisplaySleepDisabled` is included so the
+    /// screen does not blank from inactivity while actively streaming; OFF
+    /// (the default), only the screen being on is relied on. Either way, the
+    /// assertion is released by `handleDisplaySleep` when the screen goes
+    /// down and re-acquired by `handleDisplayWake` — see those functions for
+    /// why that pairing is now unconditional.
+    @Published var preventDisplaySleep: Bool = false {
+        didSet {
+            guard preventDisplaySleep != oldValue else { return }
+            // Re-express the toggle in the live assertion immediately so
+            // flipping it takes effect on a stream that is already running,
+            // rather than at the next reconnect.
+            //
+            // No "else" branch for the screen-already-asleep case: previously
+            // that branch re-acquired the assertion specifically to pin the
+            // whole Mac awake across a display sleep already in progress.
+            // That behaviour doesn't exist anymore (system sleep is never
+            // blocked), and re-acquiring `.idleDisplaySleepDisabled` on a
+            // display that is already off does nothing — the flag prevents an
+            // idle-triggered sleep, it does not reverse one. The next
+            // `handleDisplayWake` acquires cleanly on its own.
+            if streamingActivity != nil {
+                // A swap, not a second token: the options changed, so the old
+                // activity is ended before the new one is begun.
+                releaseStreamingActivity()
+                acquireStreamingActivityIfNeeded()
+            }
+        }
+    }
     @Published var autoRestartOnWake: Bool = true
     @Published var verboseDisplayLogging: Bool = false {
         didSet {
@@ -2334,6 +2366,69 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     var onRemoteDeactivateInputRequest: (() -> Void)?
     nonisolated(unsafe) private var wakeObservers: [NSObjectProtocol] = []
     private var isRestartingCaptureAfterWake = false
+    /// Guards `verifyConnectionThenResume`'s in-flight liveness probe.
+    ///
+    /// `handleSystemWake` and `handleDisplayWake` can both fire off the same
+    /// physical wake (`screensDidWakeNotification` vs `didWakeNotification`,
+    /// see `registerWakeObservers`), so a real wake can call this function
+    /// twice in close succession. The probe is async (up to
+    /// `wakeLivenessProbeTimeout`), so without this guard a second call could
+    /// start a second heartbeat probe and reach `attemptWakeReconnect` a
+    /// second time while the first reconnect is still in flight. Mirrors the
+    /// existing `isRestartingCaptureAfterWake` pattern used for exactly the
+    /// same double-notification race.
+    private var isVerifyingConnectionAfterWake = false
+    /// True from the moment a link-loss `.connectionFailed` schedules an
+    /// automatic reconnect until that reconnect either succeeds (`.ready`
+    /// clears it) or the attempt ceiling is hit and the loop gives up.
+    ///
+    /// This is the single in-flight owner shared with the wake-reconnect path:
+    /// `scheduleLinkLossReconnect` will not start a second loop while this is
+    /// already true, and `verifyConnectionThenResume`/`attemptWakeReconnect`
+    /// will not fire while a backoff retry is pending, so a wake landing mid
+    /// backoff cannot stack a duplicate reconnect attempt on top of this one.
+    private var isAutoReconnectingAfterLinkLoss = false
+    /// Read-only window onto `isAutoReconnectingAfterLinkLoss` for
+    /// `TBDisplaySenderManager.normalizeSessionInterfaces()`, which lives in a
+    /// different file and file-private access does not reach.
+    ///
+    /// Measured live: `normalizeSessionInterfaces()` runs off a 4s timer and
+    /// both wake handlers, all independent of this reconnect loop. Landing
+    /// while the real interface is transiently gone (the same drop that
+    /// triggered the recoverable `stop()` in the first place — Thunderbolt
+    /// Bridge takes a moment to renegotiate) it found no available interface
+    /// at all and wrote `localInterfaceIP = ""`. The pending backoff redial's
+    /// own guard then saw that empty string, logged "aborted -- receiverIP/
+    /// localInterfaceIP empty", and gave up the ENTIRE retry loop rather than
+    /// just skipping one attempt. `normalizeSessionInterfaces` checks this
+    /// flag before writing an empty fallback so the stale-but-non-empty
+    /// address survives until the interface genuinely comes back and its own
+    /// restore branch fixes it properly.
+    var isAwaitingLinkLossReconnect: Bool { isAutoReconnectingAfterLinkLoss }
+    /// How many automatic link-loss reconnect attempts have fired since the
+    /// loop started. Drives the backoff schedule in
+    /// `linkLossReconnectDelay(forAttempt:)` and the give-up ceiling in
+    /// `scheduleLinkLossReconnect`.
+    private var linkLossReconnectAttempt = 0
+    /// The pending backoff timer for the next automatic reconnect dial, so a
+    /// second `.connectionFailed` transition (or a manual `stop()`/`connect()`)
+    /// can cancel a stale one instead of leaving it to fire later against a
+    /// session that has since moved on.
+    private var linkLossReconnectWorkItem: DispatchWorkItem?
+    /// Non-nil between an explicit display-sleep signal and its wake, holding
+    /// the reason reported to the receiver ("displaySleep" or "systemSleep").
+    ///
+    /// Doubles as the transition guard: the packet is only ever sent when this
+    /// changes, so the receiver gets one asleep:true and one asleep:false per
+    /// sleep, never a stream. It also means the *receiver* can be wrong in only
+    /// one direction — a lost packet leaves it holding the panel awake.
+    private var senderDisplaySleepReason: String?
+    /// In-flight retry loop from `refreshLocalInterfacesRetryingForThunderbolt`,
+    /// shared so a second wake notification landing while the first is still
+    /// retrying (see that function's doc comment — `handleSystemWake` and
+    /// `handleDisplayWake` can both fire off one physical wake) awaits the
+    /// SAME loop instead of starting a redundant second one.
+    private var interfaceRefreshRetryTask: Task<Void, Never>?
     nonisolated(unsafe) private var displayReconfigurationCallbackRegistered = false
     private var verboseLoggingTimer: Timer?
     private var captureHealthWatchdog: Timer?
@@ -2723,7 +2818,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                         self.pendingViabilityTeardown = nil
                         guard self.isConnected || self.isStreaming else { return }
                         TBLog.connection.notice("connect: still non-viable; link is gone, tearing down")
-                        self.stop(resetStatusTo: .connectionFailed("Link lost — cable or interface went away"))
+                        // The path stayed non-viable past the grace window —
+                        // this is the link dying out from under us (cable
+                        // pulled, Thunderbolt Bridge dropped on sleep/wake),
+                        // not a user action. Recoverable: worth an automatic
+                        // reconnect.
+                        self.stop(resetStatusTo: .connectionFailed("Link lost — cable or interface went away"), isRecoverable: true)
                     }
                 }
                 self.pendingViabilityTeardown = work
@@ -2739,6 +2839,16 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     TBTelemetryReporter.emit("connect: ready")
                     self.connectTimeoutWorkItem?.cancel()
                     self.connectTimeoutWorkItem = nil
+                    // A successful dial ends any automatic link-loss retry
+                    // loop that led here — whether this `.ready` came from the
+                    // first attempt or the fifth, the loop's job is done.
+                    if self.isAutoReconnectingAfterLinkLoss {
+                        TBTelemetryReporter.emit("link-loss reconnect: succeeded on attempt \(self.linkLossReconnectAttempt)")
+                    }
+                    self.linkLossReconnectWorkItem?.cancel()
+                    self.linkLossReconnectWorkItem = nil
+                    self.isAutoReconnectingAfterLinkLoss = false
+                    self.linkLossReconnectAttempt = 0
                     self.isConnected = true
                     TBLog.connection.info("connect: ready — \(self.receiverIP, privacy: .public) via \(self.connectInterfaceName ?? "?", privacy: .public)")
                     self.setStatus(.waitingDisplayProfile)
@@ -2769,7 +2879,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     )
                     TBLog.connection.error("connect: failed — \(error.localizedDescription, privacy: .public); \(detail, privacy: .public)")
                     self.setStatus(.connectionFailed("\(error.localizedDescription) — \(detail)"))
-                    self.stop(resetStatusTo: nil)
+                    // NWConnection itself reporting `.failed` is a genuine
+                    // "the link died out from under us" signal, not a user
+                    // action — recoverable, same as the viability-timeout
+                    // teardown below.
+                    self.stop(resetStatusTo: nil, isRecoverable: true)
                 case .cancelled:
                     // Clear the object, not just the flag.
                     //
@@ -2938,6 +3052,17 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     func stop(persistArrangement: Bool = true) {
+        // A deliberate, user-visible stop (Disconnect button, app quit,
+        // switching receivers all funnel through this public entry point —
+        // see `stop(resetStatusTo:isRecoverable:persistArrangement:)`'s own
+        // callers for the internal-only paths) always cancels any pending or
+        // in-flight automatic link-loss reconnect. Leaving it running past a
+        // deliberate disconnect would silently reconnect a session the user
+        // just asked to end.
+        linkLossReconnectWorkItem?.cancel()
+        linkLossReconnectWorkItem = nil
+        isAutoReconnectingAfterLinkLoss = false
+        linkLossReconnectAttempt = 0
         stop(resetStatusTo: .stopped, persistArrangement: persistArrangement)
     }
 
@@ -2945,7 +3070,17 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         persistExtendedDisplayArrangementIfNeeded()
     }
 
-    private func stop(resetStatusTo status: TBDisplaySenderStatusState?, persistArrangement: Bool = true) {
+    private func stop(
+        resetStatusTo status: TBDisplaySenderStatusState?,
+        isRecoverable: Bool = false,
+        persistArrangement: Bool = true
+    ) {
+        // Captured before any of the teardown below clears them — the only
+        // way to tell, after the fact, whether this stop() interrupted a live
+        // session (worth auto-reconnecting) or fired against one that was
+        // never connected (e.g. an initial dial failure the user hasn't seen
+        // succeed yet, which should not spin up a retry loop).
+        let wasLive = isConnected || isStreaming
         if persistArrangement {
             persistExtendedDisplayArrangementIfNeeded()
         }
@@ -3004,6 +3139,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         activeCodecName = nil
         isConnected = false
         isStreaming = false
+        // A session that ends while the display is asleep must not leave the
+        // sleep state latched: the next session would then suppress the first
+        // asleep:true (transitions only) and the receiver would hold its panel
+        // awake for that whole sleep. The receiver re-enables its screen saver
+        // on disconnect anyway, so there is nothing to send here.
+        senderDisplaySleepReason = nil
         isCableTesting = false
         isCableTestConnection = false
         if let status {
@@ -3018,6 +3159,169 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         lastCursorPacket = nil
         captureDisplayText = TBDisplaySenderL10n.captureDisplayNotAvailable(language)
         displayStateText = TBDisplaySenderL10n.displayStateNotAvailable(language)
+
+        // Only a link genuinely dying out from under a live session schedules
+        // an automatic retry — never a deliberate stop (Disconnect button,
+        // app quit, switching receivers, an initial dial that never
+        // succeeded, cable-test teardown, …). `isRecoverable` marks the call
+        // site; `wasLive` (captured at entry, before this function cleared
+        // `isConnected`/`isStreaming`) confirms there was something worth
+        // getting back.
+        if isRecoverable, wasLive {
+            scheduleLinkLossReconnect()
+        }
+    }
+
+    /// Delay before automatic link-loss reconnect attempt N (1-indexed):
+    /// 2s, 5s, 10s, then 30s from attempt 4 on. Deliberately not a tight
+    /// loop — a dead link is often a genuinely sleeping Mac or iMac, where
+    /// hammering reconnects wastes battery and log noise for no benefit.
+    private static func linkLossReconnectDelay(forAttempt attempt: Int) -> TimeInterval {
+        switch attempt {
+        case ...1: return 2
+        case 2: return 5
+        case 3: return 10
+        default: return 30
+        }
+    }
+
+    /// Attempts allowed before the automatic link-loss loop gives up and
+    /// leaves the session on `.connectionFailed` for the user to retry by
+    /// hand. At the chosen backoff (2/5/10/30…30s) ~10 attempts spans a bit
+    /// over four minutes — long enough to ride out a Mac finishing its sleep
+    /// cycle, short enough not to retry silently forever.
+    private static let linkLossReconnectAttemptCeiling = 10
+
+    /// Entry point for the automatic link-loss reconnect loop. Called only
+    /// from `stop(resetStatusTo:isRecoverable:persistArrangement:)` when a
+    /// call site marked itself `isRecoverable: true` (NWConnection's own
+    /// `.failed` state, and the viability-timeout teardown) AND the session
+    /// was actually connected or streaming when the link died.
+    ///
+    /// Single in-flight owner, shared with the wake-reconnect path: guards on
+    /// `isAutoReconnectingAfterLinkLoss` exactly the way
+    /// `verifyConnectionThenResume` guards on `isVerifyingConnectionAfterWake`
+    /// — a second `.connectionFailed` transition while a backoff retry is
+    /// already pending is a no-op here, and `verifyConnectionThenResume`
+    /// below is likewise guarded so a wake landing mid-backoff does not stack
+    /// a second reconnect attempt on top of this one.
+    private func scheduleLinkLossReconnect() {
+        guard !isAutoReconnectingAfterLinkLoss else {
+            TBTelemetryReporter.emit("link-loss reconnect: already in flight — ignoring duplicate trigger")
+            return
+        }
+        // The wake-reconnect path (`verifyConnectionThenResume` /
+        // `attemptWakeReconnect`) is the other owner of "we are trying to
+        // reconnect right now". It never marks its own `stop()` calls
+        // `isRecoverable`, so it cannot land here mid-probe — but the reverse
+        // (a wake landing while THIS loop already owns the retry) is real,
+        // which is why `verifyConnectionThenResume` below guards on this same
+        // flag before starting a probe of its own.
+        guard !isVerifyingConnectionAfterWake else {
+            TBTelemetryReporter.emit("link-loss reconnect: wake-reconnect already owns recovery — ignoring")
+            return
+        }
+        guard !receiverIP.isEmpty, !localInterfaceIP.isEmpty else {
+            TBTelemetryReporter.emit("link-loss reconnect: aborted — receiverIP/localInterfaceIP empty")
+            return
+        }
+        isAutoReconnectingAfterLinkLoss = true
+        linkLossReconnectAttempt = 0
+        fireNextLinkLossReconnectAttempt()
+    }
+
+    private func fireNextLinkLossReconnectAttempt() {
+        guard isAutoReconnectingAfterLinkLoss else { return }
+        linkLossReconnectAttempt += 1
+        if linkLossReconnectAttempt > Self.linkLossReconnectAttemptCeiling {
+            NSLog("TargetBridge: link-loss reconnect — giving up after \(Self.linkLossReconnectAttemptCeiling) attempts")
+            TBTelemetryReporter.emit("link-loss reconnect: giving up after \(Self.linkLossReconnectAttemptCeiling) attempts")
+            isAutoReconnectingAfterLinkLoss = false
+            linkLossReconnectAttempt = 0
+            linkLossReconnectWorkItem = nil
+            // Leave the UI on a clear, final state rather than silently
+            // stopping the retries with no visible change.
+            setStatus(.connectionFailed("Lost connection and could not reconnect automatically"))
+            refreshLocalizedText()
+            return
+        }
+        let delay = Self.linkLossReconnectDelay(forAttempt: linkLossReconnectAttempt)
+        NSLog("TargetBridge: link-loss reconnect — attempt \(linkLossReconnectAttempt)/\(Self.linkLossReconnectAttemptCeiling) in \(delay)s")
+        TBTelemetryReporter.emit("link-loss reconnect: attempt \(linkLossReconnectAttempt)/\(Self.linkLossReconnectAttemptCeiling) scheduled in \(delay)s")
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isAutoReconnectingAfterLinkLoss else { return }
+            self.linkLossReconnectWorkItem = nil
+            guard !self.receiverIP.isEmpty, !self.localInterfaceIP.isEmpty else {
+                TBTelemetryReporter.emit("link-loss reconnect: aborted mid-loop — receiverIP/localInterfaceIP empty")
+                self.isAutoReconnectingAfterLinkLoss = false
+                self.linkLossReconnectAttempt = 0
+                return
+            }
+            // Same `connect()` the manual Connect button and
+            // `attemptWakeReconnect` use — no second connect path. Fired
+            // unconditionally on the backoff timer rather than waiting for a
+            // confirmed prior failure: `connect()` itself is idempotent
+            // against an attempt still in flight (its "stale connection
+            // object" branch tears down and redials), a `.ready` in between
+            // has already flipped `isAutoReconnectingAfterLinkLoss` false —
+            // making the guard above a no-op the next time this timer would
+            // have fired — and if the user reconnected by hand meanwhile
+            // `connect()`'s own "already connected — nothing to do" guard
+            // makes this call inert.
+            self.connect()
+            // Arms the NEXT backoff slot right away rather than waiting on
+            // this dial's outcome — `connect()`'s state handler has no single
+            // completion callback to hang this off, only the async `.ready`/
+            // `.failed`/timeout events already wired elsewhere. The loop is
+            // therefore self-driven by its own timer and only ever stopped
+            // early by `.ready` (success) or a deliberate `stop()` (user
+            // disconnect), never by an individual dial's outcome.
+            self.fireNextLinkLossReconnectAttempt()
+        }
+        linkLossReconnectWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// Called by `TBDisplaySenderService.reconnectSessionsMatchingRediscoveredReceivers`
+    /// when this session's `receiverIP` matches a receiver that just (re)appeared
+    /// in the passive Bonjour browse. Complements, not replaces, the link-loss
+    /// backoff loop above: that loop is a blind timer that can run out its
+    /// ceiling and give up (`giving up after 10 attempts`, measured live —
+    /// see debug-the-link SKILL.md) with nothing left to re-arm it. A receiver
+    /// reappearing in Bonjour is positive proof it can accept a dial right now,
+    /// so this is a faster, evidence-based path to the SAME `connect()` the
+    /// manual button, wake-reconnect and link-loss backoff already use — no
+    /// second connect mechanism.
+    ///
+    /// Double-dial safety, reusing existing state rather than a new flag:
+    ///   - `!isConnected && !isStreaming` — nothing to do if already live.
+    ///   - `connection == nil` — mirrors `connect()`'s own "stale connection"
+    ///     guard. If a dial is already in flight (connection set, not yet
+    ///     `.ready`), calling `connect()` again would hit its "stale
+    ///     connection object" branch and tear down a legitimate in-progress
+    ///     handshake; skipping here instead leaves that dial alone.
+    ///   - `!isCableTestConnection` — a manual cable test owns `connect()`
+    ///     for its own reason; do not interject.
+    ///   - If `isAutoReconnectingAfterLinkLoss` is true, this same session is
+    ///     already mid-backoff. Rather than let both fire (this call and the
+    ///     pending backoff timer racing to redial), cancel the pending
+    ///     backoff work item and dial now — Bonjour rediscovery is strictly
+    ///     better evidence than an unexpired timer, so jump the queue instead
+    ///     of running both.
+    func attemptReconnectIfIdleAfterRediscovery() {
+        guard !isConnected, !isStreaming else { return }
+        guard connection == nil else { return }
+        guard !isCableTestConnection else { return }
+        guard !receiverIP.isEmpty else { return }
+        if isAutoReconnectingAfterLinkLoss {
+            linkLossReconnectWorkItem?.cancel()
+            linkLossReconnectWorkItem = nil
+            TBTelemetryReporter.emit(
+                "bonjour rediscovery: receiver reappeared — expediting pending link-loss reconnect")
+        }
+        TBTelemetryReporter.emit(
+            "bonjour rediscovery: receiver reappeared at \(receiverIP) while idle — reconnecting")
+        connect()
     }
 
     /// Stable per-receiver discriminator: the connection address when known
@@ -3172,12 +3476,33 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         send(packet)
     }
 
-    private func sendHeartbeat() {
+    private func sendHeartbeat(onCompletion: (@MainActor (Error?) -> Void)? = nil) {
         heartbeatSequence += 1
         guard let packet = TBMonitorProtocol.makeJSONPacket(
             type: .heartbeat,
             value: TBMonitorHeartbeat(sequence: heartbeatSequence)
+        ) else {
+            onCompletion?(nil)
+            return
+        }
+        send(packet, onCompletion: onCompletion)
+    }
+
+    /// Tells the receiver whether this Mac's display is down, so it can let its
+    /// own panel sleep instead of holding a 5K screen awake for a session that
+    /// is not being looked at.
+    ///
+    /// Transitions only — see `senderDisplaySleepReason`. There is deliberately
+    /// no repeat and no keep-alive: the receiver is forbidden from inferring
+    /// sleep from a stale or absent signal, so this can only ever be missed in
+    /// the safe direction (its panel stays on).
+    private func sendSenderDisplaySleep(asleep: Bool, reason: String) {
+        guard let packet = TBMonitorProtocol.makeJSONPacket(
+            type: .senderDisplaySleep,
+            value: TBMonitorSenderDisplaySleep(asleep: asleep, reason: reason)
         ) else { return }
+        NSLog("TargetBridge: display sleep state → asleep=%d reason=%@ (%@)",
+              asleep ? 1 : 0, reason, isConnected ? "connected" : "not connected")
         send(packet)
     }
 
@@ -3218,6 +3543,29 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                         + "status=\(self.statusState) bytesBuffered=\(self.recvBuffer.count)")
                     TBLog.connection.error(
                         "receive: ended isDone=\(isDone, privacy: .public) error=\(error?.localizedDescription ?? "none", privacy: .public)")
+                    // Captured before setStatus below overwrites it: this
+                    // tells us whether the link died out from under a session
+                    // that had genuinely gotten past the dial — a real TCP
+                    // connection plus hello/caps exchange already happened by
+                    // .waitingDisplayProfile, so everything from there through
+                    // .captureActive (creating the virtual display, starting
+                    // capture, waiting on the first frame, capturing) is a
+                    // live session dropping mid-flight and worth an automatic
+                    // retry. .connecting is excluded because the receiver was
+                    // never reached at all, and .testingCable is excluded by
+                    // design (a diagnostic action, not a session). Everything
+                    // else in the enum is a state the session is already
+                    // leaving or has already left (closed/failed/stopped),
+                    // where this handler firing again doesn't represent a
+                    // fresh drop to recover from.
+                    let wasLiveSession: Bool
+                    switch self.statusState {
+                    case .waitingDisplayProfile, .creatingVirtualDisplay, .startingCapture,
+                         .captureStartedWaitingFirstFrame, .captureActive:
+                        wasLiveSession = true
+                    default:
+                        wasLiveSession = false
+                    }
                     if let error {
                         self.setStatus(.connectionClosed(error.localizedDescription))
                     } else if case .startingCapture = self.statusState {
@@ -3225,7 +3573,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     } else if case .captureActive = self.statusState {
                         self.setStatus(.receiverClosedConnection)
                     }
-                    self.stop(resetStatusTo: nil)
+                    self.stop(resetStatusTo: nil, isRecoverable: wasLiveSession)
                     return
                 }
                 self.receiveLoop(on: connection)
@@ -3928,9 +4276,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             }
             delegate.onError = { [weak self] error in
                 Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.setStatus(.captureError(self.formattedCaptureErrorMessage(for: error)))
-                    self.stop(resetStatusTo: nil)
+                    self?.handleCaptureStreamStop(error)
                 }
             }
             captureDelegate = delegate
@@ -3956,10 +4302,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             // receiver has nothing to draw and the screen has no cursor.
             // largeCursor selects sprite SIZE, it does not enable the feature.
             startCursorUpdates(displayID: display.displayID)
-            streamingActivity = ProcessInfo.processInfo.beginActivity(
-                options: activityOptions(),
-                reason: "TargetBridge streaming active"
-            )
+            acquireStreamingActivityIfNeeded()
             startFPSTimer()
             startCaptureWatchdog()
             return true
@@ -3995,21 +4338,57 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         isStreaming = true
         // Not gated on largeCursor — see the SCStream path above.
         startCursorUpdates(displayID: displayID)
-        streamingActivity = ProcessInfo.processInfo.beginActivity(
-            options: activityOptions(),
-            reason: "TargetBridge streaming active"
-        )
+        acquireStreamingActivityIfNeeded()
         startFPSTimer()
         startCaptureWatchdog()
         return true
     }
 
+    /// The one description of what the streaming power assertion holds.
+    ///
+    /// `.userInitiatedAllowingIdleSystemSleep` is unconditional and — unlike
+    /// plain `.userInitiated` — does NOT carry `NSActivityIdleSystemSleepDisabled`
+    /// (measured: `.userInitiated`'s raw value is 0x00FFFFFF, which includes
+    /// 1 << 20; the `AllowingIdleSystemSleep` variant is the one combination
+    /// that keeps a process responsive without disabling idle system sleep).
+    /// TargetBridge is the human's own Mac; it must never hold the system
+    /// awake for any reason, so this base option set can never change that.
+    ///
+    /// `.idleDisplaySleepDisabled` is the only thing the toggle adds, and it
+    /// is a DISPLAY-only flag — it cannot imply system-sleep blocking the way
+    /// `.userInitiated` did, so it is safe to condition on the toggle. With it
+    /// ON the screen does not blank from inactivity while streaming; with it
+    /// OFF the screen is expected to be on already (that's the streaming
+    /// case) and `handleDisplaySleep` reacts when it isn't.
     private func activityOptions() -> ProcessInfo.ActivityOptions {
-        var options: ProcessInfo.ActivityOptions = [.userInitiated, .idleSystemSleepDisabled]
+        var options: ProcessInfo.ActivityOptions = [.userInitiatedAllowingIdleSystemSleep]
         if preventDisplaySleep {
             options.insert(.idleDisplaySleepDisabled)
         }
         return options
+    }
+
+    /// Begin the streaming power assertion, at most one per process at a time.
+    ///
+    /// Idempotent by the nil check, which is what makes the wake path safe to
+    /// call unconditionally: a capture restart that began its own assertion must
+    /// not leave a second token behind, because an unbalanced `beginActivity`
+    /// leaks an assertion nothing ever ends.
+    private func acquireStreamingActivityIfNeeded() {
+        guard streamingActivity == nil else { return }
+        streamingActivity = ProcessInfo.processInfo.beginActivity(
+            options: activityOptions(),
+            reason: "TargetBridge streaming active"
+        )
+    }
+
+    /// End the streaming power assertion, if one is held. Safe to call twice:
+    /// there is nothing to end once `streamingActivity` is nil.
+    private func releaseStreamingActivity() {
+        if let activity = streamingActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            streamingActivity = nil
+        }
     }
 
     private func waitForCaptureDisplay() async throws -> SCDisplay {
@@ -4530,6 +4909,78 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 using: handler
             )
         )
+
+        // ---- Sleep and display wake ---------------------------------------
+        //
+        // The receiver holds PreventUserIdleDisplaySleep for the whole session,
+        // so a connected 5K iMac is held awake indefinitely whether or not
+        // anything is happening. These are the signals that let it go down: the
+        // display alone, or the whole Mac.
+        //
+        // NSWorkspace's centre, not the DistributedNotificationCenter pair
+        // above — those two carry unlock / screensaver-stopped, which fire on a
+        // different schedule and say nothing about the display going to sleep.
+        //
+        // The idle-frame heuristic in CaptureDelegate (tbIdleFramesSeen /
+        // tbWakeIdleSince) is NOT this: it samples whether frames stop arriving,
+        // which is a guess about the display's state. These notifications ARE
+        // the state, so nothing here reads or disturbs that measurement.
+        let displaySleepHandler: @Sendable (Notification) -> Void = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleDisplaySleep(fullSystem: false)
+            }
+        }
+        let systemSleepHandler: @Sendable (Notification) -> Void = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleDisplaySleep(fullSystem: true)
+            }
+        }
+        // Waking is its own handler rather than a second call to
+        // `handleSystemWake`: only this path tells the receiver to hold its
+        // panel up again, and an unnoticed wake would leave the panel free to
+        // sleep through the next working session. The restart it triggers is
+        // the existing scheduleCaptureRestart machinery, and the two paths
+        // racing is harmless — isRestartingCaptureAfterWake makes the second a
+        // no-op.
+        let displayWakeHandler: @Sendable (Notification) -> Void = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleDisplayWake()
+            }
+        }
+        wakeObservers.append(
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.screensDidSleepNotification,
+                object: nil,
+                queue: nil,
+                using: displaySleepHandler
+            )
+        )
+        wakeObservers.append(
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.willSleepNotification,
+                object: nil,
+                queue: nil,
+                using: systemSleepHandler
+            )
+        )
+        // screensDidWake is the display-only wake and the common case;
+        // didWake is the whole Mac coming back. Both are idempotent here.
+        wakeObservers.append(
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.screensDidWakeNotification,
+                object: nil,
+                queue: nil,
+                using: displayWakeHandler
+            )
+        )
+        wakeObservers.append(
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification,
+                object: nil,
+                queue: nil,
+                using: displayWakeHandler
+            )
+        )
     }
 
     private func registerDisplayReconfigurationCallback() {
@@ -4602,6 +5053,13 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func checkCaptureHealth() {
+        // `let pipeline` is what makes this consistent with a display-sleep
+        // PAUSE, where `isStreaming` is still true but the pipeline is gone:
+        // with no pipeline there is no `lastCaptureFrameAt` to measure, so this
+        // returns instead of tripping on a pipeline that is meant to be idle.
+        // `teardownCapturePipeline` also invalidates this timer, so in a pause
+        // the body is not even reached — both, because either alone would leave
+        // a path where a paused-but-streaming session looks wedged.
         guard isStreaming, activeProfile != nil, !isRestartingCaptureAfterWake, let pipeline else { return }
         let elapsed = Date().timeIntervalSince(pipeline.lastCaptureFrameAtSnapshot)
         guard elapsed >= 8.0 else { return }
@@ -4626,17 +5084,481 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         )
     }
 
+    /// Wake handler for BOTH the display coming back and the whole Mac
+    /// resuming — see `registerWakeObservers`: `screensDidWakeNotification`
+    /// drives this AND `handleDisplayWake` together, so a real wake reaches
+    /// this unconditionally while `handleDisplayWake`'s own body only runs
+    /// when a matching sleep was recorded (`senderDisplaySleepReason`).
+    ///
+    /// Two independent fixes live here, in order:
+    ///  - `refreshLocalInterfaces()` FIRST, unconditionally — a Thunderbolt
+    ///    Bridge interface that disappeared and came back (or renumbered)
+    ///    during sleep was never rescanned before this, so `localInterfaceIP`
+    ///    stayed pointed at an interface `connect()` could no longer use.
+    ///    This runs even with auto-restart off: interface detection is not a
+    ///    restart preference, it is just correctness for whenever the user
+    ///    (or the code below) next tries to connect.
+    ///  - `verifyConnectionThenResume`, gated on `autoRestartOnWake` exactly
+    ///    like the restart it replaces here — see that function for why a
+    ///    stale-but-still-`true` `isConnected` cannot be trusted after a real
+    ///    system sleep, and why a short display-only sleep (which reliably
+    ///    keeps the TCP session alive) must NOT pay the reconnect cost.
+    ///
+    /// MEASURED (log stream + a screenshot of this app's own Connection panel,
+    /// after a real sleep/wake+reconnect): `screensDidWakeNotification` fires
+    /// before Thunderbolt Bridge (en1, 10.0.1.x) has actually renegotiated —
+    /// the interface is transiently down or not yet renumbered at that exact
+    /// instant. `refreshLocalInterfaces()`'s `detectLocalInterfaces()` is a
+    /// single synchronous `getifaddrs()` snapshot, so calling it exactly once,
+    /// synchronously, at the moment this notification fires correctly finds
+    /// nothing for Thunderbolt and `applyDiscoveredReceiver` falls back to the
+    /// receiver's LAN IP instead — reproduced live, and fixed immediately by
+    /// quitting and relaunching the app (which re-scans seconds later, after
+    /// renegotiation finished). `refreshLocalInterfacesRetryingForThunderbolt`
+    /// below is that same fresh-launch timing, given to the wake handler
+    /// instead of a relaunch.
     private func handleSystemWake() {
-        guard autoRestartOnWake else { return }
-        scheduleCaptureRestart(reason: "system wake", delaySeconds: 1.0)
+        Task { @MainActor [weak self] in
+            await self?.refreshLocalInterfacesRetryingForThunderbolt(reason: "system wake")
+            guard let self, self.autoRestartOnWake else { return }
+            self.verifyConnectionThenResume(afterWake: "system wake")
+        }
     }
+
+    /// Retries `refreshLocalInterfaces()` for a few seconds after a wake
+    /// until a Thunderbolt Bridge interface shows up, instead of the old
+    /// one-shot call that raced macOS still renegotiating it (see
+    /// `handleSystemWake`'s doc comment for the measurement).
+    ///
+    /// Schedule: 5 attempts, spaced 1.5s apart (an immediate first refresh
+    /// plus 4 delayed retries — ~6s worst case). Modeled directly on
+    /// `linkLossReconnectDelay`/`fireNextLinkLossReconnectAttempt`'s
+    /// bounded-attempts-then-give-up shape (see those above), not a new retry
+    /// style: fixed short delay rather than that function's growing backoff,
+    /// because this is polling a several-second renegotiation window that was
+    /// measured directly, not guessing at an unknown outage length the way a
+    /// dead link is.  1.5s spacing keeps the total under
+    /// `wakeLivenessProbeTimeout` territory while giving `detectLocalInterfaces()`
+    /// several fresh `getifaddrs()` snapshots across the renegotiation window;
+    /// 5 attempts is enough headroom over the "typically back within a few
+    /// seconds" figure without leaving a genuinely TB-less wake (cable
+    /// actually unplugged) stuck for long before its correct LAN fallback.
+    ///
+    /// Does NOT touch `detectLocalInterfaces()` or `applyDiscoveredReceiver`'s
+    /// fallback — this only changes how many chances TB detection gets before
+    /// whatever was found (or not found) is handed to the existing code.
+    /// Awaited by `handleSystemWake`/`handleDisplayWake` before they proceed
+    /// to `verifyConnectionThenResume`, so the reconnect flow always runs
+    /// against the best interface data this loop could get, but never blocks
+    /// past its own bounded ceiling.
+    ///
+    /// Shares `interfaceRefreshRetryTask` with itself across the two wake
+    /// handlers: `handleSystemWake` and `handleDisplayWake` can both fire off
+    /// one physical wake (see `registerWakeObservers`), so a second call
+    /// landing while a loop is already running awaits that SAME task instead
+    /// of starting a redundant, overlapping second one.
+    private func refreshLocalInterfacesRetryingForThunderbolt(reason: String) async {
+        if let existing = interfaceRefreshRetryTask {
+            await existing.value
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let maxAttempts = 5
+            let delayBetweenAttempts: UInt64 = 1_500_000_000 // 1.5s
+            for attempt in 1...maxAttempts {
+                TBDisplaySenderService.shared.refreshLocalInterfaces()
+                let hasThunderbolt = TBDisplaySenderService.shared.localInterfaces.contains {
+                    $0.transportKind == .thunderboltBridge
+                }
+                if hasThunderbolt {
+                    if attempt > 1 {
+                        NSLog("TargetBridge: \(reason) — Thunderbolt Bridge found on interface-refresh attempt \(attempt)/\(maxAttempts)")
+                        TBTelemetryReporter.emit("wake (\(reason)): Thunderbolt Bridge found on attempt \(attempt)/\(maxAttempts)")
+                    }
+                    return
+                }
+                guard attempt < maxAttempts else {
+                    NSLog("TargetBridge: \(reason) — Thunderbolt Bridge still not detected after \(maxAttempts) interface-refresh attempts; proceeding with whatever was found")
+                    TBTelemetryReporter.emit("wake (\(reason)): Thunderbolt Bridge not found after \(maxAttempts) attempts — proceeding")
+                    return
+                }
+                try? await Task.sleep(nanoseconds: delayBetweenAttempts)
+            }
+        }
+        interfaceRefreshRetryTask = task
+        await task.value
+        interfaceRefreshRetryTask = nil
+    }
+
+    /// Every ScreenCaptureKit stream stop funnels through here — the
+    /// `CaptureDelegate.stream(_:didStopWithError:)` callback, and only it.
+    ///
+    /// This used to `stop()` unconditionally, which turned a display sleep into
+    /// the end of the session: macOS stops the stream itself when the display
+    /// goes down, the delegate saw that as a capture error, and the full
+    /// teardown cancelled the TCP connection and destroyed the virtual display.
+    /// The 0x3A sleep packet then never went out (`handleDisplaySleep` guards on
+    /// `isConnected`, which the teardown had already cleared), the receiver's
+    /// panel stayed on, and capture did not come back on wake.
+    ///
+    /// A stopped stream is not a stopped session: the receiver's dead-sender
+    /// watchdog reaps on 10 s of total silence and any bytes reset it, so the 2 s
+    /// heartbeat alone keeps the link alive with no video at all.
+    private func handleCaptureStreamStop(_ error: Error) {
+        let nsError = error as NSError
+        // Is this the stop macOS performs when the display goes down, rather
+        // than a real capture fault? Two signals, in order.
+        //
+        // `senderDisplaySleepReason` is the primary test: it is non-nil only
+        // once this app's own screensDidSleep / willSleep handler has run, so it
+        // is self-explanatory and cannot misfire on an unrelated error.
+        //
+        // The ScreenCaptureKit marker is the fallback for the race where the
+        // stream stop lands before that notification. On the measured
+        // display-sleep stop the system had already stopped the stream, so the
+        // stop we then attempted was a no-op that errored with
+        // `SCStreamErrorDomain` code -3808 (`attemptToStopStreamState`).
+        let isDisplaySleepStop =
+            senderDisplaySleepReason != nil
+            || (nsError.domain == SCStreamErrorDomain
+                && nsError.code == SCStreamError.Code.attemptToStopStreamState.rawValue)
+        guard isDisplaySleepStop, isConnected else {
+            setStatus(.captureError(formattedCaptureErrorMessage(for: error)))
+            stop(resetStatusTo: nil)
+            return
+        }
+        NSLog("TargetBridge: capture stream stopped for display sleep — pausing capture; connection, virtual display and heartbeat stay up")
+        TBTelemetryReporter.emit("display sleep: SCStream stop treated as pause")
+        // Packet first, teardown second; `handleDisplaySleep` already orders it
+        // that way. It is also the only writer of `senderDisplaySleepReason`, so
+        // if the screensDidSleep notification won the race this is a no-op and
+        // the packet is not sent twice. `teardownCapturePipeline` is idempotent
+        // (every step is a guarded stop or a nil-out), so a second entry is
+        // harmless even if the guard were ever bypassed.
+        handleDisplaySleep(fullSystem: false)
+    }
+
+    /// This Mac's display has gone down — the display alone
+    /// (`NSWorkspace.screensDidSleepNotification`) or the whole machine
+    /// (`NSWorkspace.willSleepNotification`).
+    ///
+    /// Two independent things happen. The receiver is told explicitly to let its
+    /// panel sleep, which is the whole point of the feature: it otherwise holds
+    /// PreventUserIdleDisplaySleep for the entire session, so a connected 5K iMac
+    /// never sleeps however idle the sender is. And the capture/encode pipeline
+    /// is torn down, because screen-capturing and encoding a 5K screen that
+    /// nobody can see is most of this app's cost.
+    ///
+    /// CALLED FROM TWO PLACES, and the ordering matters in both:
+    ///  - the NSWorkspace observers above (`screensDidSleep` / `willSleep`);
+    ///  - `handleCaptureStreamStop`, when ScreenCaptureKit's own stop for that
+    ///    same display sleep arrives first.
+    /// The packet is sent BEFORE capture is torn down, and the connection is
+    /// never touched, so `sendSenderDisplaySleep` always runs while
+    /// `connection != nil`. That is the defect being fixed here: previously the
+    /// stream stop called the full `stop()`, which cleared `isConnected` and
+    /// cancelled the connection before this ran, so the guard below returned and
+    /// the 0x3A packet was never sent at all.
+    ///
+    /// Deliberately NOT done here, each for a specific reason:
+    ///  - `isStreaming` stays true, so `scheduleCaptureRestart` — the existing,
+    ///    already-correct restart path — still accepts the wake.
+    ///  - the network connection, virtual display and heartbeat timer are
+    ///    untouched. Frames are not required to keep the session alive: the
+    ///    receiver resets its dead-sender watchdog on any bytes.
+    ///
+    /// The power activity IS ended here (toggle permitting) — see the comment at
+    /// the release. Unlike before this fix, this is no longer about letting the
+    /// Mac sleep: the base activity (`activityOptions()`) never blocks system
+    /// sleep in the first place, held or not. It is now purely resource
+    /// hygiene — nothing is capturing or encoding while the screen is down, so
+    /// there is nothing here that needs App-Nap protection, and (with the
+    /// toggle off) `.idleDisplaySleepDisabled` has already done its one job for
+    /// this transition and gains nothing by staying held on an already-dark
+    /// screen.
+    private func handleDisplaySleep(fullSystem: Bool) {
+        // Nothing to tell a receiver we are not connected to, and its panel is
+        // only ever released by this packet — with no session it keeps today's
+        // always-on behaviour, which is the safe direction.
+        guard isConnected else { return }
+        guard senderDisplaySleepReason == nil else { return }   // transitions only
+
+        let reason = fullSystem ? "systemSleep" : "displaySleep"
+        senderDisplaySleepReason = reason
+        sendSenderDisplaySleep(asleep: true, reason: reason)
+
+        // Pausing capture is only recoverable through the wake path, so it is
+        // gated on the same switch that path uses: with autoRestartOnWake off,
+        // the user has said not to bring capture back automatically, and a pause
+        // nothing would lift would leave the receiver showing a frozen frame.
+        // The packet still goes out — it asks for the panel, not for the stream.
+        if isStreaming, autoRestartOnWake {
+            NSLog("TargetBridge: display asleep (%@) — capture paused, session and heartbeat stay up", reason)
+            TBTelemetryReporter.emit("display sleep: capture paused (\(reason))")
+            teardownCapturePipeline()
+        }
+
+        // The screen is off, so drop the App-Nap-prevention activity: nothing
+        // is capturing or encoding until the wake path restarts it, so there
+        // is nothing left that needs the process kept responsive. This was
+        // once framed as "the one thing stopping this Mac from sleeping" —
+        // it never was, after the `.userInitiated` → `.userInitiatedAllowing-
+        // IdleSystemSleep` fix; the base activity cannot block system sleep
+        // whether it is held or not. Releasing it here is housekeeping, not a
+        // sleep-permission gate.
+        //
+        // PLACEMENT, three deliberate choices, kept even though the release no
+        // longer gates system sleep:
+        //  - AFTER the 0x3A packet, so the send sequence the receiver depends on
+        //    is untouched by this (the send is guarded on `connection` alone, so
+        //    the release could not affect it either way).
+        //  - AFTER `teardownCapturePipeline()`, so the capture pause is complete
+        //    before the App-Nap hold is dropped. Note that function does NOT
+        //    end the activity itself — that separation is what let the pause
+        //    stop capture without also releasing the token, and this line is now
+        //    the one place that adds the release back on top of it.
+        //  - OUTSIDE the `isStreaming, autoRestartOnWake` guard above, because
+        //    the release tracks the capture pause, not that guard. With
+        //    auto-restart off there is no capture pause to make and this still
+        //    has to run; if no capture is running there is no token and
+        //    `releaseStreamingActivity()` is a no-op.
+        // It is inside the `senderDisplaySleepReason == nil` return at the top,
+        // so it fires exactly once per sleep transition — the same guard that
+        // makes the packet transitions-only.
+        //
+        // It does NOT fire on the genuine capture-error path:
+        // `handleCaptureStreamStop` routes that to `stop()`, which ends the
+        // activity itself and never reaches this function.
+        //
+        // With the toggle ON the assertion survives the sleep and the Mac stays
+        // awake with its screen off — today's always-on behaviour, now opt-in.
+        if !preventDisplaySleep {
+            releaseStreamingActivity()
+        }
+    }
+
+    /// The display (or the Mac) is back. Tell the receiver to hold its panel
+    /// awake again, and bring the session back through `verifyConnectionThenResume`.
+    ///
+    /// Reconnect, not just restart, is the fix here: this used to call
+    /// `scheduleCaptureRestart` directly, which restarts CAPTURE only and
+    /// assumes the network connection is still alive. Measured on a real
+    /// system sleep: the TCP session died (`nw_protocol_tcp_wake_disconnected`
+    /// in the sender's own log) but `isConnected` stayed `true` — nothing had
+    /// yet tried to use the socket to notice — so the old code kept capturing
+    /// and hurling frames into a connection that no longer existed, forever.
+    /// `verifyConnectionThenResume` probes before deciding, and only redials
+    /// when the probe (or the absence of a connection at all) says the
+    /// session is actually dead — see its doc comment for the short
+    /// display-sleep case, which must reach the cheap "still alive" branch
+    /// and change nothing else.
+    private func handleDisplayWake() {
+        guard let reason = senderDisplaySleepReason else { return }
+        senderDisplaySleepReason = nil
+        // Re-acquire first, before the `autoRestartOnWake` guard below. The
+        // assertion was released on the way down and the screen is on again, so
+        // it comes back here — and it has to come back on this line, because
+        // with auto-restart off nothing else ever would, leaving the Mac
+        // unheld for the rest of the session. `verifyConnectionThenResume` is
+        // not a substitute: a dead-connection reconnect can take a couple of
+        // seconds, and this one already handles a not-yet-started pipeline, a
+        // changed profile and a failed restart.
+        acquireStreamingActivityIfNeeded()
+        if isConnected {
+            sendSenderDisplaySleep(asleep: false, reason: reason)
+        }
+        Task { @MainActor [weak self] in
+            await self?.refreshLocalInterfacesRetryingForThunderbolt(reason: "display wake (\(reason))")
+            guard let self, self.autoRestartOnWake else { return }
+            self.verifyConnectionThenResume(afterWake: "display wake (\(reason))")
+        }
+    }
+
+#if DEBUG
+    // MARK: - Test-only fault injection
+
+    /// Drives the display-sleep STOP path exactly as ScreenCaptureKit does,
+    /// without sleeping the Mac's display.
+    ///
+    /// The interesting case is a race between two async deliveries that `pmset
+    /// displaysleepnow` cannot re-create on demand — it sleeps the machine being
+    /// tested on, and it does not let you choose which of the two events lands
+    /// first. The injected error has the exact shape the system produced
+    /// (`SCStreamErrorDomain`, code -3808) and `senderDisplaySleepReason` is left
+    /// nil, so this reproduces the HARDER ordering: ScreenCaptureKit's stop
+    /// arriving before the screensDidSleep notification.
+    ///
+    /// Trigger, over a live session:
+    ///   open "targetbridge://simulate-display-sleep-stop"
+    ///   open "targetbridge://simulate-display-wake"
+    /// or headless, with the launch args on the connect action:
+    ///   --simulate-display-sleep-after 12 --simulate-display-wake-after 22
+    func simulateDisplaySleepStreamStop() {
+        let error = NSError(
+            domain: SCStreamErrorDomain,
+            code: SCStreamError.Code.attemptToStopStreamState.rawValue,
+            userInfo: [NSLocalizedDescriptionKey: "simulated display-sleep stream stop"]
+        )
+        handleCaptureStreamStop(error)
+    }
+
+    /// The other ordering: the NSWorkspace notification lands first and the SCK
+    /// stop follows.
+    func simulateScreensDidSleep() {
+        handleDisplaySleep(fullSystem: false)
+    }
+
+    /// The wake half of the round trip.
+    func simulateDisplayWake() {
+        handleDisplayWake()
+    }
+#endif
 
     func restartCaptureNow() {
         scheduleCaptureRestart(reason: "manual restart", delaySeconds: 0.0)
     }
 
+    /// True while a session owns capture — including across a display-sleep
+    /// PAUSE, where the pipeline is gone but `isStreaming` is deliberately still
+    /// true (see `teardownCapturePipeline`). So the "restart capture" control
+    /// stays available while the display is down, which is the intent: a manual
+    /// restart is the user's call.
     var canRestartCapture: Bool {
         isStreaming && activeProfile != nil && !isRestartingCaptureAfterWake
+    }
+
+    /// How long a post-wake liveness probe waits for `send()`'s completion
+    /// before giving up and treating the connection as dead anyway.
+    ///
+    /// Short by design: this only needs to catch the case where the local
+    /// send fails immediately because Network.framework already knows the
+    /// socket is gone (the measured case: `nw_protocol_tcp_wake_disconnected`
+    /// in the sender's own log). It is deliberately NOT long enough to wait
+    /// out a TCP retransmission timeout (~10s, see the comment on
+    /// `viabilityUpdateHandler` above) — a probe that waits that long would
+    /// make every wake feel broken even when reconnecting works.
+    private static let wakeLivenessProbeTimeout: TimeInterval = 2.0
+
+    /// Runs after ANY wake, before capture is touched: decides whether the
+    /// existing connection survived (the common, already-proven-working
+    /// short display-sleep case) or actually died (a real system sleep, or
+    /// any sleep long enough for macOS to tear the socket down), and only
+    /// reconnects in the second case.
+    ///
+    /// WHY NOT JUST CHECK `isConnected`: it is set `true` exactly once, in
+    /// `connect()`'s `.ready` state handler, and cleared in exactly two
+    /// places — the `.cancelled` state handler and `stop()`. Neither of those
+    /// runs automatically when the OS tears a TCP session down out from under
+    /// a suspended process; `NWConnection` only discovers that on the next
+    /// operation it performs (a send/receive), which nothing does while the
+    /// Mac is fully asleep and capture is not yet resumed. Measured on real
+    /// hardware: after a system sleep long enough to kill the socket,
+    /// `isConnected` was still `true` and `connection` was still non-nil —
+    /// the flag is a record of the last KNOWN state, not a live probe, and it
+    /// goes stale exactly in the failure case this function exists to catch.
+    /// So this actively probes instead of trusting the flag.
+    ///
+    /// WHY THIS IS SAFE FOR THE SHORT-SLEEP CASE: a display-only sleep that
+    /// the TCP session survives (the common, already-working case) answers
+    /// the probe normally — `sendHeartbeat`'s completion fires with no error,
+    /// well inside `wakeLivenessProbeTimeout` — and this falls straight
+    /// through to the existing `scheduleCaptureRestart` soft-restart, exactly
+    /// as before this fix. Reconnecting only happens on the two paths that
+    /// prove the connection is actually gone: a completion error, or the
+    /// probe timing out with no completion at all.
+    private func verifyConnectionThenResume(afterWake reason: String) {
+        // Nothing was running before this wake — scheduleCaptureRestart would
+        // already no-op here for the same reason (`guard isStreaming`), so
+        // match that rather than starting a probe or reconnect nobody asked
+        // for. A session that was merely connected but never got as far as
+        // streaming (still waiting on a display profile, say) has nothing
+        // this function needs to protect either; the normal connect timeout
+        // watchdog already covers that case.
+        guard isStreaming else { return }
+        guard !isVerifyingConnectionAfterWake else { return }
+        // The automatic link-loss reconnect loop is the other owner of "we
+        // are trying to reconnect right now" (see `scheduleLinkLossReconnect`
+        // for the full picture). In practice `isStreaming` above already
+        // covers this — that loop's `stop()` clears `isStreaming` before this
+        // guard is ever reached — but the flag is checked explicitly too so
+        // the exclusion holds even if a future change decoupled the two.
+        guard !isAutoReconnectingAfterLinkLoss else {
+            TBTelemetryReporter.emit("wake (\(reason)): link-loss reconnect already owns recovery — skipping")
+            return
+        }
+
+        guard connection != nil, isConnected else {
+            // Defensive only: `stop()` is the sole place `connection` is
+            // cleared, and it always clears `isStreaming` in the same call —
+            // so `isStreaming` true with no connection should not be
+            // reachable. If it ever is, the right answer is the same as a
+            // failed probe: there is nothing to resume in place, reconnect.
+            attemptWakeReconnect(reason: reason)
+            return
+        }
+
+        isVerifyingConnectionAfterWake = true
+        NSLog("TargetBridge: \(reason) — probing connection liveness before resuming")
+
+        let timeoutWorkItem = DispatchWorkItem { [weak self] in
+            guard let self, self.isVerifyingConnectionAfterWake else { return }
+            self.isVerifyingConnectionAfterWake = false
+            NSLog("TargetBridge: \(reason) — liveness probe timed out; treating connection as dead")
+            TBTelemetryReporter.emit("wake (\(reason)): liveness probe timed out — reconnecting")
+            self.attemptWakeReconnect(reason: reason)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.wakeLivenessProbeTimeout, execute: timeoutWorkItem)
+
+        // Reuses the heartbeat packet the receiver already expects on this
+        // exact 2s cadence — no new wire message, nothing for the receiver
+        // to learn. Only the completion is new.
+        sendHeartbeat { [weak self] error in
+            // `isVerifyingConnectionAfterWake` doubles as the "already
+            // resolved" guard between this completion and the timeout work
+            // item above — whichever runs first flips it false and the
+            // other becomes a no-op. Avoids a second, closure-local flag.
+            guard let self, self.isVerifyingConnectionAfterWake else { return }
+            self.isVerifyingConnectionAfterWake = false
+            timeoutWorkItem.cancel()
+            if let error {
+                NSLog("TargetBridge: \(reason) — liveness probe failed (\(error)); reconnecting")
+                TBTelemetryReporter.emit("wake (\(reason)): liveness probe failed (\(error)) — reconnecting")
+                self.attemptWakeReconnect(reason: reason)
+            } else {
+                NSLog("TargetBridge: \(reason) — connection still alive; resuming capture in place")
+                self.scheduleCaptureRestart(reason: reason, delaySeconds: 1.0)
+            }
+        }
+    }
+
+    /// Reconnects to the last-used receiver with NO user interaction: no
+    /// prompt, no Bonjour rediscovery. `receiverIP`/`localInterfaceIP` are
+    /// already-persisted session state (`TBDisplaySenderManager` restores
+    /// them from `UserDefaults` at launch — see `PersistedSession`), so a
+    /// direct redial is all that is needed; Bonjour is only ever the
+    /// fallback for a NEW receiver, not a known one.
+    ///
+    /// `stop()` then `connect()` is the exact recovery `connect()` itself
+    /// already performs for a stale connection object (see "connect: found a
+    /// stale connection object" above) — not a new path invented for wake.
+    /// Capture is deliberately not started here: once the fresh handshake's
+    /// display-profile packet arrives, `handleDisplayProfile` creates the
+    /// virtual display and calls `startCapture` itself, precisely as it does
+    /// after every other successful `connect()` (manual Connect button,
+    /// `targetbridge://connect`, cable test, …). Adding a second capture-start
+    /// call here would race that one.
+    private func attemptWakeReconnect(reason: String) {
+        guard !receiverIP.isEmpty, !localInterfaceIP.isEmpty else {
+            NSLog("TargetBridge: \(reason) — cannot reconnect: receiverIP or localInterfaceIP is empty")
+            TBTelemetryReporter.emit("wake (\(reason)): reconnect aborted — receiverIP/localInterfaceIP empty")
+            stop(resetStatusTo: .connectionFailed("Lost connection during sleep and could not reconnect"))
+            return
+        }
+        NSLog("TargetBridge: \(reason) — connection is dead, reconnecting to \(receiverIP)")
+        TBTelemetryReporter.emit("wake (\(reason)): reconnecting to \(receiverIP)")
+        stop(resetStatusTo: nil)
+        connect()
     }
 
     private func scheduleCaptureRestart(reason: String, delaySeconds: Double) {
@@ -4657,8 +5579,27 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
     }
 
-    private func softRestartCapture(for profile: TBMonitorDisplayProfile) async {
-        // Tear down only the capture pipeline — keep the network connection and virtual display.
+    /// Tears down the capture and encode side, leaving everything that keeps the
+    /// session alive alone.
+    ///
+    /// Factored out of `softRestartCapture` so the display-sleep pause can stop
+    /// exactly the same work without inheriting the one thing a pause must not
+    /// do: clearing `isStreaming`. That would defeat the pause, because with
+    /// `isStreaming` false, `scheduleCaptureRestart` (the path that brings
+    /// capture back on wake) refuses to run at all. The power activity is left
+    /// alone here too, but for a different reason: `softRestartCapture` ends it
+    /// because it is about to begin a fresh one, whereas the pause's release is
+    /// `handleDisplaySleep`'s call, gated on the toggle — keeping the two
+    /// concerns out of this function is what lets them stay independent.
+    ///
+    /// WHAT STOPS: the ScreenCaptureKit stream or the CGDisplayStream, the
+    /// TBVideoPipeline behind them, audio device capture, keep-warm, the FPS and
+    /// cursor timers and the capture-health watchdog. This is where the 60fps
+    /// capture/encode cost lives.
+    /// WHAT CONTINUES: the NWConnection, the virtual display and the heartbeat
+    /// timer. The power assertion is a separate question and is deliberately not
+    /// touched here — see the comment above.
+    private func teardownCapturePipeline() {
         cursorTimer?.invalidate()
         cursorTimer = nil
         fpsTimer?.invalidate()
@@ -4679,15 +5620,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             scStream = nil
         }
         captureDelegate = nil
-        if let activity = streamingActivity {
-            ProcessInfo.processInfo.endActivity(activity)
-            streamingActivity = nil
-        }
         stopAudioDeviceCapture()
         keepWarm.stop()
         pipeline?.stop()
         pipeline = nil
-        isStreaming = false
         liveMetrics.senderFPS = 0
         senderFPS = 0
         videoPathIsRaw = false
@@ -4698,6 +5634,16 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         sentSnapshot = 0
         cursorDisplayID = kCGNullDirectDisplay
         lastCursorPacket = nil
+    }
+
+    private func softRestartCapture(for profile: TBMonitorDisplayProfile) async {
+        // Tear down only the capture pipeline — keep the network connection and virtual display.
+        teardownCapturePipeline()
+        if let activity = streamingActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            streamingActivity = nil
+        }
+        isStreaming = false
 
         let started = await startCapture(for: profile)
         if !started {
@@ -4912,7 +5858,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         send(packet)
     }
 
-    private func send(_ packet: Data) {
+    private func send(_ packet: Data, onCompletion: (@MainActor (Error?) -> Void)? = nil) {
         // Report send failures instead of discarding them.
         //
         // This swallowed every error: `.contentProcessed({ _ in })` means a
@@ -4925,19 +5871,28 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // Nil connection is its own case: send() called after teardown is a
         // caller-ordering bug, not a network failure, and the two must not
         // look the same.
+        //
+        // `onCompletion` is an optional hook for a caller that needs the
+        // result of THIS send specifically -- currently only the wake-time
+        // liveness probe, which reuses this exact path (and its existing
+        // failure logging) rather than dialling its own NWConnection.send.
+        // Every other caller passes nothing and behaves exactly as before.
         guard let conn = connection else {
             TBTelemetryReporter.emit("send: DROPPED — no connection (\(packet.count) bytes)")
             TBLog.connection.error("send: dropped \(packet.count) bytes — connection is nil")
+            onCompletion?(nil)
             return
         }
         conn.send(content: packet, completion: .contentProcessed({ [weak self] error in
-            guard let error else { return }
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                TBTelemetryReporter.emit("send: FAILED — \(error)")
-                TBLog.connection.error(
-                    "send: failed after \(packet.count, privacy: .public) bytes — \(error.localizedDescription, privacy: .public)")
-                self.lastConnectionStateDetail = "send failed: \(error.localizedDescription)"
+                if let error {
+                    TBTelemetryReporter.emit("send: FAILED — \(error)")
+                    TBLog.connection.error(
+                        "send: failed after \(packet.count, privacy: .public) bytes — \(error.localizedDescription, privacy: .public)")
+                    self.lastConnectionStateDetail = "send failed: \(error.localizedDescription)"
+                }
+                onCompletion?(error)
             }
         }))
     }

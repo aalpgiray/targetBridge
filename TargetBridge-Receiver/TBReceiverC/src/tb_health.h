@@ -51,6 +51,8 @@ extern "C" {
 void tb_health_start(void);
 
 /* Hold off App Nap and other background throttling for the whole process.
+ * Does NOT block system sleep -- see tb_health_session_begin()/_end() below
+ * for the part that intentionally does, and only while a client is connected.
  *
  * A display receiver is doing user-initiated work even when it is not the front
  * app: the picture must keep arriving while the user clicks something else on
@@ -61,8 +63,28 @@ void tb_health_start(void);
  * never returned. From the user's side the receiver simply freezes on return and
  * only a relaunch clears it.
  *
- * Safe to call more than once; the assertion is held until the process exits. */
+ * Safe to call more than once; the assertion is held until the process exits.
+ * Called once, unconditionally, at startup -- there is no client-session gate
+ * on this one, because App Nap can hit the process before any client ever
+ * connects and there is nothing in it that blocks the Mac's own owner from
+ * sleeping (NSActivityUserInitiatedAllowingIdleSystemSleep, not plain
+ * NSActivityUserInitiated). */
 void tb_health_hold_awake(void);
+
+/* Hold system sleep for the duration of one client session.
+ *
+ * Unlike tb_health_hold_awake() above, THIS is the assertion that blocks the
+ * Mac's own owner from idle-sleeping -- legitimate only while a client is
+ * actively connected and there is a live picture being decoded and rendered
+ * that nothing else can do if the machine sleeps mid-stream. Call
+ * tb_health_session_begin() when a client connects and tb_health_session_end()
+ * when that session ends (including on a fatal read error, an explicit close
+ * request, or the idle-sender reaper) -- symmetrically with client_fd's own
+ * lifecycle in main.c. Both are idempotent: a begin with a session already
+ * held, or an end with none held, is a no-op rather than a leak or a
+ * double-free. */
+void tb_health_session_begin(void);
+void tb_health_session_end(void);
 
 /* Per-stage CPU accounting for the receive path.
  *

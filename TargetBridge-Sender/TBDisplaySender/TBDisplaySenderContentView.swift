@@ -565,6 +565,15 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                             }
                         }
                         .pickerStyle(.menu)
+                        // Refresh on open: `.simultaneousGesture` rather than
+                        // `.onTapGesture` so the tap does not steal the click
+                        // from the menu's own AppKit pop-up — both fire.
+                        // Same fix as the equivalent picker in
+                        // TBMonitorsWindowView's linkSection; this is the
+                        // settings-sheet copy of the same dropdown.
+                        .simultaneousGesture(TapGesture().onEnded {
+                            service.refreshLocalInterfaces()
+                        })
                         // Picking here is the user stating a preference, which is
                         // what survives the interface going away and coming back.
                         .onChange(of: session.localInterfaceIP) { _, newValue in
@@ -582,6 +591,10 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                             }
                         }
                         .pickerStyle(.menu)
+                        // Same rationale as the local-interface picker above.
+                        .simultaneousGesture(TapGesture().onEnded {
+                            service.refreshLocalInterfaces()
+                        })
                         .onChange(of: session.selectedReceiverID) { _, newValue in
                             guard let receiver = service.discoveredReceivers.first(where: { $0.id == newValue }) else { return }
                             service.applyDiscoveredReceiver(receiver, to: session)
