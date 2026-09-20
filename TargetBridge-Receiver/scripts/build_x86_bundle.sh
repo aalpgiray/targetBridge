@@ -220,7 +220,27 @@ for lib in libavcodec libswscale; do
 done
 install_name_tool -id "@loader_path/libavutil.dylib" "$APP/Contents/Frameworks/libavutil.dylib" 2>/dev/null || true
 
-codesign --force --deep --sign - "$APP" 2>/dev/null
+# Ad-hoc signing (--sign -) has no certificate, so macOS keys TCC and Local
+# Network grants to the cdhash — the exact bytes of the binary. Every rebuild
+# is then a different app as far as the OS is concerned, and every grant
+# (microphone, Local Network) is lost and must be re-approved. This is the
+# same problem TargetBridge-Sender/scripts/build_targetbridge_sender_app.sh
+# already solves for the sender — see make_local_signing_cert.sh's own
+# comment for the full explanation. Sign with the same stable identity here
+# so the receiver's grants survive a rebuild too.
+#
+# Falls back to ad-hoc rather than failing the build, so a fresh clone still
+# builds — but it says so loudly, because the fallback reintroduces the churn.
+SIGN_IDENTITY="${TB_SIGN_IDENTITY:-TargetBridge Local Signing}"
+if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$SIGN_IDENTITY"; then
+    echo "Signing receiver application as \"$SIGN_IDENTITY\"..."
+    codesign --force --deep --sign "$SIGN_IDENTITY" "$APP"
+else
+    echo "WARNING: no \"$SIGN_IDENTITY\" identity found — falling back to ad-hoc." >&2
+    echo "         Microphone / Local Network access will NOT survive this reinstall." >&2
+    echo "         Run TargetBridge-Sender/scripts/make_local_signing_cert.sh to fix permanently." >&2
+    codesign --force --deep --sign - "$APP" 2>/dev/null
+fi
 
 echo
 echo "==> $APP"
