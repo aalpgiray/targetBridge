@@ -127,6 +127,45 @@ FALSIFIED as the cause — do not re-chase for this incident:
     teardown call anywhere near the failure; the receiver's log was the only
     side that recorded an explicit teardown decision.
 
+## Receiver silently stops rendering, no crash — pre-existing, not caused by any sleep/wake fix (2026-09-20)
+
+Symptom: receiver looks frozen — display stops updating — but the process is
+still alive, still logging health lines, still holding its TCP session. Not a
+hang at the OS level. User confirms this predates tonight's sleep/wake work;
+do not treat it as a regression from that session when investigating.
+
+MEASURED, from receiver-local.log across one occurrence:
+
+```
+16:16:05.150  [metal] all 3 frame surfaces busy; dropping frames
+16:16:07.501  [cadence] ... worst 494.3 ms          <- one huge frame gap
+16:16:07.928  [main] 60 fps                          <- last normal frame log
+16:16:09.784  [health] cpu 61% uploadcopy 12% submit 29%   <- still working
+16:16:14.791  [health] cpu 39% gpu 0% uploadcopy 0% submit 0% drawable n=0
+   ... same zeroed pattern continues for ~50s ...
+16:16:59.856  [health] cpu 2% — still zero drawable/submit activity
+=== process killed and relaunched by user here ===
+```
+
+Precisely bounded: ~51s of zero GPU submit / zero drawable activity, process
+never recovered on its own, no crash log, no exception, no segfault anywhere.
+`[health]`'s own tick kept running the whole time — this is a stuck render
+path, not a stuck main loop.
+
+Leading indicator worth re-testing first if this recurs: "all 3 frame
+surfaces busy; dropping frames" appeared once, ~3s before the last healthy
+frame — every other frame-surface-busy/drop event seen elsewhere in these
+logs recovers within a second or two on its own; this one didn't. Check
+whether the Metal presentation path can permanently exhaust its 3 surfaces
+and never reclaim one (a stuck completion handler, a present that never
+signals) rather than looking at anything connection/sleep-related — the TCP
+session and health tick were both fine throughout.
+
+NOT YET INVESTIGATED: no root cause found, no fix attempted. This entry
+exists so the next occurrence isn't debugged from zero — grep
+receiver-local.log for "all 3 frame surfaces busy" near the freeze window
+first.
+
 ## Already falsified — do not re-chase
 
 For connect failures: the firewall, TCC, entitlements, a reboot, six reinstalls,
