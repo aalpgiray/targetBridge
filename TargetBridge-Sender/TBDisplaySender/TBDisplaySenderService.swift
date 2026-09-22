@@ -2387,6 +2387,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// already true, and `verifyConnectionThenResume`/`attemptWakeReconnect`
     /// will not fire while a backoff retry is pending, so a wake landing mid
     /// backoff cannot stack a duplicate reconnect attempt on top of this one.
+    /// Set on a deliberate, user-visible stop (Disconnect button, app quit,
+    /// switching receivers) and left set until the user asks to connect
+    /// again. Both automatic reconnect paths (link-loss backoff and Bonjour
+    /// idle-rediscovery) must check this — without it, `receiverIP` staying
+    /// populated after a deliberate stop (needed for the *wanted* case: link
+    /// died, want back in) also lets the next idle re-announce silently
+    /// reconnect a session the user just told to stop.
+    private var userInitiatedStop = false
     private var isAutoReconnectingAfterLinkLoss = false
     /// Read-only window onto `isAutoReconnectingAfterLinkLoss` for
     /// `TBDisplaySenderManager.normalizeSessionInterfaces()`, which lives in a
@@ -2671,6 +2679,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     func connect() {
+        // Any call to connect() — whether the user's own button or an
+        // automatic path (wake, link-loss backoff, Bonjour rediscovery) that
+        // got this far — means we are no longer in the "user deliberately
+        // stopped" state the flag exists to record.
+        userInitiatedStop = false
         // A user-visible button must never do nothing silently.
         //
         // This guard used to be a bare `return`: press Connect with a stranded
@@ -3063,6 +3076,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         linkLossReconnectWorkItem = nil
         isAutoReconnectingAfterLinkLoss = false
         linkLossReconnectAttempt = 0
+        userInitiatedStop = true
         stop(resetStatusTo: .stopped, persistArrangement: persistArrangement)
     }
 
@@ -3206,6 +3220,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// below is likewise guarded so a wake landing mid-backoff does not stack
     /// a second reconnect attempt on top of this one.
     private func scheduleLinkLossReconnect() {
+        guard !userInitiatedStop else {
+            TBTelemetryReporter.emit("link-loss reconnect: user stopped deliberately — not scheduling")
+            return
+        }
         guard !isAutoReconnectingAfterLinkLoss else {
             TBTelemetryReporter.emit("link-loss reconnect: already in flight — ignoring duplicate trigger")
             return
@@ -3309,6 +3327,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     ///     better evidence than an unexpired timer, so jump the queue instead
     ///     of running both.
     func attemptReconnectIfIdleAfterRediscovery() {
+        guard !userInitiatedStop else {
+            TBTelemetryReporter.emit(
+                "bonjour rediscovery: receiver reappeared — user stopped deliberately, not reconnecting")
+            return
+        }
         guard !isConnected, !isStreaming else { return }
         guard connection == nil else { return }
         guard !isCableTestConnection else { return }
