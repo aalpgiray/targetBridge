@@ -133,6 +133,7 @@ SOURCES=(
     "$CODEC/tb_dpcm.c"
     "$SRC/tb_gesture_bridge.m" "$SRC/tb_display_tweaks.m"
     "$SRC/tb_mic_capture.m" "$SRC/tb_metal_plane.m" "$SRC/tb_health.m"
+    "$SRC/tb_wake_watch.m"
 )
 for s in "${SOURCES[@]}"; do
     [ -f "$s" ] || { echo "!! missing source $s"; exit 1; }

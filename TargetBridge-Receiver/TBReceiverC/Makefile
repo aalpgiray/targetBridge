@@ -41,7 +41,7 @@ LDFLAGS  += -framework ApplicationServices -framework AppKit -framework CoreFoun
 endif
 
 C_SRC = src/main.c src/net.c src/decoder.c src/display.c src/tb_i18n.c src/tb_logship.c
-OBJC_SRC = src/tb_gesture_bridge.m src/tb_display_tweaks.m src/tb_mic_capture.m src/tb_metal_plane.m src/tb_health.m
+OBJC_SRC = src/tb_gesture_bridge.m src/tb_display_tweaks.m src/tb_mic_capture.m src/tb_metal_plane.m src/tb_health.m src/tb_wake_watch.m
 OBJ = $(C_SRC:.c=.o) $(OBJC_SRC:.m=.o) $(CODEC_OBJ)
 BIN = tbreceiver
 

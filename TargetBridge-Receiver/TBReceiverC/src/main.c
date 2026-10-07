@@ -24,6 +24,7 @@
 #include "tb_i18n.h"
 #include "tb_logship.h"
 #include "tb_health.h"
+#include "tb_wake_watch.h"
 
 #include <SDL.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -42,6 +43,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,6 +115,45 @@
  * within one health tick, not so frequent it spams mDNSResponder while
  * nothing has changed. */
 #define TB_IDLE_ANNOUNCE_INTERVAL_MS 5000
+
+/* Audio output self-healing.
+ *
+ * The SDL audio device is opened once at startup and nothing ever checked it
+ * again -- measured incident, 2026-09-2x: the receiver ran across ~5 days of
+ * this iMac's sleep/wake cycles, the sender kept streaming audio the whole
+ * time (driver->app loopback measured ~385 KB/s, matching 48kHz stereo
+ * float), the iMac's own output (iMac Speakers, volume 82, not muted) was
+ * fine, and the unified log showed zero CoreAudio/HALC activity from
+ * TBReceiver in the last hour. Restarting the process fixed it instantly,
+ * which only proves the device object SDL held was no longer a live route --
+ * not which of the two ways that happens (callback stopped firing, or kept
+ * firing into dead air) actually occurred. So two independent detectors:
+ *
+ *   1. A heartbeat: audio_callback() bumps a counter every time CoreAudio
+ *      calls it. If the counter has not advanced across two consecutive ~1s
+ *      checks, or SDL itself reports the device is not SDL_AUDIO_PLAYING,
+ *      the callback has stopped -- close and reopen.
+ *   2. NSWorkspaceDidWakeNotification (tb_wake_watch.h): covers the case the
+ *      heartbeat cannot see, where the callback keeps firing on schedule but
+ *      into a route CoreAudio already tore down under it. Reopen unconditionally
+ *      on wake; the cost of one needless reopen is a few ms of silence, and
+ *      unlike the heartbeat this fires the instant the OS says the machine
+ *      is back, not up to a watchdog period later.
+ *
+ * Threshold: 2 ticks means at least one full check interval (~1s, matching
+ * this file's TB_IDLE_ANNOUNCE_INTERVAL_MS-style 1Hz idiom) with zero
+ * progress, i.e. up to ~2s of silence before recovery fires. A single ~21ms
+ * callback period stalling once is normal scheduling jitter, not death; the
+ * SDL callback buffer is spec.samples=1024 frames at 48kHz (~21ms), so a
+ * device that is still alive calls back roughly 47 times a second -- a full
+ * second of zero calls is unambiguous. Longer than that just delays
+ * recovery for no benefit, since the callback itself is essentially free. */
+#define TB_AUDIO_WATCHDOG_INTERVAL_MS 1000
+#define TB_AUDIO_WATCHDOG_STALL_TICKS 2
+/* Reopen retries (startup failure, or a reopen that itself fails) back off to
+ * this cadence rather than trying every loop iteration or staying silent
+ * forever -- matches the health/idle-announce family's ~5s idiom. */
+#define TB_AUDIO_REOPEN_RETRY_MS 5000
 
 #define TB_CTRL_QUEUE_MAX 512
 
@@ -314,6 +355,24 @@ struct app {
     int      input_tap_consumes_events;
 
     SDL_AudioDeviceID audio_device;
+
+    /* Watchdog bookkeeping for tb_audio_open()/tb_audio_watchdog_tick() below.
+     * audio_cb_ticks is written by audio_callback() (CoreAudio's own audio
+     * thread, per SDL2's HAL-backed implementation -- see tb_audio_open()'s
+     * comment for why the main loop reading it here is safe without a lock)
+     * and read+compared by the main loop, hence atomic rather than a plain
+     * counter: on x86_64 a lone uint64_t increment/read is already atomic at
+     * the ISA level, but marking the intent explicitly is what stops a future
+     * change (e.g. compiler auto-vectorizing, or porting to an arch without
+     * that guarantee) from silently reintroducing a race on a variable whose
+     * only job is telling the truth about whether audio is still alive. */
+    _Atomic uint64_t audio_cb_ticks;
+    uint64_t audio_watchdog_last_ticks;   /* value sampled at the previous check */
+    uint64_t audio_watchdog_last_ms;      /* when that sample was taken */
+    uint32_t audio_watchdog_stall_count;  /* consecutive checks with zero progress */
+    uint64_t audio_reopen_retry_ms;       /* next time to retry an open that failed; 0 = not pending */
+    uint64_t audio_diag_last_ms;          /* last [audio] diagnostic line, separate cadence from the watchdog */
+    uint64_t audio_diag_last_ticks;
 
     /* Senders older than the Float32 change send Int16 and do not say so in
      * their hello. Assume Int16 until told otherwise, so such a sender plays
@@ -1260,12 +1319,176 @@ static void ring_read(struct app *a, Uint8 *dst, int len) {
 
 static void audio_callback(void *userdata, Uint8 *stream, int len) {
     struct app *a = (struct app *)userdata;
+    /* Heartbeat: proves this callback is still being driven by CoreAudio at
+     * all, independent of whether the ring buffer had anything queued for it.
+     * Runs on CoreAudio's own render thread (SDL2's macOS backend calls this
+     * straight from the HAL I/O proc), which is why it is a plain increment
+     * on an atomic rather than anything that could block -- see the field's
+     * declaration in struct app and tb_audio_open()'s comment for the full
+     * threading picture. */
+    atomic_fetch_add_explicit(&a->audio_cb_ticks, 1, memory_order_relaxed);
     if (a->audio_buf_size >= len) {
         ring_read(a, stream, len);
     } else {
         int available = a->audio_buf_size;
         if (available > 0) ring_read(a, stream, available);
         memset(stream + available, 0, len - available);
+    }
+}
+
+/* ---- Audio output open/close/watchdog ---------------------------------
+ *
+ * See the TB_AUDIO_WATCHDOG_* comment near the top of the file for why this
+ * exists at all. tb_audio_open()/tb_audio_close() factor out what used to be
+ * inline, startup-only code in main() so the exact same path opens the
+ * device the first time and reopens it later -- a startup-only helper that a
+ * reopen calls slightly differently is exactly how this class of bug hides.
+ *
+ * THREADING: audio_device is only ever written here, and both call sites --
+ * main()'s startup and tb_audio_watchdog_tick() below -- run on the main
+ * thread. TB_PKT_AUDIO_FRAME (the other reader of audio_device, in on_packet)
+ * also only ever runs on the main thread: reader_on_packet() queues audio
+ * frames into ctrl_q for anything that is not TB_PKT_RAW_FRAME/RAW_DPCM, and
+ * pump_network() drains that queue by calling on_packet() from inside the
+ * main loop; the non-threaded fallback path (drain_socket() -> the parser's
+ * callback) reaches on_packet() the same way, synchronously from the main
+ * loop. So a reopen and an incoming audio frame can never actually run at
+ * the same time -- confirmed by reading the call graph, not assumed. The one
+ * real cross-thread access is CoreAudio's render thread calling
+ * audio_callback() while the main thread calls SDL_CloseAudioDevice(): SDL
+ * itself makes that safe (SDL_CloseAudioDevice stops and joins the device's
+ * audio thread before returning, so the callback cannot be mid-flight when
+ * the device handle is invalidated), which is the same guarantee close_client()
+ * already relies on implicitly today. The ring-buffer field reset below still
+ * takes SDL_LockAudioDevice on the *new* device, matching close_client()'s
+ * existing pattern, because audio_callback on that new device starts running
+ * immediately once SDL_PauseAudioDevice(0) is called and must not observe a
+ * half-written head/tail/size. */
+
+static void tb_audio_close(struct app *a) {
+    if (a->audio_device == 0) return;
+    SDL_CloseAudioDevice(a->audio_device);   /* stops+joins the callback thread first */
+    a->audio_device = 0;
+}
+
+/* 0 on success. On failure a.audio_device is left at 0 and the caller is
+ * responsible for scheduling a retry (see TB_AUDIO_REOPEN_RETRY_MS) --
+ * this function never blocks or spins waiting for the device to appear. */
+static int tb_audio_open(struct app *a) {
+    SDL_AudioSpec spec;
+    SDL_zero(spec);
+    spec.freq = AUDIO_SAMPLE_RATE;
+    spec.format = AUDIO_F32SYS; // 32-bit float, native endian — CoreAudio's own format
+    spec.channels = AUDIO_CHANNELS;          // Stereo
+    spec.samples = 1024;   // ~21ms at 48kHz; see the startup comment this replaced
+    spec.callback = audio_callback;
+    spec.userdata = a;
+    SDL_AudioSpec obtained;
+    SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &spec, &obtained, 0);
+    if (dev == 0) {
+        fprintf(stderr, "[audio] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+        return -1;
+    }
+    a->audio_device = dev;
+
+    /* Fresh device, fresh ring buffer -- matching close_client()'s existing
+     * reset (~line 2799). Anything queued for the old device is audio timed
+     * against a route that is gone; playing it out on the new one would just
+     * be stale sound at the wrong moment, and it is a few ms of buffer at
+     * most (AUDIO_BACKLOG_MAX_MS=150). */
+    SDL_LockAudioDevice(a->audio_device);
+    a->audio_buf_head = 0;
+    a->audio_buf_tail = 0;
+    a->audio_buf_size = 0;
+    SDL_UnlockAudioDevice(a->audio_device);
+
+    /* Rebaseline the watchdog against this device's own callback stream --
+     * comparing post-reopen ticks against a pre-reopen count would read the
+     * gap while the old device was dead as more of the same stall. */
+    atomic_store_explicit(&a->audio_cb_ticks, 0, memory_order_relaxed);
+    a->audio_watchdog_last_ticks = 0;
+    a->audio_watchdog_last_ms = now_ms();
+    a->audio_watchdog_stall_count = 0;
+
+    SDL_PauseAudioDevice(a->audio_device, 0); // Start playing (unpaused)
+    fprintf(stderr, "[audio] output device opened: %d Hz, %d ch, 32-bit float (obtained %d samples)\n",
+            AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, obtained.samples);
+    return 0;
+}
+
+/* Called once per main-loop iteration; internally rate-limited to
+ * TB_AUDIO_WATCHDOG_INTERVAL_MS for the stall check and
+ * TB_AUDIO_DIAG_INTERVAL_MS for the diagnostic line, so calling it every
+ * iteration costs one atomic load and two integer comparisons in the common
+ * case where neither is due yet. */
+static void tb_audio_watchdog_tick(struct app *a, uint64_t t) {
+    /* System wake: the failure mode this covers is a callback that keeps
+     * firing right through the sleep/wake (ticks advancing normally) into a
+     * route CoreAudio has already torn down, which the heartbeat below
+     * cannot distinguish from healthy output. Reopen unconditionally rather
+     * than trying to confirm it is actually dead first -- an unnecessary
+     * reopen costs a few ms of silence, a missed dead route costs the rest
+     * of the session, same trade the heartcheck below makes the other way
+     * for a stall that is NOT a wake. */
+    if (tb_wake_watch_take_wake()) {
+        fprintf(stderr, "[audio] output stalled (system wake) -- reopening\n");
+        tb_audio_close(a);
+        a->audio_reopen_retry_ms = (tb_audio_open(a) != 0) ? t + TB_AUDIO_REOPEN_RETRY_MS : 0;
+        return;
+    }
+
+    if (a->audio_device == 0) {
+        /* Never opened, or a previous (re)open attempt failed outright.
+         * Retry on a timer rather than spinning every loop iteration or
+         * staying silent forever until someone restarts the process. */
+        if (a->audio_reopen_retry_ms != 0 && t >= a->audio_reopen_retry_ms) {
+            fprintf(stderr, "[audio] retrying output device open\n");
+            a->audio_reopen_retry_ms = (tb_audio_open(a) != 0) ? t + TB_AUDIO_REOPEN_RETRY_MS : 0;
+        }
+        if (t - a->audio_diag_last_ms >= TB_AUDIO_WATCHDOG_INTERVAL_MS * 5) {
+            fprintf(stderr, "[audio] dead (device not open)\n");
+            a->audio_diag_last_ms = t;
+        }
+        return;
+    }
+
+    if (t - a->audio_watchdog_last_ms >= TB_AUDIO_WATCHDOG_INTERVAL_MS) {
+        const uint64_t ticks = atomic_load_explicit(&a->audio_cb_ticks, memory_order_relaxed);
+        const SDL_AudioStatus status = SDL_GetAudioDeviceStatus(a->audio_device);
+        const int status_bad = (status != SDL_AUDIO_PLAYING);
+        /* Compared against the value sampled at the PREVIOUS tick, not
+         * against any wall-clock-derived expectation of how many ticks
+         * "should" have happened by now -- a single long loop stall (a
+         * 68-minute single iteration was observed live across a sleep) must
+         * not read as "zero progress since forever ago" on the very first
+         * tick after it. audio_watchdog_last_ticks only ever changes here,
+         * so whatever real time elapsed during that stall, this compares
+         * against the count from immediately before it, which is the
+         * correct comparison rather than a false trigger. */
+        const int no_progress = (ticks == a->audio_watchdog_last_ticks);
+        a->audio_watchdog_stall_count = no_progress ? a->audio_watchdog_stall_count + 1 : 0;
+        a->audio_watchdog_last_ticks = ticks;
+        a->audio_watchdog_last_ms = t;
+
+        if (status_bad || a->audio_watchdog_stall_count >= TB_AUDIO_WATCHDOG_STALL_TICKS) {
+            const char *reason = status_bad ? "device not playing" : "callback stalled";
+            fprintf(stderr, "[audio] output stalled (%s) -- reopening\n", reason);
+            tb_audio_close(a);
+            a->audio_reopen_retry_ms = (tb_audio_open(a) != 0) ? t + TB_AUDIO_REOPEN_RETRY_MS : 0;
+            return;   /* tb_audio_open() already rebaselined the diag counters */
+        }
+    }
+
+    /* Low-noise periodic diagnostic, separate cadence from the stall check
+     * above (5x slower) so next time this needs measuring there is a number
+     * on record instead of only a restart to go on. */
+    if (t - a->audio_diag_last_ms >= TB_AUDIO_WATCHDOG_INTERVAL_MS * 5) {
+        const uint64_t ticks = atomic_load_explicit(&a->audio_cb_ticks, memory_order_relaxed);
+        const double elapsed_s = (double)(t - a->audio_diag_last_ms) / 1000.0;
+        const double rate = elapsed_s > 0.0 ? (double)(ticks - a->audio_diag_last_ticks) / elapsed_s : 0.0;
+        fprintf(stderr, "[audio] %s cb=%.1f/s\n", rate > 1.0 ? "ok" : "dead", rate);
+        a->audio_diag_last_ms = t;
+        a->audio_diag_last_ticks = ticks;
     }
 }
 
@@ -2863,27 +3086,15 @@ int main(int argc, char **argv) {
     a.disp = tb_disp_create(fullscreen);
     if (!a.disp) { fprintf(stderr, "tb_disp_create failed\n"); return 1; }
 
-
-    /* Open SDL Audio Device */
-    SDL_AudioSpec spec;
-    SDL_zero(spec);
-    spec.freq = AUDIO_SAMPLE_RATE;
-    spec.format = AUDIO_F32SYS; // 32-bit float, native endian — CoreAudio's own format
-    spec.channels = AUDIO_CHANNELS;          // Stereo
-    /* Frames per callback. A power of two, as SDL expects, and ~21 ms at
-     * 48 kHz: small enough that output latency stays tight, large enough that a
-     * scheduling hiccup does not underrun. */
-    spec.samples = 1024;
-    spec.callback = audio_callback;
-    spec.userdata = &a;
-    SDL_AudioSpec obtained;
-    a.audio_device = SDL_OpenAudioDevice(NULL, 0, &spec, &obtained, 0);
-    if (a.audio_device != 0) {
-        SDL_PauseAudioDevice(a.audio_device, 0); // Start playing (unpaused)
-        fprintf(stderr, "[main] SDL audio device opened: %d Hz, %d ch, 32-bit float (obtained %d samples)\n",
-                AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, obtained.samples);
-    } else {
-        fprintf(stderr, "[main] warning: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+    /* Open the audio output through the same helper reopen uses -- see the
+     * "Audio output open/close/watchdog" section above for why a startup-only
+     * variant of this code is exactly how the self-healing path used to be
+     * absent. A startup failure is not fatal to the process (video still
+     * works with no sound); the watchdog below retries every
+     * TB_AUDIO_REOPEN_RETRY_MS instead of leaving it silent forever. */
+    tb_wake_watch_start();
+    if (tb_audio_open(&a) != 0) {
+        a.audio_reopen_retry_ms = now_ms() + TB_AUDIO_REOPEN_RETRY_MS;
     }
 
     struct tb_display_info boot_info;
@@ -2966,6 +3177,15 @@ int main(int argc, char **argv) {
             a.last_idle_announce_ms = t;
             bonjour_update(&a, TB_PORT);
         }
+
+        /* Audio output watchdog. Unlike the Bonjour re-announce above this
+         * runs whether or not a client is attached -- audio can be silently
+         * dead across a sleep/wake with no session live to notice, and the
+         * next connect deserves working sound from its first frame rather
+         * than a fresh 2s detection window. See the TB_AUDIO_WATCHDOG_*
+         * comment near the top of the file for the two failure modes this
+         * covers and why the thresholds are what they are. */
+        tb_audio_watchdog_tick(&a, t);
 
         /* Accept the client. One accept per iteration.
          *
@@ -3321,9 +3541,7 @@ int main(int argc, char **argv) {
     bonjour_deinit(&a);
     tb_parser_free(&a.parser);
     tb_dec_destroy(a.dec);
-    if (a.audio_device != 0) {
-        SDL_CloseAudioDevice(a.audio_device);
-    }
+    tb_audio_close(&a);
     tb_disp_destroy(a.disp);
     fprintf(stderr, "[main] bye\n");
     return 0;
