@@ -127,6 +127,36 @@ FALSIFIED as the cause — do not re-chase for this incident:
     teardown call anywhere near the failure; the receiver's log was the only
     side that recorded an explicit teardown decision.
 
+## Sender stops connecting after hours; restarting the app fixes it (2026-10-07, fixed)
+
+Symptom: after a long idle/sleep the sender dials and times out forever; the
+receiver is listening and logs no dial at all; quitting and relaunching the
+sender connects instantly.
+
+PROVEN: the sender process ran out of NECP flows. `log show --predicate
+'processID == <pid>'` showed `NECP_CLIENT_ACTION_ADD_FLOW ... [12: Cannot
+allocate memory]`, first ~10h before the user noticed, and dozens of flows
+still `waiting parent-flow` that had been started hours earlier. Source:
+`sendLanguageUpdate()` opened a fresh NWConnection to every advertised
+receiver IP (including the Wi-Fi LAN one) on every `$receivers` publish, and
+never cancelled one that sat in `.waiting`. The 4s interface-refresh timer
+restarted the Bonjour browser each tick, so it published constantly
+(~60 connections/min, connection ids past 71000 in 1.5h).
+
+Fix: cancel on `.waiting` plus a 3s deadline; push only on language change
+or a new receiver/address; the 4s timer restarts discovery only when the
+interface list changed (that restart also made the main window flicker
+every tick). Verified: 0 new connections/min and no stray dials on the
+receiver afterwards.
+
+First check next time: `log show --predicate 'processID == <pid>'` for
+`Cannot allocate memory`, and count `] start$` lines per minute on
+`com.apple.network` for that pid.
+
+Receiver audio: the startup line is now `[audio] output device opened`
+(was `[main] SDL audio device opened`), and `[audio] ok|dead cb=N/s` is
+logged every 5s.
+
 ## Receiver silently stops rendering, no crash — pre-existing, not caused by any sleep/wake fix (2026-09-20)
 
 Symptom: receiver looks frozen — display stops updating — but the process is

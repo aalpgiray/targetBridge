@@ -786,25 +786,33 @@ struct TBAddonDetailPageView: View {
     @ViewBuilder
     private var audioDriverSection: some View {
         Section {
+            // Above the install/remove controls: this is the setting someone
+            // actually changes, whereas the driver state is usually just
+            // checked.
+            Toggle(TBDisplaySenderL10n.autoSelectAudioOutput(service.language),
+                   isOn: $service.autoSelectAudioOutput)
+            Text(TBDisplaySenderL10n.autoSelectAudioOutputHint(service.language))
+                .font(.caption)
+                .foregroundStyle(.secondary)
             switch driverStatus {
             case .notBundled:
-                Text("This build does not include the driver.")
+                Text(TBDisplaySenderL10n.driverNotBundled(service.language))
                     .foregroundStyle(.secondary)
             case .notInstalled:
-                LabeledContent("System driver") {
-                    Text("Not installed").foregroundStyle(.orange)
+                LabeledContent(TBDisplaySenderL10n.systemDriverLabel(service.language)) {
+                    Text(TBDisplaySenderL10n.driverNotInstalled(service.language)).foregroundStyle(.orange)
                 }
-                Button("Install…") { runInstaller(install: true) }
+                Button(TBDisplaySenderL10n.installDriverButton(service.language)) { runInstaller(install: true) }
             case .installed(let version):
-                LabeledContent("System driver") {
-                    Text("Installed · \(version)").foregroundStyle(.secondary)
+                LabeledContent(TBDisplaySenderL10n.systemDriverLabel(service.language)) {
+                    Text(TBDisplaySenderL10n.driverUpToDate(version, service.language)).foregroundStyle(.secondary)
                 }
-                Button("Remove…", role: .destructive) { runInstaller(install: false) }
-            case .outdated(let installed, let bundled):
-                LabeledContent("System driver") {
-                    Text("\(installed) → \(bundled)").foregroundStyle(.orange)
+                Button(TBDisplaySenderL10n.removeDriverButton(service.language), role: .destructive) { runInstaller(install: false) }
+            case .outdated:
+                LabeledContent(TBDisplaySenderL10n.systemDriverLabel(service.language)) {
+                    Text(TBDisplaySenderL10n.driverUpdateAvailable(service.language)).foregroundStyle(.orange)
                 }
-                Button("Update…") { runInstaller(install: true) }
+                Button(TBDisplaySenderL10n.updateDriverButton(service.language)) { runInstaller(install: true) }
             }
         } header: {
             Text("Audio device")

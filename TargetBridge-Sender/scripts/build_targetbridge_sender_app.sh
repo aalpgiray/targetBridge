@@ -26,6 +26,30 @@ xcodebuild \
 mkdir -p "$DEST_DIR"
 rm -rf "$DEST_APP"
 ditto "$SOURCE_APP" "$DEST_APP"
+
+# Bundle the audio driver.
+#
+# The app's driver page compares the driver it ships against the one in
+# /Library/Audio/Plug-Ins/HAL and offers Install / Update / "Up to date". With
+# nothing bundled it can only ever say "This build does not include the driver",
+# which is what every build said until this step existed.
+#
+# The driver's build.sh stamps CFBundleVersion with a hash of its own sources,
+# so an unchanged driver is reused rather than recompiled — libASPL is a
+# universal build and not quick.
+DRIVER_DIR="$REPO_ROOT/TargetBridge-AudioDriver"
+DRIVER_BUNDLE="$DRIVER_DIR/build/TargetBridge.driver"
+DRIVER_HASH=$(cd "$DRIVER_DIR" && cat Driver.cpp build.sh | shasum -a 256 | cut -c1-12)
+BUILT_HASH=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" \
+    "$DRIVER_BUNDLE/Contents/Info.plist" 2>/dev/null || true)
+if [[ "$BUILT_HASH" != "$DRIVER_HASH" ]]; then
+    echo "Building audio driver ($DRIVER_HASH)..."
+    bash "$DRIVER_DIR/build.sh"
+else
+    echo "Audio driver unchanged ($DRIVER_HASH), reusing build."
+fi
+ditto "$DRIVER_BUNDLE" "$DEST_APP/Contents/Resources/TargetBridge.driver"
+
 echo "Cleaning extended attributes..."
 xattr -cr "$DEST_APP" || true
 # Sign with a STABLE identity, not ad-hoc.
@@ -54,6 +78,11 @@ SIGN_IDENTITY="${TB_SIGN_IDENTITY:-TargetBridge Local Signing}"
 if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$SIGN_IDENTITY"; then
     echo "Signing sender application as \"$SIGN_IDENTITY\"..."
     codesign --force --deep --sign "$SIGN_IDENTITY" "$DEST_APP"
+    # --deep just re-signed the bundled driver with our certificate. Put it
+    # back to ad-hoc — the signature the driver's own build.sh gives it and the
+    # only one proven to load in coreaudiod here — then reseal the app around it.
+    codesign --force --sign - "$DEST_APP/Contents/Resources/TargetBridge.driver"
+    codesign --force --sign "$SIGN_IDENTITY" "$DEST_APP"
 else
     echo "WARNING: no \"$SIGN_IDENTITY\" identity found — falling back to ad-hoc." >&2
     echo "         Local Network access will NOT survive this reinstall." >&2

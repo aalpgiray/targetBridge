@@ -54,7 +54,10 @@ final class TBDisplaySenderService: ObservableObject {
         didSet {
             language.persist()
             sessions.forEach { $0.language = language }
-            pushLanguageUpdateToDiscoveredReceivers()
+            // forceAll: true -- the language itself just changed, so every
+            // currently known receiver needs the new value regardless of
+            // what was last pushed to it (see `lastPushedReceiverState`).
+            pushLanguageUpdateToDiscoveredReceivers(forceAll: true)
             objectWillChange.send()
         }
     }
@@ -112,6 +115,25 @@ final class TBDisplaySenderService: ObservableObject {
             objectWillChange.send()
         }
     }
+    /// Switch the system output to the TargetBridge device when a stream
+    /// starts, and back (via the existing `TBDefaultOutputGuard.restoreIfSelected()`)
+    /// when it ends.
+    ///
+    /// Off by default: taking over the user's audio output is not something
+    /// to do uninvited. With it on, casting behaves like plugging in a
+    /// monitor with speakers -- sound follows the picture without a trip to
+    /// Sound settings. Ported from commit 144a721; see
+    /// `observeStreamingForAudioDriver()` for the wiring and
+    /// `TBDefaultOutputGuard.selectOursWhenPublished()` for why this polls
+    /// rather than waits a fixed delay.
+    @Published var autoSelectAudioOutput: Bool =
+        UserDefaults.standard.bool(forKey: "fd.tbdisplaysender.autoSelectAudioOutput") {
+        didSet {
+            UserDefaults.standard.set(autoSelectAudioOutput,
+                                      forKey: "fd.tbdisplaysender.autoSelectAudioOutput")
+            objectWillChange.send()
+        }
+    }
     @Published var verboseDisplayLogging: Bool = UserDefaults.standard.bool(forKey: "fd.tbdisplaysender.verboseDisplayLogging") {
         didSet {
             UserDefaults.standard.set(verboseDisplayLogging, forKey: "fd.tbdisplaysender.verboseDisplayLogging")
@@ -143,6 +165,10 @@ final class TBDisplaySenderService: ObservableObject {
     /// mean "TargetBridge is running", which is what the driver's probe was
     /// really asking all along.
     private var audioDriverReceiver: TBAudioDriverReceiver?
+    /// One subscription per session, watching for isStreaming to become true
+    /// so the audio output can follow it when `autoSelectAudioOutput` is on.
+    /// See `observeStreamingForAudioDriver()`.
+    private var audioDriverStreamObservers: Set<AnyCancellable> = []
     private var sessionCancellables: [UUID: AnyCancellable] = [:]
     private let receiverDiscovery = TBReceiverDiscovery()
     private let addonStore = TBAddonStore.shared
@@ -165,6 +191,26 @@ final class TBDisplaySenderService: ObservableObject {
     /// the manual "Refresh IP" button already does) not to matter at that
     /// rate.
     private var interfaceRefreshTimer: Timer?
+    /// What was last actually pushed to each discovered receiver, keyed by
+    /// `TBDiscoveredReceiver.id` (service name + preferred IP).
+    ///
+    /// `$receivers` republishes on every Bonjour browse event, and the 4s
+    /// `interfaceRefreshTimer` restarts the browser, so without this,
+    /// `pushLanguageUpdateToDiscoveredReceivers()` fired on every tick and
+    /// opened a fresh `NWConnection` per advertised IP each time -- measured
+    /// live at ~60 new connections/minute for receivers that had not changed
+    /// at all. This records the IP set and language code last sent to each
+    /// receiver id so a browse tick with nothing new to say is a no-op.
+    ///
+    /// Absence is judged by time, not by one publish: `refreshLocalInterfaces()`
+    /// runs `receiverDiscovery.refresh()` every 4s, which publishes an EMPTY
+    /// list (`stop()` sets `receivers = []`) and then re-resolves the same
+    /// receiver milliseconds later. Clearing state on that empty publish
+    /// re-pushed on every tick and defeated the dedup entirely. A receiver
+    /// counts as gone -- and is pushed again on reappearance (sleep/wake,
+    /// receiver restart) -- only after `languagePushForgetAfter` unseen.
+    private var lastPushedReceiverState: [String: (ips: Set<String>, languageCode: String, lastSeen: Date)] = [:]
+    private let languagePushForgetAfter: TimeInterval = 30
 
     private init() {
         discoveryCancellable = receiverDiscovery.$receivers.sink { [weak self] receivers in
@@ -187,6 +233,7 @@ final class TBDisplaySenderService: ObservableObject {
         // Publish the audio device immediately, not on first stream.
         refreshAudioDriverListener()
         observeAudioDeviceSelection()
+        observeStreamingForAudioDriver()
         startClipboardMonitoring()
         startInterfaceRefreshMonitoring()
         activationObserver = NotificationCenter.default.addObserver(
@@ -249,6 +296,47 @@ final class TBDisplaySenderService: ObservableObject {
                 TBLog.connection.notice("audio: TargetBridge selected as output — enabling audio on \(off.count, privacy: .public) session(s)")
                 self.objectWillChange.send()
             }
+        }
+    }
+
+    /// Switch the audio output to ours whenever any session's stream starts,
+    /// when `autoSelectAudioOutput` is on.
+    ///
+    /// Driven from `$isStreaming` through Combine rather than patched into
+    /// each of the several start paths (manual connect, wake-reconnect,
+    /// link-loss backoff reconnect, Bonjour idle-rediscovery reconnect) —
+    /// all of them converge on the session setting `isStreaming = true` in
+    /// `startCapture`/`startDirectDisplayStream`, so one subscription per
+    /// session covers every trigger with no separate wiring per reconnect
+    /// path. Ported from commit 144a721 ("fix(sender): the audio device
+    /// exists only while a stream can carry sound").
+    ///
+    /// Calls `TBDefaultOutputGuard.shared.selectOursWhenPublished()` directly
+    /// rather than routing through `refreshAudioDriverListener()`: unlike the
+    /// original commit, this app's listener is NOT gated on `anyStreaming` —
+    /// it opens at app launch and stays up for the app's whole lifetime (see
+    /// that function's own doc comment) — so there is no "listener just
+    /// started" edge to hang the select off. `selectOursWhenPublished()`
+    /// polls for up to 8s regardless of whether the device happens to be
+    /// published already, which covers both the common case (listener has
+    /// been up for a while, device already published) and the rarer one
+    /// (audio driver addon just turned on, or the very first stream right
+    /// after launch, where the driver's 1 Hz probe has not yet landed).
+    ///
+    /// Rebuilt from scratch each time sessions change: a stale subscription
+    /// to a removed session would keep it alive.
+    private func observeStreamingForAudioDriver() {
+        audioDriverStreamObservers.removeAll()
+        for session in sessions {
+            session.$isStreaming
+                .removeDuplicates()
+                .filter { $0 }
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    guard let self, self.autoSelectAudioOutput, self.audioDriverAvailable else { return }
+                    TBDefaultOutputGuard.shared.selectOursWhenPublished()
+                }
+                .store(in: &audioDriverStreamObservers)
         }
     }
 
@@ -427,6 +515,7 @@ final class TBDisplaySenderService: ObservableObject {
         }
         attachSession(session)
         sessions.append(session)
+        observeStreamingForAudioDriver()
         schedulePersist()
         objectWillChange.send()
     }
@@ -435,6 +524,7 @@ final class TBDisplaySenderService: ObservableObject {
         guard sessions.count > 1 else { return }
         session.stop()
         sessions.removeAll { $0.id == session.id }
+        observeStreamingForAudioDriver()
         sessionCancellables.removeValue(forKey: session.id)
         normalizeAddonState()
         normalizeSessionInterfaces()
@@ -553,6 +643,7 @@ final class TBDisplaySenderService: ObservableObject {
             session.audioDriverAvailable = audioDriverAvailable
             attachSession(session)
             sessions.append(session)
+            observeStreamingForAudioDriver()
         }
         // Mark the latch repair done whether or not it changed anything, so a
         // later deliberate "audio off" is never second-guessed.
@@ -610,6 +701,24 @@ final class TBDisplaySenderService: ObservableObject {
 
     func refreshLocalInterfaces() {
         localInterfaces = detectLocalInterfaces()
+        receiverDiscovery.refresh()
+        normalizeSessionInterfaces()
+        objectWillChange.send()
+    }
+
+    /// The 4s timer's tick. Same work as `refreshLocalInterfaces()`, but only
+    /// when the interface list actually changed. Running the full refresh
+    /// unconditionally made the main window flicker every few seconds
+    /// (measured on a screen recording): `receiverDiscovery.refresh()` empties
+    /// `receivers` and re-resolves it, so the selected receiver vanished for
+    /// ~150ms -- the page showed "Session 1" with an empty receiver row -- and
+    /// came back, every tick. An unchanged interface list has nothing for a
+    /// browser restart to fix; the passive browser already reports receivers
+    /// coming and going on its own.
+    private func refreshLocalInterfacesIfChanged() {
+        let detected = detectLocalInterfaces()
+        guard detected != localInterfaces else { return }
+        localInterfaces = detected
         receiverDiscovery.refresh()
         normalizeSessionInterfaces()
         objectWillChange.send()
@@ -951,7 +1060,7 @@ final class TBDisplaySenderService: ObservableObject {
         interfaceRefreshTimer?.invalidate()
         interfaceRefreshTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.refreshLocalInterfaces()
+                self?.refreshLocalInterfacesIfChanged()
             }
         }
     }
@@ -1043,15 +1152,44 @@ final class TBDisplaySenderService: ObservableObject {
         }
     }
 
-    private func pushLanguageUpdateToDiscoveredReceivers() {
+    private func pushLanguageUpdateToDiscoveredReceivers(forceAll: Bool = false) {
         let receivers = discoveredReceivers
         let languageCode = language.fileStem
+        let now = Date()
+        // Forget receivers unseen for longer than `languagePushForgetAfter`
+        // (see that property for why a single empty publish is not "gone"),
+        // so a real reappearance is pushed again.
+        lastPushedReceiverState = lastPushedReceiverState.filter {
+            now.timeIntervalSince($0.value.lastSeen) < languagePushForgetAfter
+        }
+
         for receiver in receivers {
             let candidateIPs = [receiver.preferredIP, receiver.thunderboltIP, receiver.networkIP]
+            let ipsForReceiver = Set(candidateIPs.filter { !$0.isEmpty })
+
+            // Measured live: `$receivers` republishes on every Bonjour browse
+            // event, and the 4s `interfaceRefreshTimer` restarts the browser,
+            // so calling this unconditionally opened a fresh `NWConnection`
+            // per advertised IP on every tick (~60/minute) even when nothing
+            // about the receiver or the language had changed. Skip receivers
+            // whose IP set and language we already pushed, unless the caller
+            // is the language-change path (`forceAll`), which must always
+            // reach every currently known receiver. Subset, not equality: a
+            // receiver re-resolves in stages after each browser restart (one
+            // address, then all three), and every partial view would
+            // otherwise look "changed". Only a genuinely new address pushes.
+            if !forceAll, let last = lastPushedReceiverState[receiver.id],
+               ipsForReceiver.isSubset(of: last.ips), last.languageCode == languageCode {
+                lastPushedReceiverState[receiver.id]?.lastSeen = now
+                continue
+            }
+
             var sentTo = Set<String>()
             for ip in candidateIPs where !ip.isEmpty && sentTo.insert(ip).inserted {
                 sendLanguageUpdate(to: ip, languageCode: languageCode)
             }
+            let knownIPs = lastPushedReceiverState[receiver.id].map { $0.languageCode == languageCode ? $0.ips : [] } ?? []
+            lastPushedReceiverState[receiver.id] = (knownIPs.union(ipsForReceiver), languageCode, now)
         }
     }
 
@@ -1105,14 +1243,38 @@ final class TBDisplaySenderService: ObservableObject {
             using: .tcp
         )
 
+        // Measured live: a connection that lands in `.waiting` (receiver
+        // asleep, address unreachable -- routine for `networkIP`, a Wi-Fi LAN
+        // address that is dialed even when nothing is listening there) was
+        // never cancelled by the old handler, which only reacted to `.ready`
+        // and `.failed`/`.cancelled`. Dozens of these accumulated per process
+        // until NECP's flow table ran out (`NECP_CLIENT_ACTION_ADD_FLOW ...
+        // Cannot allocate memory`), after which every real display-link
+        // connect failed too, until the app was restarted. Cancel on
+        // `.waiting` as well, and back it with a hard ~3s deadline -- longer
+        // than any real LAN round trip, short enough that even a connection
+        // whose state callback never arrives cannot outlive this call for
+        // long. Lifetime is deliberate: the handler and the deadline both hold
+        // `connection` strongly (a weak capture would let the wrapper die
+        // before `.ready` and the push would silently never happen), and the
+        // cycle is broken in the terminal branch -- every path, including the
+        // deadline and a successful send, ends in `.cancelled`, which nils
+        // `stateUpdateHandler` and releases it. The deadline is not cancelled
+        // on early completion: `cancel()` is idempotent, so firing on an
+        // already-finished connection is a no-op that only holds it 3s.
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) {
+            connection.cancel()
+        }
+
         connection.stateUpdateHandler = { state in
             switch state {
             case .ready:
                 connection.send(content: packet, completion: .contentProcessed { _ in
                     connection.cancel()
                 })
-            case .failed, .cancelled:
+            case .waiting, .failed, .cancelled:
                 connection.cancel()
+                connection.stateUpdateHandler = nil
             default:
                 break
             }

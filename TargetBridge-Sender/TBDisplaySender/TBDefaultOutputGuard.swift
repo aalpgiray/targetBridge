@@ -171,4 +171,83 @@ final class TBDefaultOutputGuard: @unchecked Sendable {
             TBLog.connection.error("audio: failed to restore output device (\(status, privacy: .public))")
         }
     }
+
+    /// Make our device the system output, remembering what was there before so
+    /// `restoreIfSelected()` can put it back when the stream ends.
+    ///
+    /// The mirror of `restoreIfSelected`, for "switch automatically when
+    /// casting starts". No-op when our device is already selected, and when
+    /// it is not published at all -- the driver only publishes while a
+    /// stream is live, so calling this before the listener is up would find
+    /// nothing to select.
+    @discardableResult
+    func selectOursIfAvailable() -> Bool {
+        guard let current = currentDefaultOutput() else { return false }
+        if isOurs(current) {
+            // Already selected -- by macOS restoring its remembered choice,
+            // or by the user. Nothing to do: `restoreIfSelected()` already
+            // falls back to `fallbackDevice()` when there is no remembered
+            // `previousDeviceID`, and `noteCurrentDefault()` (driven by the
+            // property listener `begin()` installs at launch) already
+            // records the last non-ours device whenever one was selected, so
+            // there is nothing this branch needs to capture.
+            return true
+        }
+
+        guard var target = ourDevice() else { return false }
+
+        // Remember the real device explicitly rather than relying on the
+        // observer having seen it: this runs at session start, and the
+        // change notification for the switch below may not have landed yet.
+        lock.lock(); previousDeviceID = current; lock.unlock()
+
+        var addr = defaultOutputAddress()
+        let size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject),
+                                                &addr, 0, nil, size, &target)
+        if status == noErr {
+            TBTelemetryReporter.emit("audio: output switched to TargetBridge for this stream")
+            return true
+        }
+        TBLog.connection.error("audio: auto-switch failed (\(status, privacy: .public))")
+        return false
+    }
+
+    /// Wait for the driver to publish the device, then select it.
+    ///
+    /// A fixed delay does not work: the driver republishes on its first
+    /// answered probe, but it probes at 1 Hz and CoreAudio then has to add
+    /// the device and notify listeners. Measured with a 1.5 s delay, the log
+    /// said "device is not published yet" on most reconnects and succeeded
+    /// only when the timing happened to line up (see commit 144a721). So
+    /// poll for the device instead of guessing.
+    func selectOursWhenPublished(timeout: TimeInterval = 8.0) {
+        let deadline = Date().addingTimeInterval(timeout)
+
+        func attempt() {
+            if selectOursIfAvailable() { return }
+            guard Date() < deadline else {
+                TBTelemetryReporter.emit(
+                    "audio: auto-switch gave up — device never appeared within \(Int(timeout))s")
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { attempt() }
+        }
+        attempt()
+    }
+
+    /// Our published device, or nil when the driver has withdrawn it.
+    private func ourDevice() -> AudioDeviceID? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size) == noErr else { return nil }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &ids) == noErr else { return nil }
+        return ids.first(where: { isOurs($0) })
+    }
 }

@@ -425,8 +425,48 @@ enum TBDisplaySenderL10n {
         text("sender.toggle.auto_restart_on_wake", language)
     }
 
+    static func autoSelectAudioOutput(_ language: TBDisplaySenderLanguage) -> String {
+        text("sender.toggle.auto_select_audio_output", language)
+    }
+
+    static func autoSelectAudioOutputHint(_ language: TBDisplaySenderLanguage) -> String {
+        text("sender.toggle.auto_select_audio_output_hint", language)
+    }
+
     static func restartCaptureButton(_ language: TBDisplaySenderLanguage) -> String {
         text("sender.button.restart_capture", language)
+    }
+
+    static func systemDriverLabel(_ language: TBDisplaySenderLanguage) -> String {
+        text("sender.label.system_driver", language)
+    }
+
+    static func driverNotBundled(_ language: TBDisplaySenderLanguage) -> String {
+        text("sender.driver.not_bundled", language)
+    }
+
+    static func driverNotInstalled(_ language: TBDisplaySenderLanguage) -> String {
+        text("sender.driver.not_installed", language)
+    }
+
+    static func driverUpToDate(_ version: String, _ language: TBDisplaySenderLanguage) -> String {
+        text("sender.driver.up_to_date", language, ["version": version])
+    }
+
+    static func driverUpdateAvailable(_ language: TBDisplaySenderLanguage) -> String {
+        text("sender.driver.update_available", language)
+    }
+
+    static func installDriverButton(_ language: TBDisplaySenderLanguage) -> String {
+        text("sender.button.install_driver", language)
+    }
+
+    static func updateDriverButton(_ language: TBDisplaySenderLanguage) -> String {
+        text("sender.button.update_driver", language)
+    }
+
+    static func removeDriverButton(_ language: TBDisplaySenderLanguage) -> String {
+        text("sender.button.remove_driver", language)
     }
 
     static func streamAudio(_ language: TBDisplaySenderLanguage) -> String {
