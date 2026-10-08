@@ -157,6 +157,38 @@ Receiver audio: the startup line is now `[audio] output device opened`
 (was `[main] SDL audio device opened`), and `[audio] ok|dead cb=N/s` is
 logged every 5s.
 
+## Thunderbolt link dead after sleep; replugging fixes it (2026-10-08)
+
+Symptom: after a sleep both Macs report "No device connected" on every
+Thunderbolt port (`system_profiler SPThunderboltDataType`), cable still in.
+Replugging restores it. Not app-level: no process can fail link training.
+
+MEASURED (one failing and one working cycle, n=2 -- not proven):
+  - The link always drops while the iMac sleeps; that is normal.
+  - Failing case: the iMac woke by itself (network packet) while the
+    MacBook was LOCKED (`Lock Screen state ... lockedLogin`). The MacBook
+    logged `kIOPort_Message_AuthorizationStateChange` at 12:07:07.77 and the
+    iMac saw the MacBook leave the port 0.1s later; link training then
+    failed for good.
+  - Working cases: the same authorization message, but the MacBook was
+    unlocked (`screenOff` only) when the iMac came back.
+  - Likely cause: the MacBook's "Allow accessories to connect" (Privacy &
+    Security; Apple Silicon only) refusing a reconnect while locked. Set to
+    "Always" on 2026-10-08; afterwards no authorization messages were logged
+    at all. Still untested: iMac waking while the MacBook is locked.
+
+Why the iMac woke on its own: Wake for Network Access (`womp 1`). The wake
+packet is logged on the iMac by corecapture:
+`updateWoWReasonToIoReg ... Wake reason<E_RX_IP_PACKET:2> <packet hex>` --
+decode the source address and look it up with `ndp -an` / `arp -an`. One
+wake was the user's iPhone (Continuity, IPv6 link-local TCP); others were
+the sender dialling over Wi-Fi (fixed in 271ce73). `womp` set to 0 on the
+iMac; nothing in TargetBridge needs it -- the human wakes it by power button.
+
+On the iMac over ssh, `log` is shadowed by zsh: use `/usr/bin/log`. If the
+Thunderbolt link is down, ssh via the iMac's Wi-Fi address with
+`-o HostKeyAlias=10.0.1.2`.
+
 ## Receiver silently stops rendering, no crash — pre-existing, not caused by any sleep/wake fix (2026-09-20)
 
 Symptom: receiver looks frozen — display stops updating — but the process is
