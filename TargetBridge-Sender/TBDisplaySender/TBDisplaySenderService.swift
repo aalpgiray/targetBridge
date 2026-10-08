@@ -2744,7 +2744,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // sends it out the primary interface (usually Wi-Fi) and a dial to a
         // Thunderbolt Bridge peer leaves by the wrong link. A routable address
         // like 10.0.1.2 has its own route — `route get 10.0.1.2` names en1 — so
-        // the pin adds nothing there.
+        // the pin adds nothing there *while that route exists*. See the
+        // `prohibitedInterfaceTypes` block below for the case where it doesn't.
         //
         // And it can cost something: with the pin, Network.framework rejected
         // this exact dial in 29ms with ENETDOWN while `nc` from the same host to
@@ -2753,6 +2754,32 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         let needsSourcePin = receiverIP.hasPrefix("169.254.")
         if needsSourcePin, let localPort = NWEndpoint.Port(rawValue: 0) {
             params.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(localInterfaceIP), port: localPort)
+        }
+
+        // Thunderbolt Bridge sessions must never leave over Wi-Fi/cellular,
+        // regardless of what the route table says at dial time.
+        //
+        // MEASURED (2026-10-08): the comment above — "a routable address has
+        // its own route, so it reaches the right link regardless" — holds only
+        // while the Thunderbolt interface is actually up. Sender telemetry
+        // caught the case where it wasn't: `connect: dialing host=10.0.1.2
+        // port=54321 scoped=10.0.1.2 local=10.0.1.1 iface=nil
+        // transport=thunderboltBridge pin=false`, with the matching
+        // `com.apple.network` log showing that exact dial going out en0
+        // (Wi-Fi), and the receiver's `pmset` log waking 1-2s later
+        // (`DarkWake ... due to EC.ARPT`, `DriverReason:E_RX_IP_PACKET`).
+        // `connectInterfaceName` (computed just below) is nil exactly when the
+        // Thunderbolt interface is missing from `currentIPv4Interfaces()` —
+        // i.e. genuinely down — so its TB-specific route is gone too, and an
+        // unrestricted dial silently falls through to the default route,
+        // which on this machine is Wi-Fi. Excluding Wi-Fi/cellular from the
+        // candidate interfaces removes that fallback entirely: the dial either
+        // rides the real bridge link or sits in `.waiting` (handled in
+        // `stateUpdateHandler` below) until the interface reappears — it can
+        // no longer leave by the wrong link no matter what the route table
+        // says.
+        if transportKind == .thunderboltBridge {
+            params.prohibitedInterfaceTypes = [.wifi, .cellular]
         }
 
         // Scope link-local dials to the interface that owns the local IP.

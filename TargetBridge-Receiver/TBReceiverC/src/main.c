@@ -1344,9 +1344,10 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
  * device the first time and reopens it later -- a startup-only helper that a
  * reopen calls slightly differently is exactly how this class of bug hides.
  *
- * THREADING: audio_device is only ever written here, and both call sites --
- * main()'s startup and tb_audio_watchdog_tick() below -- run on the main
- * thread. TB_PKT_AUDIO_FRAME (the other reader of audio_device, in on_packet)
+ * THREADING: audio_device is only ever written here, and all call sites --
+ * the accept branch's client-connect handling, close_client(), and
+ * tb_audio_watchdog_tick() below -- run on the main thread. TB_PKT_AUDIO_FRAME
+ * (the other reader of audio_device, in on_packet)
  * also only ever runs on the main thread: reader_on_packet() queues audio
  * frames into ctrl_q for anything that is not TB_PKT_RAW_FRAME/RAW_DPCM, and
  * pump_network() drains that queue by calling on_packet() from inside the
@@ -1422,6 +1423,27 @@ static int tb_audio_open(struct app *a) {
  * iteration costs one atomic load and two integer comparisons in the common
  * case where neither is due yet. */
 static void tb_audio_watchdog_tick(struct app *a, uint64_t t) {
+    /* No client attached: audio output is intentionally closed (see
+     * close_client()), not merely paused, so CoreAudio's IO actually stops
+     * and coreaudiod drops its PreventUserIdleSystemSleep assertion --
+     * measured on the iMac, that assertion was held by coreaudiod for the
+     * entire 49h+ runtime of a receiver that left the device open and
+     * unpaused (playing silence) with no client connected at all. There is
+     * nothing to stall-check or reopen until a session exists, so bail
+     * before any of that; drain the wake flag too, so a wake that lands
+     * while idle doesn't queue up a spurious reopen-on-wake for whatever
+     * session connects next (tb_audio_open() on that accept already starts
+     * clean). */
+    if (a->client_fd < 0) {
+        (void)tb_wake_watch_take_wake();
+        a->audio_reopen_retry_ms = 0;
+        if (t - a->audio_diag_last_ms >= TB_AUDIO_WATCHDOG_INTERVAL_MS * 5) {
+            fprintf(stderr, "[audio] idle (no client)\n");
+            a->audio_diag_last_ms = t;
+        }
+        return;
+    }
+
     /* System wake: the failure mode this covers is a callback that keeps
      * firing right through the sleep/wake (ticks advancing normally) into a
      * route CoreAudio has already torn down, which the heartbeat below
@@ -2951,13 +2973,26 @@ static void close_client(struct app *a) {
     tb_parser_free(&a->parser);
     tb_parser_init(&a->parser, on_packet, a);
     tb_dec_reset(a->dec);   /* fresh decoder for next session */
-    if (a->audio_device != 0) {
-        SDL_LockAudioDevice(a->audio_device);
-        a->audio_buf_head = 0;
-        a->audio_buf_tail = 0;
-        a->audio_buf_size = 0;
-        SDL_UnlockAudioDevice(a->audio_device);
-    }
+    /* Audio output only runs with a client attached: actually close the
+     * device here rather than pausing it. SDL2's CoreAudio backend (checked
+     * against SDL 2.32.10's src/audio/coreaudio/SDL_coreaudio.m) implements
+     * output via AudioQueue and never assigns impl->PauseDevice, so
+     * SDL_PauseAudioDevice() only flips an atomic the AudioQueue's own
+     * callback checks before writing silence (outputCallback()) -- the
+     * AudioQueue (and the CoreAudio IO underneath it) keeps running either
+     * way. COREAUDIO_CloseDevice() is the only path that calls
+     * AudioQueueStop()+AudioQueueDispose(), which is what actually stops the
+     * IO and lets coreaudiod drop its PreventUserIdleSystemSleep assertion --
+     * measured on the iMac holding that assertion for a receiver's entire
+     * 49h+ idle runtime, with no client ever attached, because the device
+     * was left open (just unpaused and silent). tb_audio_close() also resets
+     * audio_device to 0, so TB_PKT_AUDIO_FRAME's `if (a->audio_device != 0)`
+     * guard (on_packet()) safely no-ops for frames that arrive before the
+     * next session opens it again; the ring-buffer reset that used to live
+     * here is now redundant with tb_audio_open()'s own reset on next
+     * connect. */
+    tb_audio_close(a);
+    a->audio_reopen_retry_ms = 0;   /* nothing to retry while idle */
     fprintf(stderr, "[main] client disconnected\n");
 }
 
@@ -3086,16 +3121,15 @@ int main(int argc, char **argv) {
     a.disp = tb_disp_create(fullscreen);
     if (!a.disp) { fprintf(stderr, "tb_disp_create failed\n"); return 1; }
 
-    /* Open the audio output through the same helper reopen uses -- see the
-     * "Audio output open/close/watchdog" section above for why a startup-only
-     * variant of this code is exactly how the self-healing path used to be
-     * absent. A startup failure is not fatal to the process (video still
-     * works with no sound); the watchdog below retries every
-     * TB_AUDIO_REOPEN_RETRY_MS instead of leaving it silent forever. */
+    /* Audio output now opens per client session (see the accept branch below
+     * and close_client()) instead of at startup. Measured on the iMac: a
+     * receiver that opened the device here and left it open-but-silent with
+     * no client attached held coreaudiod's PreventUserIdleSystemSleep
+     * assertion for its entire 49h+ idle runtime -- CoreAudio IO keeps
+     * running (and coreaudiod keeps the assertion) for as long as the
+     * device is open, pause or no pause. Nothing to open at startup. */
     tb_wake_watch_start();
-    if (tb_audio_open(&a) != 0) {
-        a.audio_reopen_retry_ms = now_ms() + TB_AUDIO_REOPEN_RETRY_MS;
-    }
+    a.audio_reopen_retry_ms = 0;
 
     struct tb_display_info boot_info;
     if (tb_disp_get_info(a.disp, &boot_info) == 0) {
@@ -3178,13 +3212,14 @@ int main(int argc, char **argv) {
             bonjour_update(&a, TB_PORT);
         }
 
-        /* Audio output watchdog. Unlike the Bonjour re-announce above this
-         * runs whether or not a client is attached -- audio can be silently
-         * dead across a sleep/wake with no session live to notice, and the
-         * next connect deserves working sound from its first frame rather
-         * than a fresh 2s detection window. See the TB_AUDIO_WATCHDOG_*
-         * comment near the top of the file for the two failure modes this
-         * covers and why the thresholds are what they are. */
+        /* Audio output watchdog. This is a no-op while idle now -- output
+         * only runs with a client attached (opened on accept just below,
+         * closed in close_client()), so there is nothing live to stall or
+         * reopen until a session exists; tb_audio_watchdog_tick() checks
+         * a.client_fd itself and prints the idle diagnostic instead. See the
+         * TB_AUDIO_WATCHDOG_* comment near the top of the file for the two
+         * failure modes this still covers once a session is live, and why
+         * the thresholds are what they are. */
         tb_audio_watchdog_tick(&a, t);
 
         /* Accept the client. One accept per iteration.
@@ -3281,6 +3316,18 @@ int main(int argc, char **argv) {
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] client connected\n");
+                /* Audio output runs only while a client is attached (see
+                 * close_client() and the "Audio output open/close/watchdog"
+                 * comment above for why pausing the device isn't enough and
+                 * it has to be actually closed/opened): open fresh for this
+                 * session. tb_audio_open() already resets the ring buffer
+                 * and rebaselines the watchdog counters, so the first frames
+                 * of this session are neither lost nor misread as a stall. A
+                 * failed open isn't fatal -- the watchdog retries every
+                 * TB_AUDIO_REOPEN_RETRY_MS same as it always has. */
+                if (tb_audio_open(&a) != 0) {
+                    a.audio_reopen_retry_ms = t + TB_AUDIO_REOPEN_RETRY_MS;
+                }
                 /* System sleep is legitimate to block only while a client is
                  * actually presenting a picture; a live TCP accept is the
                  * start of that session, and close_client() -- the single

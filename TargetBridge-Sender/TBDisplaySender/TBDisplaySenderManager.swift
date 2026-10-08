@@ -1152,6 +1152,37 @@ final class TBDisplaySenderService: ObservableObject {
         }
     }
 
+    /// Which address(es) a language push should actually dial for `receiver`,
+    /// restricted to the transport(s) a session of ours uses to reach it.
+    ///
+    /// MEASURED (2026-10-08): this used to be unconditionally `[preferredIP,
+    /// thunderboltIP, networkIP]`, so a receiver reached entirely over
+    /// Thunderbolt Bridge still got a one-shot control dial at its Wi-Fi LAN
+    /// `networkIP` on every browse tick. The comment on `sendLanguageUpdate`
+    /// already noted this was "routine ... even when nothing is listening
+    /// there" — but wake-on-network does not require a listener: the
+    /// receiver's Wi-Fi NIC wakes the whole sleeping Mac on ANY inbound IP
+    /// packet (`pmset`: `DarkWake ... due to EC.ARPT`,
+    /// `DriverReason:E_RX_IP_PACKET`, looping every ~48s for hours). Only
+    /// dial the address matching the transport actually in use: a receiver
+    /// with a session over `.thunderboltBridge` gets only `thunderboltIP`
+    /// (never `networkIP`); one reached only over `.networkLink` still gets
+    /// its `networkIP` as before. A receiver with no session yet (first
+    /// discovery, nothing connected) gets a single dial at its own
+    /// self-declared `preferredIP` rather than all three.
+    private func relevantLanguagePushIPs(for receiver: TBDiscoveredReceiver) -> Set<String> {
+        let receiverIPs = Set([receiver.preferredIP, receiver.thunderboltIP, receiver.networkIP].filter { !$0.isEmpty })
+        let matchingTransports = Set(
+            sessions
+                .filter { !$0.receiverIP.isEmpty && receiverIPs.contains($0.receiverIP) }
+                .map(\.transportKind)
+        )
+        guard !matchingTransports.isEmpty else {
+            return receiver.preferredIP.isEmpty ? [] : [receiver.preferredIP]
+        }
+        return Set(matchingTransports.map { receiver.ip(for: $0) }.filter { !$0.isEmpty })
+    }
+
     private func pushLanguageUpdateToDiscoveredReceivers(forceAll: Bool = false) {
         let receivers = discoveredReceivers
         let languageCode = language.fileStem
@@ -1164,8 +1195,7 @@ final class TBDisplaySenderService: ObservableObject {
         }
 
         for receiver in receivers {
-            let candidateIPs = [receiver.preferredIP, receiver.thunderboltIP, receiver.networkIP]
-            let ipsForReceiver = Set(candidateIPs.filter { !$0.isEmpty })
+            let ipsForReceiver = relevantLanguagePushIPs(for: receiver)
 
             // Measured live: `$receivers` republishes on every Bonjour browse
             // event, and the 4s `interfaceRefreshTimer` restarts the browser,
@@ -1184,9 +1214,12 @@ final class TBDisplaySenderService: ObservableObject {
                 continue
             }
 
-            var sentTo = Set<String>()
-            for ip in candidateIPs where !ip.isEmpty && sentTo.insert(ip).inserted {
-                sendLanguageUpdate(to: ip, languageCode: languageCode)
+            for ip in ipsForReceiver {
+                sendLanguageUpdate(
+                    to: ip,
+                    languageCode: languageCode,
+                    thunderboltOnly: !receiver.thunderboltIP.isEmpty && ip == receiver.thunderboltIP
+                )
             }
             let knownIPs = lastPushedReceiverState[receiver.id].map { $0.languageCode == languageCode ? $0.ips : [] } ?? []
             lastPushedReceiverState[receiver.id] = (knownIPs.union(ipsForReceiver), languageCode, now)
@@ -1229,7 +1262,7 @@ final class TBDisplaySenderService: ObservableObject {
         }
     }
 
-    private func sendLanguageUpdate(to receiverIP: String, languageCode: String) {
+    private func sendLanguageUpdate(to receiverIP: String, languageCode: String, thunderboltOnly: Bool = false) {
         guard !receiverIP.isEmpty,
               let packet = TBMonitorProtocol.makeJSONPacket(
                 type: .uiLanguage,
@@ -1237,10 +1270,18 @@ final class TBDisplaySenderService: ObservableObject {
               )
         else { return }
 
+        // Same rule as the display-link dial in connect(): a Thunderbolt
+        // address must never be reached over Wi-Fi. With the cable down the
+        // OS default route is Wi-Fi, and a packet arriving there wakes the
+        // sleeping iMac (measured: wake-on-IP-packet loops every ~48s).
+        let params = NWParameters.tcp
+        if thunderboltOnly {
+            params.prohibitedInterfaceTypes = [.wifi, .cellular]
+        }
         let connection = NWConnection(
             host: NWEndpoint.Host(receiverIP),
             port: NWEndpoint.Port(rawValue: TBMonitorProtocol.port)!,
-            using: .tcp
+            using: params
         )
 
         // Measured live: a connection that lands in `.waiting` (receiver
