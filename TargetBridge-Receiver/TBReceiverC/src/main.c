@@ -373,6 +373,9 @@ struct app {
     uint64_t audio_reopen_retry_ms;       /* next time to retry an open that failed; 0 = not pending */
     uint64_t audio_diag_last_ms;          /* last [audio] diagnostic line, separate cadence from the watchdog */
     uint64_t audio_diag_last_ticks;
+    /* Set when this receiver asks the iMac to sleep; the output is closed
+     * and the watchdog stands down until the next wake or reopen. */
+    int audio_suspended_for_sleep;
 
     /* Senders older than the Float32 change send Int16 and do not say so in
      * their hello. Assume Int16 until told otherwise, so such a sender plays
@@ -1376,6 +1379,7 @@ static void tb_audio_close(struct app *a) {
  * responsible for scheduling a retry (see TB_AUDIO_REOPEN_RETRY_MS) --
  * this function never blocks or spins waiting for the device to appear. */
 static int tb_audio_open(struct app *a) {
+    a->audio_suspended_for_sleep = 0;
     SDL_AudioSpec spec;
     SDL_zero(spec);
     spec.freq = AUDIO_SAMPLE_RATE;
@@ -1439,6 +1443,25 @@ static void tb_audio_watchdog_tick(struct app *a, uint64_t t) {
         a->audio_reopen_retry_ms = 0;
         if (t - a->audio_diag_last_ms >= TB_AUDIO_WATCHDOG_INTERVAL_MS * 5) {
             fprintf(stderr, "[audio] idle (no client)\n");
+            a->audio_diag_last_ms = t;
+        }
+        return;
+    }
+
+    /* Going to sleep on purpose (request_system_sleep()). CoreAudio stops
+     * the output as the machine goes down, which the heartbeat below reads
+     * as a stall. Measured 2026-10-08: it then retried the open every 5s,
+     * each failing with AudioQueueStart -66681 and blocking this loop for
+     * ~2.5s, and the iMac took 21s instead of ~15s to reach sleep. Stand
+     * down until a real wake; the wake flag reopens it. A dark wake does not
+     * post NSWorkspaceDidWakeNotification, so maintenance wakes leave the
+     * output closed. */
+    if (a->audio_suspended_for_sleep) {
+        if (tb_wake_watch_take_wake()) {
+            fprintf(stderr, "[audio] system wake after sleep -- reopening\n");
+            a->audio_reopen_retry_ms = (tb_audio_open(a) != 0) ? t + TB_AUDIO_REOPEN_RETRY_MS : 0;
+        } else if (t - a->audio_diag_last_ms >= TB_AUDIO_WATCHDOG_INTERVAL_MS * 5) {
+            fprintf(stderr, "[audio] suspended (system sleep requested)\n");
             a->audio_diag_last_ms = t;
         }
         return;
@@ -1908,10 +1931,20 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
                  * takes the network with it, so this is a deliberate trade: the
                  * human presses the iMac's power button after every full sleep,
                  * same as for a real systemSleep reason. */
+                tb_audio_close(a);
+                a->audio_reopen_retry_ms = 0;
+                a->audio_suspended_for_sleep = 1;
                 request_system_sleep();
             } else {
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] sender display awake; holding panel awake\n");
+                /* Sleep was requested but never happened (display came back
+                 * first): bring the output back now rather than wait for a
+                 * wake notification that will not come. */
+                if (a->audio_suspended_for_sleep) {
+                    fprintf(stderr, "[audio] sleep did not happen -- reopening\n");
+                    a->audio_reopen_retry_ms = (tb_audio_open(a) != 0) ? now_ms() + TB_AUDIO_REOPEN_RETRY_MS : 0;
+                }
             }
         }
         break;
