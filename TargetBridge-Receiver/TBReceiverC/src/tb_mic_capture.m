@@ -13,6 +13,9 @@
 #include "tb_mic_capture.h"
 #include "proto.h"   /* AUDIO_* — the wire format this must match */
 
+#include <stdatomic.h>
+#include <stdio.h>
+
 @interface TBMicDelegate : NSObject <AVCaptureAudioDataOutputSampleBufferDelegate>
 @property (nonatomic, assign) tb_mic_cb callback;
 @property (nonatomic, assign) void *userData;
@@ -63,28 +66,64 @@ didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
 
 static AVCaptureSession *g_session = nil;
 static TBMicDelegate *g_delegate = nil;
+static dispatch_queue_t g_mic_q = nil;
+static _Atomic int g_mic_wanted = 0;
+static tb_mic_cb g_mic_cb = NULL;
+static void *g_mic_user = NULL;
 
-int tb_mic_capture_start(tb_mic_cb cb, void *user_data) {
-    if (g_session) return 0;
+/* startRunning and stopRunning run only on g_mic_q. AVCaptureSession
+ * startRunning is synchronous and blocks in CoreAudio. Measured 2026-10-29
+ * on the iMac, twice, while a system-sleep request had been made and had not
+ * completed: each accept stalled the main thread for 7.2s between
+ * "input capture disabled" and "[mic] capturing", and the second dial paid
+ * that cost again because the first session was stopped and opened over.
+ * The main thread only sets g_mic_wanted and enqueues the work. */
 
-    /* Requesting access is asynchronous the first time; if it has not been
-     * granted yet, bail and let the caller retry once the user has answered. */
+static void tb_mic_ensure_queue(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_mic_q = dispatch_queue_create("com.targetbridge.mic.open", DISPATCH_QUEUE_SERIAL);
+    });
+}
+
+static void tb_mic_worker_apply(void) {
+    if (!atomic_load(&g_mic_wanted)) {
+        if (!g_session) return;
+        [g_session stopRunning];
+        g_session = nil;
+        g_delegate = nil;
+        fprintf(stderr, "[mic] capture stopped\n");
+        return;
+    }
+    if (g_session) {
+        fprintf(stderr, "[mic] capture already running; keeping it\n");
+        return;
+    }
+
     if ([AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio] != AVAuthorizationStatusAuthorized) {
         [AVCaptureDevice requestAccessForMediaType:AVMediaTypeAudio completionHandler:^(BOOL granted) {
             (void)granted;
         }];
-        return -1;
+        fprintf(stderr, "[mic] not started (microphone permission pending)\n");
+        return;
     }
 
     AVCaptureDevice *device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
-    if (!device) return -1;
+    if (!device) {
+        fprintf(stderr, "[mic] no input device\n");
+        return;
+    }
 
     NSError *error = nil;
     AVCaptureDeviceInput *input = [AVCaptureDeviceInput deviceInputWithDevice:device error:&error];
-    if (!input) return -1;
+    if (!input) {
+        fprintf(stderr, "[mic] input device failed: %s\n",
+                error.localizedDescription.UTF8String ?: "unknown");
+        return;
+    }
 
     AVCaptureSession *session = [[AVCaptureSession alloc] init];
-    if (![session canAddInput:input]) return -1;
+    if (![session canAddInput:input]) return;
     [session addInput:input];
 
     AVCaptureAudioDataOutput *out = [[AVCaptureAudioDataOutput alloc] init];
@@ -99,27 +138,49 @@ int tb_mic_capture_start(tb_mic_cb cb, void *user_data) {
     };
 
     TBMicDelegate *delegate = [[TBMicDelegate alloc] init];
-    delegate.callback = cb;
-    delegate.userData = user_data;
-    dispatch_queue_t queue = dispatch_queue_create("com.targetbridge.mic", DISPATCH_QUEUE_SERIAL);
-    [out setSampleBufferDelegate:delegate queue:queue];
+    delegate.callback = g_mic_cb;
+    delegate.userData = g_mic_user;
+    dispatch_queue_t samples = dispatch_queue_create("com.targetbridge.mic", DISPATCH_QUEUE_SERIAL);
+    [out setSampleBufferDelegate:delegate queue:samples];
 
-    if (![session canAddOutput:out]) return -1;
+    if (![session canAddOutput:out]) return;
     [session addOutput:out];
 
+    /* Blocks this queue, not the main thread. */
     [session startRunning];
-    if (!session.isRunning) return -1;
-
+    if (!atomic_load(&g_mic_wanted) || !session.isRunning) {
+        if (session.isRunning) [session stopRunning];
+        if (!session.isRunning)
+            fprintf(stderr, "[mic] capture did not start\n");
+        return;
+    }
     g_session = session;
     g_delegate = delegate;
+    fprintf(stderr, "[mic] capturing and streaming to sender\n");
+}
+
+int tb_mic_capture_start(tb_mic_cb cb, void *user_data) {
+    tb_mic_ensure_queue();
+    if (!g_mic_q) return -1;
+    g_mic_cb = cb;
+    g_mic_user = user_data;
+    atomic_store(&g_mic_wanted, 1);
+    dispatch_async(g_mic_q, ^{
+        @autoreleasepool {
+            tb_mic_worker_apply();
+        }
+    });
     return 0;
 }
 
 void tb_mic_capture_stop(void) {
-    if (!g_session) return;
-    [g_session stopRunning];
-    g_session = nil;
-    g_delegate = nil;
+    atomic_store(&g_mic_wanted, 0);
+    if (!g_mic_q) return;
+    dispatch_async(g_mic_q, ^{
+        @autoreleasepool {
+            tb_mic_worker_apply();
+        }
+    });
 }
 
 int tb_mic_capture_available(void) {

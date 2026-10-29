@@ -133,7 +133,16 @@ void tb_disp_render_reconnect_hold(struct tb_display *d);
 
 /* If a live picture should be fullscreen and macOS has dropped that space
  * (an aborted system sleep does this while the loop is still ticking), put
- * it back. Already-fullscreen is a no-op. Retries are rate-limited. */
+ * it back. A window that already covers the screen is left alone. When SDL
+ * still claims fullscreen but the frame does not cover the screen, the flag
+ * is cleared first so the next enter is a real WindowServer transition.
+ * Retries are rate-limited. */
 void tb_disp_reassert_fullscreen_if_needed(struct tb_display *d);
+
+/* Force the next few reassert checks to call SetWindowFullscreen even when
+ * SDL already reports fullscreen. Used after system sleep and when a live
+ * picture returns, including after the hold expired and the plane was torn
+ * down. The waiting screen does not consume the armed tries. */
+void tb_disp_arm_fullscreen_restore(struct tb_display *d);
 
 #endif

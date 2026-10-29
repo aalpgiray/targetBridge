@@ -18,8 +18,11 @@ typedef void (*tb_mic_cb)(const uint8_t *pcm, size_t bytes, void *user_data);
 /* 1 if this Mac has an audio input device at all. */
 int  tb_mic_capture_available(void);
 
-/* 0 on success. Returns -1 if microphone access has not been granted yet —
- * the request is kicked off, so a later retry can succeed. */
+/* 0 once the open has been requested. startRunning runs on a private queue
+ * and does not block the caller. A later call while that open is in flight,
+ * or while capture is already running, keeps the one session. -1 only if
+ * the queue itself could not be created. Permission failures are logged
+ * from the queue; the next start retries. */
 int  tb_mic_capture_start(tb_mic_cb cb, void *user_data);
 void tb_mic_capture_stop(void);
 

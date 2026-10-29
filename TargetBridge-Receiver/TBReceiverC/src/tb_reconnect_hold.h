@@ -88,11 +88,11 @@ static inline void tb_reconnect_hold_note_frame(struct tb_reconnect_hold *h) {
     tb_reconnect_hold_clear(h);
 }
 
-/* The main thread was blocked for stalled_ms while this hold was already
- * up (AudioQueueStart, a wedged write). That time is not the sender being
- * gone. Add it to both clocks. Inactive, NULL, and a zero stall do nothing.
- * The caller decides which span counts: time before the hold began, and the
- * gap between loop iterations (a real sleep), must not be passed in. */
+/* Time that passed while this hold was already up, but the sender was not
+ * gone: the main thread was blocked, or the machine was asleep
+ * (CLOCK_MONOTONIC jumps across system sleep; CLOCK_UPTIME_RAW does not).
+ * Add it to both clocks. Inactive, NULL, and a zero span do nothing.
+ * The caller must not pass ordinary time between loop iterations. */
 static inline void tb_reconnect_hold_credit_stall(struct tb_reconnect_hold *h,
                                                  uint64_t stalled_ms) {
     if (!h || !h->active || stalled_ms == 0) return;

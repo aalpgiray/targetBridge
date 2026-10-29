@@ -57,6 +57,7 @@ struct tb_display {
     uint32_t      last_video_frame_time;
     int           system_cursor_hidden;
     uint32_t      fullscreen_reassert_ms;
+    int           fullscreen_reapply_left;
 
     char          last_ip[64];
     char          last_status[128];
@@ -602,18 +603,45 @@ static void tb_disp_refresh_window_mode(struct tb_display *d) {
     }
 }
 
+void tb_disp_arm_fullscreen_restore(struct tb_display *d) {
+    if (!d || !d->preferred_fullscreen) return;
+    /* A few tries, not one. After a real sleep SDL_GetWindowFlags can still
+     * say fullscreen while the space is gone, so a single check never logs
+     * and never calls SetWindowFullscreen again. The 2026-10-29 wake had no
+     * "[disp] restoring fullscreen" line and the picture came back windowed. */
+    d->fullscreen_reapply_left = 6;
+    d->fullscreen_reassert_ms = 0;
+}
+
 void tb_disp_reassert_fullscreen_if_needed(struct tb_display *d) {
     if (!d || !d->win || !d->preferred_fullscreen) return;
+    /* Leave the retry count armed while the waiting screen is up. The next
+     * live picture consumes it. */
     if (!d->is_connected && !d->is_connecting) return;
     const Uint32 flags = SDL_GetWindowFlags(d->win);
-    if (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) return;
+    const int flags_fs = (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0;
+    /* Steady state: flags agree and nothing asked for another try. The
+     * AppKit frame check stays off this path; it runs only while a restore
+     * is armed or the flag has already dropped. */
+    if (flags_fs && d->fullscreen_reapply_left <= 0) return;
+    /* The frame is the fact that matters. SDL_GetWindowFlags still said
+     * fullscreen on the 2026-10-29 wake while the picture was a window, and
+     * SDL_SetWindowFullscreen returns without calling WindowServer when that
+     * flag already matches. */
+    const int covers = tb_window_covers_screen();
+    if (covers == 1) {
+        d->fullscreen_reapply_left = 0;
+        return;
+    }
     /* SDL_SetWindowFullscreen in a tight loop fights WindowServer and can
      * itself drop the space. One try per half-second is enough to follow an
      * aborted sleep without spinning the frame loop. */
     const Uint32 now = SDL_GetTicks();
     if (d->fullscreen_reassert_ms != 0 && (now - d->fullscreen_reassert_ms) < 500) return;
     d->fullscreen_reassert_ms = now;
+    if (d->fullscreen_reapply_left > 0) d->fullscreen_reapply_left--;
     fprintf(stderr, "[disp] restoring fullscreen\n");
+    if (flags_fs) SDL_SetWindowFullscreen(d->win, 0);
     tb_disp_refresh_window_mode(d);
 }
 

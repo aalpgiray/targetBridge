@@ -45,6 +45,36 @@ int tb_window_on_active_space(void *sdl_window) {
     return on_active;
 }
 
+int tb_window_covers_screen(void) {
+    /* Same window walk as tb_window_on_active_space: SDL_GetWindowWMInfo is
+     * version-gated and fails on the Intel build. A fullscreen-desktop window
+     * is borderless and sized to the screen; the waiting window is 980x620.
+     * styleMask FullScreen is the wrong test here — this app uses
+     * SDL_WINDOW_FULLSCREEN_DESKTOP, which does not take a separate space. */
+    NSWindow *content = nil;
+    CGFloat best_area = 0.0;
+    for (NSWindow *w in [NSApp windows]) {
+        if (!w.isVisible) continue;
+        NSSize s = w.frame.size;
+        CGFloat area = s.width * s.height;
+        if (area < 200.0 * 200.0) continue;
+        if (area > best_area) { best_area = area; content = w; }
+    }
+    if (!content) return -1;
+    NSScreen *screen = content.screen ?: [NSScreen mainScreen];
+    if (!screen) return -1;
+    const NSRect wf = content.frame;
+    const NSRect sf = screen.frame;
+    /* Menu-bar height is ~24–37pt. The waiting window is 980×620 against a
+     * 2560×1440 point 5K panel, so a wide slop still cannot confuse the two. */
+    const CGFloat slop = 96.0;
+    if (fabs(wf.size.width - sf.size.width) <= slop &&
+        fabs(wf.size.height - sf.size.height) <= slop) {
+        return 1;
+    }
+    return 0;
+}
+
 static tb_gesture_space_switch_callback g_callback = NULL;
 static void *g_context = NULL;
 static id g_swipe_monitor = nil;

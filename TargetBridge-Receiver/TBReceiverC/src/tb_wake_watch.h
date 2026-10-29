@@ -31,6 +31,9 @@ extern "C" {
  * startup; idempotent. */
 void tb_wake_watch_start(void);
 
+/* 1 if a wake notification is waiting. Does not clear it; take_wake does. */
+int tb_wake_watch_pending(void);
+
 /* Returns 1 and clears the flag if a wake notification has landed since the
  * last call, 0 otherwise. Cheap enough (one atomic exchange) to poll every
  * main-loop iteration rather than on the ~1s watchdog cadence, so recovery

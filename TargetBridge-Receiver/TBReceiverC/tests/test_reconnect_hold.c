@@ -135,6 +135,29 @@ static void test_connect_and_frame_outside_a_hold(void) {
           "null state with a picture still wants a hold");
 }
 
+static void test_sleep_does_not_consume_the_grace(void) {
+    struct tb_reconnect_hold h;
+    tb_reconnect_hold_clear(&h);
+    tb_reconnect_hold_begin(&h, 1000, 10000);
+    tb_reconnect_hold_note_connect(&h, 1500);
+    /* CLOCK_MONOTONIC jumps by the nap; the caller adds that jump back. */
+    tb_reconnect_hold_credit_stall(&h, 60000);
+    CHECK(h.until_ms == 71000, "sleep is added to the disconnect deadline");
+    CHECK(h.connected_ms == 61500, "sleep is added to the post-connect clock");
+    const uint64_t woke = 1000 + 60000 + 5000;
+    CHECK(!tb_reconnect_hold_should_drop(&h, woke, 1, 10000),
+          "on wake, five seconds of the post-connect grace are still left");
+    CHECK(tb_reconnect_should_hold(0, 1, &h, woke, 10000),
+          "a close just after wake still keeps the picture");
+
+    struct tb_reconnect_hold raw;
+    tb_reconnect_hold_clear(&raw);
+    tb_reconnect_hold_begin(&raw, 1000, 10000);
+    tb_reconnect_hold_note_connect(&raw, 1500);
+    CHECK(!tb_reconnect_should_hold(0, 1, &raw, woke, 10000),
+          "the same close without the sleep credit gives up the picture");
+}
+
 static void test_stall_credit_keeps_the_picture(void) {
     struct tb_reconnect_hold idle;
     tb_reconnect_hold_clear(&idle);
@@ -181,6 +204,7 @@ int main(void) {
     test_double_dial_does_not_expire_early_or_renew();
     test_expired_hold_is_not_renewed();
     test_connect_and_frame_outside_a_hold();
+    test_sleep_does_not_consume_the_grace();
     test_stall_credit_keeps_the_picture();
 
     if (g_failures) {

@@ -39,6 +39,10 @@ void tb_wake_watch_start(void) {
     });
 }
 
+int tb_wake_watch_pending(void) {
+    return atomic_load(&g_wake_flag);
+}
+
 int tb_wake_watch_take_wake(void) {
     return atomic_exchange(&g_wake_flag, 0);
 }

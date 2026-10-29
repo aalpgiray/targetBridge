@@ -10,4 +10,10 @@ void tb_gesture_bridge_set_active(int active);
  * Space (or can't be determined), 0 if it is on a different Space. */
 int tb_window_on_active_space(void *sdl_window);
 
+/* 1 if the receiver content window's frame covers its screen, 0 if it is
+ * visibly smaller (the 980x620 waiting window), -1 if no window can be
+ * found. SDL_GetWindowFlags can still say fullscreen after sleep while this
+ * is 0, which is the case a flag check cannot see. */
+int tb_window_covers_screen(void);
+
 #endif

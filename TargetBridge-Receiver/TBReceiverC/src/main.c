@@ -354,6 +354,10 @@ struct app {
     uint64_t loop_tick_ms;
     uint64_t reconnect_stall_accounted_ms;
     int      reconnect_stall_credited;
+    /* Previous iteration's CLOCK_MONOTONIC and CLOCK_UPTIME_RAW, so a system
+     * sleep (monotonic jumps, uptime does not) can be credited to the hold. */
+    uint64_t mono_sample_ms;
+    uint64_t awake_sample_ms;
 
     char     ip_text[64];
     char     tb_ip_text[64];
@@ -477,6 +481,21 @@ static void on_sigint(int s) { g_term_signal = s; g_term = 1; }
 static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+
+/* Time the machine was awake. CLOCK_MONOTONIC on macOS keeps ticking through
+ * system sleep; CLOCK_UPTIME_RAW does not. The difference is the nap. */
+static uint64_t awake_ms(void) {
+#if defined(CLOCK_UPTIME_RAW)
+    const clockid_t clk = CLOCK_UPTIME_RAW;
+#elif defined(CLOCK_MONOTONIC_RAW)
+    const clockid_t clk = CLOCK_MONOTONIC_RAW;
+#else
+    const clockid_t clk = CLOCK_MONOTONIC;
+#endif
+    struct timespec ts;
+    if (clock_gettime(clk, &ts) != 0) return now_ms();
     return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
 }
 
@@ -1199,8 +1218,15 @@ static void tb_receiver_apply_input_control_mode(struct app *a, const uint8_t *p
  * session's picture, that wait is over and the badge comes down before the
  * main loop paints, so the waiting screen does not get a turn in between. */
 static void tb_mark_video_frame(struct app *a) {
+    const int first = !a->have_video_frame;
+    const int held = tb_reconnect_hold_active(&a->reconnect);
     a->have_video_frame = 1;
-    if (!tb_reconnect_hold_active(&a->reconnect)) return;
+    /* The first frame of a session, and the frame that ends a hold, are
+     * both "a live picture returns". Fullscreen is requested even if SDL
+     * still claims the window already is; that claim survived the wake of
+     * 2026-10-29 and the picture came back windowed. */
+    if (first || held) tb_disp_arm_fullscreen_restore(a->disp);
+    if (!held) return;
     tb_reconnect_hold_note_frame(&a->reconnect);
     tb_metal_plane_set_reconnect_badge(0, NULL);
     fprintf(stderr, "[main] live frame resumed; reconnect hold cleared\n");
@@ -2727,14 +2753,12 @@ static void tb_mic_frame_cb(const uint8_t *pcm, size_t bytes, void *user_data) {
 }
 
 static void tb_mic_start_if_possible(struct app *a) {
-    if (!tb_mic_capture_available()) return;
     g_mic_app = a;
+    /* Returns once the open is queued. startRunning itself is off this
+     * thread; a second dial while it is in flight keeps that one session.
+     * Permission and "no device" are logged from the queue. */
     if (tb_mic_capture_start(tb_mic_frame_cb, a) != 0) {
-        /* Permission not granted yet; the prompt has been raised and the next
-         * session will retry. */
-        fprintf(stderr, "[mic] not started (microphone permission pending)\n");
-    } else {
-        fprintf(stderr, "[mic] capturing and streaming to sender\n");
+        fprintf(stderr, "[mic] not started\n");
     }
 }
 
@@ -3225,10 +3249,43 @@ static uint64_t tb_reconnect_grace_from_env(void) {
 /* A blocked main thread is not the sender being gone. 250ms is far above a
  * frame and far below the 10s grace, so ordinary loop jitter is not credited
  * and the 15s AudioQueueStart hang is. Only time since this iteration's tick,
- * and only once the hold already exists: the gap before the next iteration
- * is a real sleep, and time before begin() is not a stall of this hold.
+ * and only once the hold already exists. Time before begin(), and the gap
+ * before this iteration, are not this stall. System sleep is credited on
+ * its own, from the monotonic/uptime clocks, before this runs.
  * A hold that was already due at the tick is left due. */
 #define TB_RECONNECT_STALL_CREDIT_MS 250
+
+/* Called at the start of an iteration, before any hold decision. A system
+ * sleep freezes this process, so the gap shows up as monotonic time with
+ * almost no awake time. That span is not the sender being gone and not a
+ * reason to leave fullscreen. Ordinary scheduling jitter is below the
+ * threshold and is ignored. */
+static void tb_note_system_sleep(struct app *a, uint64_t mono_now) {
+    const uint64_t awake = awake_ms();
+    if (a->mono_sample_ms != 0 && a->awake_sample_ms != 0 &&
+        mono_now >= a->mono_sample_ms && awake >= a->awake_sample_ms) {
+        const uint64_t d_mono = mono_now - a->mono_sample_ms;
+        const uint64_t d_awake = awake - a->awake_sample_ms;
+        if (d_mono > d_awake && d_mono - d_awake >= 500) {
+            const uint64_t slept = d_mono - d_awake;
+            fprintf(stderr, "[main] system was asleep for %llu ms\n",
+                    (unsigned long long)slept);
+            if (tb_reconnect_hold_active(&a->reconnect)) {
+                tb_reconnect_hold_credit_stall(&a->reconnect, slept);
+                fprintf(stderr,
+                        "[main] reconnect hold extended %llu ms (system was asleep)\n",
+                        (unsigned long long)slept);
+            }
+            if (a->last_recv_ms != 0 && mono_now > a->last_recv_ms) {
+                const uint64_t room = mono_now - a->last_recv_ms;
+                a->last_recv_ms += slept < room ? slept : room;
+            }
+            tb_disp_arm_fullscreen_restore(a->disp);
+        }
+    }
+    a->mono_sample_ms = mono_now;
+    a->awake_sample_ms = awake;
+}
 
 static void tb_reconnect_credit_loop_stall(struct app *a) {
     if (!a || a->loop_tick_ms == 0) return;
@@ -3528,6 +3585,11 @@ int main(int argc, char **argv) {
         a.loop_tick_ms = t;
         a.reconnect_stall_accounted_ms = t;
         a.reconnect_stall_credited = 0;
+        tb_note_system_sleep(&a, t);
+        /* The notification can also arrive without a measurable clock gap,
+         * once this run loop is pumped. Arm fullscreen either way. take_wake
+         * still belongs to the audio watchdog later in this iteration. */
+        if (tb_wake_watch_pending()) tb_disp_arm_fullscreen_restore(a.disp);
 
         /* Wake notifications are delivered on this run loop, which AudioQueueStart
          * used to stall, so they showed up only once the hang ended. Restore
@@ -3678,7 +3740,7 @@ int main(int argc, char **argv) {
                 a.audio_input_is_s16 = 1;   // re-learned from the next hello
                 a.reported_night_shift = -1;   /* force one report per session */
                 a.reported_true_tone = -1;
-                a.last_recv_ms = t;
+                a.last_recv_ms = now_ms();
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] client connected\n");
                 if (tb_reconnect_hold_active(&a.reconnect)) {
@@ -3720,8 +3782,11 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "[main] falling back to inline (single-threaded) receive\n");
                 }
                 tb_receiver_refresh_input_capture(&a);
-                tb_mic_start_if_possible(&a);
+                /* Profile before capture opens. The mic open used to run
+                 * here on this thread and the profile did not go out until
+                 * startRunning returned (~7s, twice, on 2026-10-29). */
                 send_receiver_info(&a);
+                tb_mic_start_if_possible(&a);
             }
         }
 
@@ -3740,7 +3805,7 @@ int main(int argc, char **argv) {
                     fatal = 1;
                 } else {
                     socket_activity = drain_result;
-                    if (drain_result > 0) a.last_recv_ms = t;
+                    if (drain_result > 0) a.last_recv_ms = now_ms();
                 }
             }
             if (fatal) {
@@ -3749,16 +3814,24 @@ int main(int argc, char **argv) {
 
                 if (a.close_requested) {
                     close_client(&a);
-                } else if (a.last_recv_ms < t &&
-                           t - a.last_recv_ms >= TB_SENDER_IDLE_TIMEOUT_MS) {
-                    /* The sender streams frames continuously and heartbeats
-                     * every 2s. Total silence means it died without a FIN
-                     * (crash, pulled cable, force sleep). Without this reap,
-                     * the dead fd is held forever and every future connect is
-                     * locked out until the app is restarted. */
-                    fprintf(stderr, "[main] no data from sender for %llu ms; closing stale session\n",
-                            (unsigned long long)(t > a.last_recv_ms ? t - a.last_recv_ms : 0));
-                    close_client(&a);
+                } else {
+                    /* now, not the t sampled at the top of the iteration.
+                     * A receive during a long iteration used to be stamped
+                     * with that t, so the next pass treated just-arrived
+                     * bytes as already 10s old. Sleep is removed from
+                     * last_recv_ms in tb_note_system_sleep. */
+                    const uint64_t recv_now = now_ms();
+                    if (a.last_recv_ms < recv_now &&
+                        recv_now - a.last_recv_ms >= TB_SENDER_IDLE_TIMEOUT_MS) {
+                        /* The sender streams frames continuously and heartbeats
+                         * every 2s. Total silence means it died without a FIN
+                         * (crash, pulled cable, force sleep). Without this reap,
+                         * the dead fd is held forever and every future connect is
+                         * locked out until the app is restarted. */
+                        fprintf(stderr, "[main] no data from sender for %llu ms; closing stale session\n",
+                                (unsigned long long)(recv_now - a.last_recv_ms));
+                        close_client(&a);
+                    }
                 }
             }
         }
