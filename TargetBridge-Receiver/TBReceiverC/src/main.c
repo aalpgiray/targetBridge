@@ -349,6 +349,11 @@ struct app {
      * the environment overrides it; 0 disables the hold. */
     struct tb_reconnect_hold reconnect;
     uint64_t reconnect_grace_ms;
+    /* This iteration's tick, and how far into it the hold clock has already
+     * absorbed. A stall before the hold began is not credited. */
+    uint64_t loop_tick_ms;
+    uint64_t reconnect_stall_accounted_ms;
+    int      reconnect_stall_credited;
 
     char     ip_text[64];
     char     tb_ip_text[64];
@@ -375,9 +380,9 @@ struct app {
 
     SDL_AudioDeviceID audio_device;
 
-    /* Watchdog bookkeeping for tb_audio_open()/tb_audio_watchdog_tick() below.
+    /* Watchdog bookkeeping for the audio open path and tb_audio_watchdog_tick().
      * audio_cb_ticks is written by audio_callback() (CoreAudio's own audio
-     * thread, per SDL2's HAL-backed implementation -- see tb_audio_open()'s
+     * thread, per SDL2's HAL-backed implementation -- see the audio open
      * comment for why the main loop reading it here is safe without a lock)
      * and read+compared by the main loop, hence atomic rather than a plain
      * counter: on x86_64 a lone uint64_t increment/read is already atomic at
@@ -395,6 +400,9 @@ struct app {
     /* Set when this receiver asks the iMac to sleep; the output is closed
      * and the watchdog stands down until the next wake or reopen. */
     int audio_suspended_for_sleep;
+    /* A session wants an output device that is not installed yet. The open
+     * itself runs off this thread; see tb_audio_kick_open(). */
+    int audio_open_wanted;
 
     /* Senders older than the Float32 change send Int16 and do not say so in
      * their hello. Assume Int16 until told otherwise, so such a sender plays
@@ -1357,7 +1365,7 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
      * Runs on CoreAudio's own render thread (SDL2's macOS backend calls this
      * straight from the HAL I/O proc), which is why it is a plain increment
      * on an atomic rather than anything that could block -- see the field's
-     * declaration in struct app and tb_audio_open()'s comment for the full
+     * declaration in struct app and the audio-open comment for the full
      * threading picture. */
     atomic_fetch_add_explicit(&a->audio_cb_ticks, 1, memory_order_relaxed);
     if (a->audio_buf_size >= len) {
@@ -1372,83 +1380,259 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
 /* ---- Audio output open/close/watchdog ---------------------------------
  *
  * See the TB_AUDIO_WATCHDOG_* comment near the top of the file for why this
- * exists at all. tb_audio_open()/tb_audio_close() factor out what used to be
- * inline, startup-only code in main() so the exact same path opens the
- * device the first time and reopens it later -- a startup-only helper that a
- * reopen calls slightly differently is exactly how this class of bug hides.
+ * exists at all. The same install path runs for the first open and every
+ * reopen.
  *
- * THREADING: audio_device is only ever written here, and all call sites --
- * the accept branch's client-connect handling, close_client(), and
- * tb_audio_watchdog_tick() below -- run on the main thread. TB_PKT_AUDIO_FRAME
- * (the other reader of audio_device, in on_packet)
- * also only ever runs on the main thread: reader_on_packet() queues audio
- * frames into ctrl_q for anything that is not TB_PKT_RAW_FRAME/RAW_DPCM, and
- * pump_network() drains that queue by calling on_packet() from inside the
- * main loop; the non-threaded fallback path (drain_socket() -> the parser's
- * callback) reaches on_packet() the same way, synchronously from the main
- * loop. So a reopen and an incoming audio frame can never actually run at
- * the same time -- confirmed by reading the call graph, not assumed. The one
- * real cross-thread access is CoreAudio's render thread calling
- * audio_callback() while the main thread calls SDL_CloseAudioDevice(): SDL
- * itself makes that safe (SDL_CloseAudioDevice stops and joins the device's
- * audio thread before returning, so the callback cannot be mid-flight when
- * the device handle is invalidated), which is the same guarantee close_client()
- * already relies on implicitly today. The ring-buffer field reset below still
- * takes SDL_LockAudioDevice on the *new* device, matching close_client()'s
- * existing pattern, because audio_callback on that new device starts running
- * immediately once SDL_PauseAudioDevice(0) is called and must not observe a
- * half-written head/tail/size. */
+ * SDL_OpenAudioDevice is the one call that must not run on this thread.
+ * It blocks inside AudioQueueStart. Measured 2026-10-08, during intentional
+ * sleep: each retry failed with AudioQueueStart -66681 and froze this loop
+ * for ~2.5s, so the iMac took 21s instead of ~15s to sleep. Measured
+ * 2026-10-29, on the accept right after a wake: the same error held the
+ * main thread from 17:10:35.712 until 17:10:50.743 (~15s, the loop's "other"
+ * bucket). Nothing was drawn, the 10s reconnect hold ran out during the
+ * freeze, and the session was torn down. A failed open is only missing
+ * audio. It must not cost the picture.
+ *
+ * The worker thread's only job is SDL_OpenAudioDevice. A new device starts
+ * paused, so audio_callback does not run until the main thread installs it.
+ * audio_device is still written only on the main thread. One open is in
+ * flight at a time. A generation counter is the handoff: tb_audio_close
+ * bumps it, and a worker whose open has been superseded closes that paused
+ * device itself and does not touch struct app. The main thread closes every
+ * device it adopts. SDL_GetError is thread-local, so the worker copies the
+ * string before returning.
+ *
+ * TB_PKT_AUDIO_FRAME still only runs on the main thread (reader_on_packet
+ * queues it, pump_network drains it here). SDL_CloseAudioDevice on an
+ * installed device stops and joins the callback before returning. The ring
+ * is reset under SDL_LockAudioDevice before the unpause, so the callback
+ * cannot observe a half-written head/tail/size. */
 
-static void tb_audio_close(struct app *a) {
-    if (a->audio_device == 0) return;
-    SDL_CloseAudioDevice(a->audio_device);   /* stops+joins the callback thread first */
-    a->audio_device = 0;
-}
+enum {
+    TB_AUDIO_OPEN_IDLE = 0,
+    TB_AUDIO_OPEN_INFLIGHT,
+    TB_AUDIO_OPEN_READY,
+    TB_AUDIO_OPEN_FAILED
+};
 
-/* 0 on success. On failure a.audio_device is left at 0 and the caller is
- * responsible for scheduling a retry (see TB_AUDIO_REOPEN_RETRY_MS) --
- * this function never blocks or spins waiting for the device to appear. */
-static int tb_audio_open(struct app *a) {
-    a->audio_suspended_for_sleep = 0;
-    SDL_AudioSpec spec;
-    SDL_zero(spec);
-    spec.freq = AUDIO_SAMPLE_RATE;
-    spec.format = AUDIO_F32SYS; // 32-bit float, native endian — CoreAudio's own format
-    spec.channels = AUDIO_CHANNELS;          // Stereo
-    spec.samples = 1024;   // ~21ms at 48kHz; see the startup comment this replaced
-    spec.callback = audio_callback;
-    spec.userdata = a;
-    SDL_AudioSpec obtained;
-    SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &spec, &obtained, 0);
-    if (dev == 0) {
-        fprintf(stderr, "[audio] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
-        return -1;
-    }
+static pthread_mutex_t g_audio_open_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_audio_open_state = TB_AUDIO_OPEN_IDLE;
+static uint64_t g_audio_open_gen = 0;
+static uint64_t g_audio_open_inflight_gen = 0;
+static SDL_AudioDeviceID g_audio_open_dev = 0;
+static int g_audio_open_samples = 0;
+static char g_audio_open_error[256];
+
+struct tb_audio_open_job {
+    struct app *app;
+    uint64_t gen;
+};
+
+static void tb_audio_install_device(struct app *a, SDL_AudioDeviceID dev, int samples) {
     a->audio_device = dev;
-
-    /* Fresh device, fresh ring buffer -- matching close_client()'s existing
-     * reset (~line 2799). Anything queued for the old device is audio timed
-     * against a route that is gone; playing it out on the new one would just
-     * be stale sound at the wrong moment, and it is a few ms of buffer at
-     * most (AUDIO_BACKLOG_MAX_MS=150). */
+    /* Fresh device, fresh ring buffer. Anything queued for the old route is
+     * a few ms of audio (AUDIO_BACKLOG_MAX_MS) timed against a device that
+     * is gone. */
     SDL_LockAudioDevice(a->audio_device);
     a->audio_buf_head = 0;
     a->audio_buf_tail = 0;
     a->audio_buf_size = 0;
     SDL_UnlockAudioDevice(a->audio_device);
 
-    /* Rebaseline the watchdog against this device's own callback stream --
-     * comparing post-reopen ticks against a pre-reopen count would read the
+    /* Rebaseline the watchdog against this device's own callback stream.
+     * Comparing post-reopen ticks against a pre-reopen count would read the
      * gap while the old device was dead as more of the same stall. */
     atomic_store_explicit(&a->audio_cb_ticks, 0, memory_order_relaxed);
     a->audio_watchdog_last_ticks = 0;
     a->audio_watchdog_last_ms = now_ms();
     a->audio_watchdog_stall_count = 0;
 
-    SDL_PauseAudioDevice(a->audio_device, 0); // Start playing (unpaused)
+    SDL_PauseAudioDevice(a->audio_device, 0);
+    a->audio_open_wanted = 0;
+    a->audio_reopen_retry_ms = 0;
     fprintf(stderr, "[audio] output device opened: %d Hz, %d ch, 32-bit float (obtained %d samples)\n",
-            AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, obtained.samples);
-    return 0;
+            AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, samples);
+}
+
+static void *tb_audio_open_worker(void *arg) {
+    struct tb_audio_open_job *job = (struct tb_audio_open_job *)arg;
+    struct app *app = job->app;
+    const uint64_t gen = job->gen;
+    free(job);
+
+    SDL_AudioSpec spec;
+    SDL_zero(spec);
+    spec.freq = AUDIO_SAMPLE_RATE;
+    spec.format = AUDIO_F32SYS;
+    spec.channels = AUDIO_CHANNELS;
+    spec.samples = 1024;
+    spec.callback = audio_callback;
+    spec.userdata = app;
+    SDL_AudioSpec obtained;
+    SDL_zero(obtained);
+    /* Blocks here, on this thread, for as long as CoreAudio wants. */
+    SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &spec, &obtained, 0);
+    char err[256];
+    err[0] = '\0';
+    if (dev == 0) {
+        const char *e = SDL_GetError();
+        snprintf(err, sizeof(err), "%s", (e && e[0]) ? e : "unknown");
+    }
+
+    int discard = 0;
+    pthread_mutex_lock(&g_audio_open_mu);
+    if (gen != g_audio_open_gen) {
+        discard = 1;
+        if (g_audio_open_state == TB_AUDIO_OPEN_INFLIGHT &&
+            g_audio_open_inflight_gen == gen) {
+            g_audio_open_state = TB_AUDIO_OPEN_IDLE;
+        }
+    } else if (dev == 0) {
+        snprintf(g_audio_open_error, sizeof(g_audio_open_error), "%s", err);
+        g_audio_open_dev = 0;
+        g_audio_open_samples = 0;
+        g_audio_open_state = TB_AUDIO_OPEN_FAILED;
+    } else {
+        g_audio_open_dev = dev;
+        g_audio_open_samples = (int)obtained.samples;
+        g_audio_open_error[0] = '\0';
+        g_audio_open_state = TB_AUDIO_OPEN_READY;
+    }
+    pthread_mutex_unlock(&g_audio_open_mu);
+
+    /* Paused, never installed, generation already superseded. Closing here
+     * does not join a live callback and does not touch struct app, which
+     * may already be gone if the process is exiting. */
+    if (discard && dev != 0) SDL_CloseAudioDevice(dev);
+    return NULL;
+}
+
+static int tb_audio_open_inflight(void) {
+    pthread_mutex_lock(&g_audio_open_mu);
+    const int inflight = (g_audio_open_state == TB_AUDIO_OPEN_INFLIGHT);
+    pthread_mutex_unlock(&g_audio_open_mu);
+    return inflight;
+}
+
+static void tb_audio_spawn_open(struct app *a) {
+    struct tb_audio_open_job *job = (struct tb_audio_open_job *)calloc(1, sizeof(*job));
+    if (!job) {
+        a->audio_reopen_retry_ms = now_ms() + TB_AUDIO_REOPEN_RETRY_MS;
+        return;
+    }
+
+    pthread_mutex_lock(&g_audio_open_mu);
+    if (g_audio_open_state != TB_AUDIO_OPEN_IDLE) {
+        pthread_mutex_unlock(&g_audio_open_mu);
+        free(job);
+        return;
+    }
+    g_audio_open_gen++;
+    if (g_audio_open_gen == 0) g_audio_open_gen = 1;
+    job->app = a;
+    job->gen = g_audio_open_gen;
+    g_audio_open_inflight_gen = g_audio_open_gen;
+    g_audio_open_dev = 0;
+    g_audio_open_samples = 0;
+    g_audio_open_error[0] = '\0';
+    g_audio_open_state = TB_AUDIO_OPEN_INFLIGHT;
+    pthread_mutex_unlock(&g_audio_open_mu);
+
+    pthread_t th;
+    if (pthread_create(&th, NULL, tb_audio_open_worker, job) != 0) {
+        pthread_mutex_lock(&g_audio_open_mu);
+        if (g_audio_open_state == TB_AUDIO_OPEN_INFLIGHT &&
+            g_audio_open_inflight_gen == job->gen) {
+            g_audio_open_state = TB_AUDIO_OPEN_IDLE;
+        }
+        pthread_mutex_unlock(&g_audio_open_mu);
+        free(job);
+        fprintf(stderr, "[audio] could not start output open\n");
+        a->audio_reopen_retry_ms = now_ms() + TB_AUDIO_REOPEN_RETRY_MS;
+        return;
+    }
+    pthread_detach(th);
+}
+
+/* Ask for an output device. Returns immediately. Clears the sleep
+ * stand-down: accept and wake both mean the output should come back, and
+ * leaving that flag set would drop the device when the open finished. */
+static void tb_audio_kick_open(struct app *a) {
+    a->audio_suspended_for_sleep = 0;
+    a->audio_open_wanted = 1;
+    if (a->audio_device != 0) {
+        a->audio_open_wanted = 0;
+        return;
+    }
+    tb_audio_spawn_open(a);
+}
+
+static void tb_audio_close(struct app *a) {
+    a->audio_open_wanted = 0;
+    SDL_AudioDeviceID leftover = 0;
+    pthread_mutex_lock(&g_audio_open_mu);
+    g_audio_open_gen++;
+    if (g_audio_open_gen == 0) g_audio_open_gen = 1;
+    if (g_audio_open_state == TB_AUDIO_OPEN_READY) {
+        leftover = g_audio_open_dev;
+        g_audio_open_dev = 0;
+        g_audio_open_state = TB_AUDIO_OPEN_IDLE;
+    } else if (g_audio_open_state == TB_AUDIO_OPEN_FAILED) {
+        g_audio_open_state = TB_AUDIO_OPEN_IDLE;
+    }
+    /* INFLIGHT stays set. That worker sees the new generation, closes the
+     * paused device itself, and clears INFLIGHT only if it still owns it. */
+    pthread_mutex_unlock(&g_audio_open_mu);
+    if (leftover != 0) SDL_CloseAudioDevice(leftover);
+    if (a->audio_device == 0) return;
+    SDL_CloseAudioDevice(a->audio_device);
+    a->audio_device = 0;
+}
+
+/* Adopt a finished open, or start the one a kick deferred because another
+ * open was still inside AudioQueueStart. A failure arms the 5s retry and
+ * does not spin. */
+static void tb_audio_poll_open(struct app *a, uint64_t t) {
+    SDL_AudioDeviceID dev = 0;
+    int samples = 0;
+    int failed = 0;
+    char err[256];
+    err[0] = '\0';
+
+    pthread_mutex_lock(&g_audio_open_mu);
+    if (g_audio_open_state == TB_AUDIO_OPEN_READY ||
+        g_audio_open_state == TB_AUDIO_OPEN_FAILED) {
+        failed = (g_audio_open_state == TB_AUDIO_OPEN_FAILED);
+        dev = g_audio_open_dev;
+        samples = g_audio_open_samples;
+        snprintf(err, sizeof(err), "%s", g_audio_open_error);
+        g_audio_open_dev = 0;
+        g_audio_open_error[0] = '\0';
+        g_audio_open_state = TB_AUDIO_OPEN_IDLE;
+    }
+    const int inflight = (g_audio_open_state == TB_AUDIO_OPEN_INFLIGHT);
+    pthread_mutex_unlock(&g_audio_open_mu);
+
+    const int session = (a->client_fd >= 0 && !a->audio_suspended_for_sleep);
+    if (failed) {
+        if (a->audio_open_wanted && session) {
+            fprintf(stderr, "[audio] SDL_OpenAudioDevice failed: %s\n",
+                    err[0] ? err : "unknown");
+            a->audio_reopen_retry_ms = t + TB_AUDIO_REOPEN_RETRY_MS;
+        }
+    } else if (dev != 0) {
+        if (a->audio_open_wanted && session && a->audio_device == 0) {
+            tb_audio_install_device(a, dev, samples);
+        } else {
+            SDL_CloseAudioDevice(dev);
+        }
+    }
+
+    if (a->audio_open_wanted && !failed && !inflight &&
+        a->audio_device == 0 && session &&
+        a->audio_reopen_retry_ms == 0) {
+        tb_audio_spawn_open(a);
+    }
 }
 
 /* Called once per main-loop iteration; internally rate-limited to
@@ -1466,8 +1650,7 @@ static void tb_audio_watchdog_tick(struct app *a, uint64_t t) {
      * nothing to stall-check or reopen until a session exists, so bail
      * before any of that; drain the wake flag too, so a wake that lands
      * while idle doesn't queue up a spurious reopen-on-wake for whatever
-     * session connects next (tb_audio_open() on that accept already starts
-     * clean). */
+     * session connects next (the accept path's kick already starts clean). */
     if (a->client_fd < 0) {
         (void)tb_wake_watch_take_wake();
         a->audio_reopen_retry_ms = 0;
@@ -1480,16 +1663,18 @@ static void tb_audio_watchdog_tick(struct app *a, uint64_t t) {
 
     /* Going to sleep on purpose (request_system_sleep()). CoreAudio stops
      * the output as the machine goes down, which the heartbeat below reads
-     * as a stall. Measured 2026-10-08: it then retried the open every 5s,
-     * each failing with AudioQueueStart -66681 and blocking this loop for
-     * ~2.5s, and the iMac took 21s instead of ~15s to reach sleep. Stand
-     * down until a real wake; the wake flag reopens it. A dark wake does not
-     * post NSWorkspaceDidWakeNotification, so maintenance wakes leave the
-     * output closed. */
+     * as a stall. Measured 2026-10-08: retries failed with AudioQueueStart
+     * -66681. The open is off this thread now, so that no longer freezes the
+     * loop, but a device that is open still holds coreaudiod's
+     * PreventUserIdleSystemSleep assertion. Stand down until a real wake;
+     * the wake flag reopens it. A dark wake does not post
+     * NSWorkspaceDidWakeNotification, so maintenance wakes leave the output
+     * closed. */
     if (a->audio_suspended_for_sleep) {
         if (tb_wake_watch_take_wake()) {
             fprintf(stderr, "[audio] system wake after sleep -- reopening\n");
-            a->audio_reopen_retry_ms = (tb_audio_open(a) != 0) ? t + TB_AUDIO_REOPEN_RETRY_MS : 0;
+            a->audio_reopen_retry_ms = 0;
+            tb_audio_kick_open(a);
         } else if (t - a->audio_diag_last_ms >= TB_AUDIO_WATCHDOG_INTERVAL_MS * 5) {
             fprintf(stderr, "[audio] suspended (system sleep requested)\n");
             a->audio_diag_last_ms = t;
@@ -1508,20 +1693,26 @@ static void tb_audio_watchdog_tick(struct app *a, uint64_t t) {
     if (tb_wake_watch_take_wake()) {
         fprintf(stderr, "[audio] output stalled (system wake) -- reopening\n");
         tb_audio_close(a);
-        a->audio_reopen_retry_ms = (tb_audio_open(a) != 0) ? t + TB_AUDIO_REOPEN_RETRY_MS : 0;
+        a->audio_reopen_retry_ms = 0;
+        tb_audio_kick_open(a);
         return;
     }
 
     if (a->audio_device == 0) {
         /* Never opened, or a previous (re)open attempt failed outright.
          * Retry on a timer rather than spinning every loop iteration or
-         * staying silent forever until someone restarts the process. */
-        if (a->audio_reopen_retry_ms != 0 && t >= a->audio_reopen_retry_ms) {
+         * staying silent forever until someone restarts the process.
+         * An open already inside AudioQueueStart is left alone; polling
+         * adopts it, and a second thread would just block CoreAudio twice. */
+        if (!tb_audio_open_inflight() &&
+            a->audio_reopen_retry_ms != 0 && t >= a->audio_reopen_retry_ms) {
             fprintf(stderr, "[audio] retrying output device open\n");
-            a->audio_reopen_retry_ms = (tb_audio_open(a) != 0) ? t + TB_AUDIO_REOPEN_RETRY_MS : 0;
+            a->audio_reopen_retry_ms = 0;
+            tb_audio_kick_open(a);
         }
         if (t - a->audio_diag_last_ms >= TB_AUDIO_WATCHDOG_INTERVAL_MS * 5) {
-            fprintf(stderr, "[audio] dead (device not open)\n");
+            fprintf(stderr, "[audio] %s\n",
+                    tb_audio_open_inflight() ? "opening" : "dead (device not open)");
             a->audio_diag_last_ms = t;
         }
         return;
@@ -1549,8 +1740,9 @@ static void tb_audio_watchdog_tick(struct app *a, uint64_t t) {
             const char *reason = status_bad ? "device not playing" : "callback stalled";
             fprintf(stderr, "[audio] output stalled (%s) -- reopening\n", reason);
             tb_audio_close(a);
-            a->audio_reopen_retry_ms = (tb_audio_open(a) != 0) ? t + TB_AUDIO_REOPEN_RETRY_MS : 0;
-            return;   /* tb_audio_open() already rebaselined the diag counters */
+            a->audio_reopen_retry_ms = 0;
+            tb_audio_kick_open(a);
+            return;   /* install rebaselines the watchdog once the open finishes */
         }
     }
 
@@ -1973,7 +2165,8 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
                  * wake notification that will not come. */
                 if (a->audio_suspended_for_sleep) {
                     fprintf(stderr, "[audio] sleep did not happen -- reopening\n");
-                    a->audio_reopen_retry_ms = (tb_audio_open(a) != 0) ? now_ms() + TB_AUDIO_REOPEN_RETRY_MS : 0;
+                    a->audio_reopen_retry_ms = 0;
+                    tb_audio_kick_open(a);
                 }
             }
         }
@@ -3029,7 +3222,40 @@ static uint64_t tb_reconnect_grace_from_env(void) {
     return (uint64_t)v;
 }
 
+/* A blocked main thread is not the sender being gone. 250ms is far above a
+ * frame and far below the 10s grace, so ordinary loop jitter is not credited
+ * and the 15s AudioQueueStart hang is. Only time since this iteration's tick,
+ * and only once the hold already exists: the gap before the next iteration
+ * is a real sleep, and time before begin() is not a stall of this hold.
+ * A hold that was already due at the tick is left due. */
+#define TB_RECONNECT_STALL_CREDIT_MS 250
+
+static void tb_reconnect_credit_loop_stall(struct app *a) {
+    if (!a || a->loop_tick_ms == 0) return;
+    if (!tb_reconnect_hold_active(&a->reconnect)) return;
+    if (tb_reconnect_hold_should_drop(&a->reconnect, a->loop_tick_ms,
+                                     a->client_fd >= 0, a->reconnect_grace_ms)) {
+        return;
+    }
+    const uint64_t now = now_ms();
+    if (now < a->reconnect_stall_accounted_ms) return;
+    const uint64_t extra = now - a->reconnect_stall_accounted_ms;
+    if (!a->reconnect_stall_credited && extra < TB_RECONNECT_STALL_CREDIT_MS) return;
+    if (extra == 0) return;
+    tb_reconnect_hold_credit_stall(&a->reconnect, extra);
+    a->reconnect_stall_accounted_ms = now;
+    a->reconnect_stall_credited = 1;
+    fprintf(stderr, "[main] reconnect hold extended %llu ms (main thread was blocked)\n",
+            (unsigned long long)extra);
+}
+
 static void close_client(struct app *a) {
+    /* Before the deadline check. The second wake of 2026-10-29 began a hold,
+     * then blocked in SDL_OpenAudioDevice for ~15s, then closed again.
+     * now_ms() had stepped past the 10s grace while this process was stuck,
+     * so the picture was released. Explicit stop does not get that extension:
+     * the person asked for the waiting screen. */
+    if (!a->close_requested) tb_reconnect_credit_loop_stall(a);
     /* Captured before the resets below. close_requested is the sender's
      * TEARDOWN (the user pressed stop). had_picture is "a frame is actually
      * on screen", including one we are already holding from the previous
@@ -3084,6 +3310,9 @@ static void close_client(struct app *a) {
         SDL_DisableScreenSaver();
         tb_metal_plane_set_cursor(0, 0, 1, 1, 0, 0);
         if (hold_starting) {
+            /* This iteration's earlier time belongs to whatever the loop was
+             * doing before the picture needed holding, not to the grace. */
+            a->reconnect_stall_accounted_ms = now;
             fprintf(stderr, "[main] unexpected disconnect; holding last frame for %llu ms\n",
                     (unsigned long long)a->reconnect_grace_ms);
         }
@@ -3114,8 +3343,7 @@ static void close_client(struct app *a) {
      * audio_device to 0, so TB_PKT_AUDIO_FRAME's `if (a->audio_device != 0)`
      * guard (on_packet()) safely no-ops for frames that arrive before the
      * next session opens it again; the ring-buffer reset that used to live
-     * here is now redundant with tb_audio_open()'s own reset on next
-     * connect. */
+     * here happens when that open is installed. */
     tb_audio_close(a);
     a->audio_reopen_retry_ms = 0;   /* nothing to retry while idle */
     fprintf(stderr, "[main] client disconnected\n");
@@ -3297,6 +3525,15 @@ int main(int argc, char **argv) {
         }
 
         uint64_t t = now_ms();
+        a.loop_tick_ms = t;
+        a.reconnect_stall_accounted_ms = t;
+        a.reconnect_stall_credited = 0;
+
+        /* Wake notifications are delivered on this run loop, which AudioQueueStart
+         * used to stall, so they showed up only once the hang ended. Restore
+         * fullscreen here too: an aborted sleep drops the space while the loop
+         * is still ticking, before any later accept. */
+        tb_disp_reassert_fullscreen_if_needed(a.disp);
 
         if (t - a.last_ip_check_ms >= 1000) {
             char refreshed_tb_ip[64] = {0};
@@ -3340,14 +3577,14 @@ int main(int argc, char **argv) {
             bonjour_update(&a, TB_PORT);
         }
 
-        /* Audio output watchdog. This is a no-op while idle now -- output
-         * only runs with a client attached (opened on accept just below,
-         * closed in close_client()), so there is nothing live to stall or
-         * reopen until a session exists; tb_audio_watchdog_tick() checks
-         * a.client_fd itself and prints the idle diagnostic instead. See the
-         * TB_AUDIO_WATCHDOG_* comment near the top of the file for the two
-         * failure modes this still covers once a session is live, and why
-         * the thresholds are what they are. */
+        /* Adopt an audio open that finished off-thread before the watchdog
+         * decides the device is missing and starts another. The open itself
+         * never runs here. */
+        tb_audio_poll_open(&a, t);
+
+        /* Audio output watchdog. Output only runs with a client attached
+         * (kicked on accept, closed in close_client()). While idle the tick
+         * prints the idle diagnostic and does not reopen. */
         tb_audio_watchdog_tick(&a, t);
 
         /* Accept the client. One accept per iteration.
@@ -3448,18 +3685,15 @@ int main(int argc, char **argv) {
                     tb_reconnect_hold_note_connect(&a.reconnect, t);
                     fprintf(stderr, "[main] sender reconnected during hold; staying on last frame\n");
                 }
-                /* Audio output runs only while a client is attached (see
-                 * close_client() and the "Audio output open/close/watchdog"
-                 * comment above for why pausing the device isn't enough and
-                 * it has to be actually closed/opened): open fresh for this
-                 * session. tb_audio_open() already resets the ring buffer
-                 * and rebaselines the watchdog counters, so the first frames
-                 * of this session are neither lost nor misread as a stall. A
-                 * failed open isn't fatal -- the watchdog retries every
-                 * TB_AUDIO_REOPEN_RETRY_MS same as it always has. */
-                if (tb_audio_open(&a) != 0) {
-                    a.audio_reopen_retry_ms = t + TB_AUDIO_REOPEN_RETRY_MS;
-                }
+                /* Audio output runs only while a client is attached. The open
+                 * is kicked here and finished on another thread: right after
+                 * a wake, SDL_OpenAudioDevice blocks inside AudioQueueStart
+                 * (measured ~15s, -66681, 2026-10-29) and that used to freeze
+                 * this loop, expire the reconnect hold, and drop the session.
+                 * A failed open retries from the watchdog. It does not close
+                 * the link and it does not wait. */
+                a.audio_reopen_retry_ms = 0;
+                tb_audio_kick_open(&a);
                 /* System sleep is legitimate to block only while a client is
                  * actually presenting a picture; a live TCP accept is the
                  * start of that session, and close_client() -- the single
@@ -3543,6 +3777,14 @@ int main(int argc, char **argv) {
         /* Apply any cursor position that arrived since the last pass. Off the
          * packet path on purpose — see tb_metal_plane_flush_cursor. */
         tb_metal_plane_flush_cursor();
+
+        /* An aborted IOPMSleepSystem can drop the fullscreen space while
+         * this loop is still ticking and is_connected stays set. Nothing else
+         * calls refresh_window_mode until a flag changes, which is the
+         * "immediately left fullscreen" wake. A hold keeps is_connected, so
+         * the same check covers the picture we are keeping. */
+        tb_disp_reassert_fullscreen_if_needed(a.disp);
+        tb_reconnect_credit_loop_stall(&a);
 
         if (tb_reconnect_hold_should_drop(&a.reconnect, t, a.client_fd >= 0, a.reconnect_grace_ms)) {
             fprintf(stderr, "[main] reconnect hold expired; returning to waiting screen\n");

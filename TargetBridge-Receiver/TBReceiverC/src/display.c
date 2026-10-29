@@ -56,6 +56,7 @@ struct tb_display {
     int           cursor_type;
     uint32_t      last_video_frame_time;
     int           system_cursor_hidden;
+    uint32_t      fullscreen_reassert_ms;
 
     char          last_ip[64];
     char          last_status[128];
@@ -599,6 +600,21 @@ static void tb_disp_refresh_window_mode(struct tb_display *d) {
         CGDisplayShowCursor(CGMainDisplayID());
         d->system_cursor_hidden = 0;
     }
+}
+
+void tb_disp_reassert_fullscreen_if_needed(struct tb_display *d) {
+    if (!d || !d->win || !d->preferred_fullscreen) return;
+    if (!d->is_connected && !d->is_connecting) return;
+    const Uint32 flags = SDL_GetWindowFlags(d->win);
+    if (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) return;
+    /* SDL_SetWindowFullscreen in a tight loop fights WindowServer and can
+     * itself drop the space. One try per half-second is enough to follow an
+     * aborted sleep without spinning the frame loop. */
+    const Uint32 now = SDL_GetTicks();
+    if (d->fullscreen_reassert_ms != 0 && (now - d->fullscreen_reassert_ms) < 500) return;
+    d->fullscreen_reassert_ms = now;
+    fprintf(stderr, "[disp] restoring fullscreen\n");
+    tb_disp_refresh_window_mode(d);
 }
 
 static SDL_Renderer *tb_disp_try_renderer(SDL_Window *win, const char *driver) {

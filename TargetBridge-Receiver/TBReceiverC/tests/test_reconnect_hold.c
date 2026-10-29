@@ -135,6 +135,43 @@ static void test_connect_and_frame_outside_a_hold(void) {
           "null state with a picture still wants a hold");
 }
 
+static void test_stall_credit_keeps_the_picture(void) {
+    struct tb_reconnect_hold idle;
+    tb_reconnect_hold_clear(&idle);
+    tb_reconnect_hold_credit_stall(&idle, 15000);
+    CHECK(!idle.active, "credit on an idle hold does nothing");
+    CHECK(idle.until_ms == 0 && idle.connected_ms == 0,
+          "idle credit does not invent a deadline");
+    tb_reconnect_hold_credit_stall(NULL, 15000);
+
+    struct tb_reconnect_hold h;
+    tb_reconnect_hold_clear(&h);
+    tb_reconnect_hold_begin(&h, 0, 10000);
+    tb_reconnect_hold_credit_stall(&h, 0);
+    CHECK(h.until_ms == 10000, "a zero stall does not move the deadline");
+
+    /* Second wake, 2026-10-29: hold began, the sender accepted, then
+     * AudioQueueStart blocked the main thread for ~15s. The 10s grace must
+     * still be intact when that call returns. */
+    tb_reconnect_hold_note_connect(&h, 50);
+    tb_reconnect_hold_credit_stall(&h, 15000);
+    CHECK(h.until_ms == 25000, "blocked time is added to the disconnect deadline");
+    CHECK(h.connected_ms == 15050, "blocked time is added to the post-connect clock");
+    CHECK(!tb_reconnect_hold_should_drop(&h, 16000, 1, 10000),
+          "a 15s stall does not expire a hold whose grace is 10s");
+    CHECK(tb_reconnect_should_hold(0, 1, &h, 16000, 10000),
+          "another close during that stall still keeps the picture");
+
+    struct tb_reconnect_hold raw;
+    tb_reconnect_hold_clear(&raw);
+    tb_reconnect_hold_begin(&raw, 0, 10000);
+    tb_reconnect_hold_note_connect(&raw, 50);
+    CHECK(!tb_reconnect_should_hold(0, 1, &raw, 16000, 10000),
+          "the same close without credit gives up the picture");
+    CHECK(tb_reconnect_hold_should_drop(&raw, 16000, 1, 10000),
+          "without credit the post-connect grace has already elapsed");
+}
+
 int main(void) {
     test_explicit_stop_never_holds();
     test_no_picture_and_disabled();
@@ -144,6 +181,7 @@ int main(void) {
     test_double_dial_does_not_expire_early_or_renew();
     test_expired_hold_is_not_renewed();
     test_connect_and_frame_outside_a_hold();
+    test_stall_credit_keeps_the_picture();
 
     if (g_failures) {
         fprintf(stderr, "%d/%d checks failed\n", g_failures, g_checks);

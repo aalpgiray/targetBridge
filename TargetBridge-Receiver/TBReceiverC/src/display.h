@@ -131,4 +131,9 @@ void tb_disp_render_connecting(struct tb_display *d);
  * and does not release a Metal plane. */
 void tb_disp_render_reconnect_hold(struct tb_display *d);
 
+/* If a live picture should be fullscreen and macOS has dropped that space
+ * (an aborted system sleep does this while the loop is still ticking), put
+ * it back. Already-fullscreen is a no-op. Retries are rate-limited. */
+void tb_disp_reassert_fullscreen_if_needed(struct tb_display *d);
+
 #endif
