@@ -175,6 +175,7 @@
   "receiver.ui.help_4": "按 L 可切换接收端语言。",
   "receiver.language.auto": "自动",
   "receiver.status.waiting_for_sender": "等待发送端",
+  "receiver.status.reconnecting": "正在重新连接",
   "receiver.splash.connecting": "正在连接你的 MacBook",
   "receiver.menu.quit": "退出 TargetBridge Receiver",
   "receiver.menu.idle": "未投送",

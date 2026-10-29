@@ -60,13 +60,14 @@ $(CODEC_OBJ): $(CODEC)/tb_dpcm.c $(CODEC)/tb_dpcm.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJ) $(BIN) $(TEST_BIN) $(TEST_DPCM_BIN)
+	rm -f $(OBJ) $(BIN) $(TEST_BIN) $(TEST_DPCM_BIN) $(TEST_HOLD_BIN)
 
 # Unit tests. net.c and tb_dpcm.c are pure POSIX/libc, so these need no
 # ffmpeg/SDL/pkgconf — they run anywhere, including CI, with no hardware.
 TEST_CFLAGS = -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11
 TEST_BIN = test_net_parser
 TEST_DPCM_BIN = test_dpcm
+TEST_HOLD_BIN = test_reconnect_hold
 
 $(TEST_BIN): tests/test_net_parser.c src/net.c src/net.h src/proto.h
 	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_parser.c src/net.c -o $@
@@ -74,8 +75,12 @@ $(TEST_BIN): tests/test_net_parser.c src/net.c src/net.h src/proto.h
 $(TEST_DPCM_BIN): tests/test_dpcm.c $(CODEC)/tb_dpcm.c $(CODEC)/tb_dpcm.h
 	$(CC) $(TEST_CFLAGS) -I$(CODEC) tests/test_dpcm.c $(CODEC)/tb_dpcm.c -o $@
 
-test: $(TEST_BIN) $(TEST_DPCM_BIN)
+$(TEST_HOLD_BIN): tests/test_reconnect_hold.c src/tb_reconnect_hold.h
+	$(CC) $(TEST_CFLAGS) -Isrc tests/test_reconnect_hold.c -o $@
+
+test: $(TEST_BIN) $(TEST_DPCM_BIN) $(TEST_HOLD_BIN)
 	./$(TEST_BIN)
 	./$(TEST_DPCM_BIN)
+	./$(TEST_HOLD_BIN)
 
 .PHONY: all clean test

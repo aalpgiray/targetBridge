@@ -88,14 +88,20 @@ want "parser cost regression test"      1 "backlog_cost_stays_linear" TargetBrid
 want "threaded receive"                 1 "link_reader_main"       TargetBridge-Receiver/TBReceiverC/src
 want "video queue (never block reader)" 1 "TB_VIDEO_QUEUE"         TargetBridge-Receiver/TBReceiverC/src
 want "async present"                    1 "TB_ASYNC_PRESENT"       TargetBridge-Receiver/TBReceiverC/src
-# The video layer must come down with the session.
+# The video layer must come down when the session is actually over.
 #
 # The Metal plane sits OVER the SDL window and keeps the last frame it drew.
 # close_client reset the decoder, the parser and the audio ring but left the
 # plane up, so the idle screen rendered underneath a stale frame: the receiver
 # looked frozen and only a kill would clear it. Nothing errors when this
 # regresses -- the picture simply stops changing.
+#
+# An unexpected disconnect (sleep, link drop) is the exception: the plane stays
+# up for TB_RECONNECT_HOLD_MS so the waiting screen does not flash before the
+# sender dials back. Explicit teardown and grace expiry still call set_hidden.
+# Both markers have to stay; deleting either one is a different bug.
 want "video layer released on teardown" 1 "tb_metal_plane_set_hidden" TargetBridge-Receiver/TBReceiverC/src/main.c
+want "reconnect hold keeps the last frame" 1 "TB_RECONNECT_HOLD_MS" TargetBridge-Receiver/TBReceiverC/src
 
 echo "== audio ===================================================="
 want "virtual output driver"            1 "libASPL\|TargetBridgeAudioDevice" TargetBridge-AudioDriver TargetBridge-Sender

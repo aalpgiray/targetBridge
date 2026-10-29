@@ -42,8 +42,20 @@ int  tb_metal_plane_supports_dpcm(void);
 void tb_metal_plane_set_vsync(int enabled);
 
 /* Show/hide the video plane. Hidden while the SDL status/connecting UI owns
- * the window, shown once frames arrive. */
+ * the window, shown once frames arrive.
+ *
+ * Hiding releases the plane outright (there is no set_hidden(0)). A brief
+ * reconnect must simply not call this: the last drawable stays on screen
+ * only while the view is still attached. */
 void tb_metal_plane_set_hidden(int hidden);
+
+/* Draw or remove a small reconnecting chip over the last frame.
+ *
+ * `visible` 0 removes it. The label is the already-translated word; NULL is
+ * fine when hiding. Safe to call every loop tick: it does nothing when the
+ * plane is down or the chip is already showing this label at this size.
+ * Main thread only — it edits the layer tree. */
+void tb_metal_plane_set_reconnect_badge(int visible, const char *label);
 
 /* Cursor overlay state, in source-frame coordinates.
  *

@@ -39,6 +39,7 @@
  * animation. */
 #import <QuartzCore/QuartzCore.h>
 #import <Cocoa/Cocoa.h>
+#import <CoreText/CoreText.h>
 
 #include "tb_metal_plane.h"
 #include "tb_dpcm.h"
@@ -61,6 +62,7 @@ static double tb_mp_now_ms(void) {
 #include <SDL.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 /* Drawables the layer may hand out. Only 2 or 3 are legal — CAMetalLayer clamps,
  * and double buffering is the floor for a compositor: one buffer is scanned out
@@ -203,6 +205,17 @@ static struct {
     float                 cur_tex_scale;      /* what curTex was built for */
     int                   cur_x, cur_y, cur_sw, cur_sh, cur_visible, cur_type;
 
+    /* Small "reconnecting" chip drawn over the last frame. A sibling of the
+     * cursor plane: it has to live above the CAMetalLayer, because anything
+     * SDL draws is underneath it and invisible while the plane is up. */
+    CALayer              *reconnectBadge;
+    CALayer              *reconnectSpinner;
+    CALayer              *reconnectText;
+    char                  reconnect_label[96];
+    CGFloat               reconnect_font_pt;
+    CGFloat               reconnect_scale;
+    CGSize                reconnect_host;
+
     int                   shown;
     /* Default on: tearing should be opted into, never inherited. */
     int                   vsync;
@@ -237,6 +250,7 @@ static atomic_int g_cursor_dirty = 0;
 static void tb_cursor_layer_attach(void);
 static void tb_cursor_layer_ensure(void);
 static void tb_cursor_layer_place(void);
+static void tb_reconnect_badge_detach(void);
 
 /* The cursor's own thread.
  *
@@ -1116,6 +1130,7 @@ void tb_metal_plane_shutdown(void) {
     for (int i = 0; i < TB_UPLOAD_RING; ++i) { g.ring[i] = nil; g.ring_cap[i] = 0; }
     for (int i = 0; i < TB_FRAME_RING; ++i) { g.frame[i] = nil; g.frame_cap[i] = 0; }
     g.frame_open = 0; g.frame_widx = 0;
+    tb_reconnect_badge_detach();
     tb_cursor_layer_detach();
     g.curTex = nil; g.cur_tex_scale = 0.f;
     g.pipe = nil; g.cursorPipe = nil; g.dpcmPipe = nil;
@@ -1160,6 +1175,246 @@ int tb_metal_plane_supports_dpcm(void) {
                 cached ? "available" : "unavailable", [[dev name] UTF8String]);
     }
     return cached;
+}
+
+static void tb_reconnect_badge_detach(void) {
+    if (!g.reconnectBadge) return;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [g.reconnectBadge removeFromSuperlayer];
+    [CATransaction commit];
+    g.reconnectBadge = nil;
+    g.reconnectSpinner = nil;
+    g.reconnectText = nil;
+    g.reconnect_label[0] = '\0';
+    g.reconnect_font_pt = 0;
+    g.reconnect_scale = 0;
+    g.reconnect_host = CGSizeZero;
+}
+
+/* 12-tick spinner, same green as the SDL connecting splash (84, 225, 137),
+ * so the chip reads as part of this app and not as a system alert. Cached:
+ * the bitmap does not depend on the label. */
+static CGImageRef tb_reconnect_spinner_image(CGFloat scale) {
+    static CGImageRef cached = NULL;
+    static int cached_px = 0;
+    int px = (int)(32.0 * scale);
+    if (px < 32) px = 32;
+    if (cached && cached_px == px) return cached;
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(NULL, (size_t)px, (size_t)px, 8,
+                                             (size_t)px * 4, cs,
+                                             kCGImageAlphaPremultipliedLast |
+                                             kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    if (!ctx) return cached;
+
+    static const int vectors[12][2] = {
+        { 0, -100 }, { 50, -87 }, { 87, -50 }, { 100, 0 },
+        { 87, 50 }, { 50, 87 }, { 0, 100 }, { -50, 87 },
+        { -87, 50 }, { -100, 0 }, { -87, -50 }, { -50, -87 }
+    };
+    CGContextSetLineWidth(ctx, px * 0.08);
+    CGContextSetLineCap(ctx, kCGLineCapRound);
+    const CGFloat cx = px / 2.0;
+    const CGFloat cy = px / 2.0;
+    const CGFloat radius = px * 0.28;
+    const CGFloat segment = px * 0.16;
+    for (int i = 0; i < 12; i++) {
+        const CGFloat alpha = (54.0 + (11 - i) * 18.0) / 255.0;
+        CGContextSetRGBStrokeColor(ctx, 84.0 / 255.0, 225.0 / 255.0, 137.0 / 255.0, alpha);
+        const CGFloat x1 = cx + vectors[i][0] * radius / 100.0;
+        const CGFloat y1 = cy + vectors[i][1] * radius / 100.0;
+        const CGFloat x2 = cx + vectors[i][0] * (radius + segment) / 100.0;
+        const CGFloat y2 = cy + vectors[i][1] * (radius + segment) / 100.0;
+        CGContextMoveToPoint(ctx, x1, y1);
+        CGContextAddLineToPoint(ctx, x2, y2);
+        CGContextStrokePath(ctx);
+    }
+    CGImageRef next = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    if (!next) return cached;
+    if (cached) CGImageRelease(cached);
+    cached = next;
+    cached_px = px;
+    return cached;
+}
+
+/* The word, rasterised so it cannot come out upside down. CATextLayer draws
+ * in its own flipped space and gets this wrong on the SDL metal view, which
+ * has been both orientations. CoreText into a bitmap is the same path the
+ * cursor sprite already uses, and that one is upright. */
+static CGImageRef tb_reconnect_text_image(const char *utf8, CGFloat ptSize,
+                                         CGFloat scale, CGSize *outPoints) {
+    if (!utf8 || !utf8[0]) utf8 = "Reconnecting";
+    CFStringRef str = CFStringCreateWithCString(NULL, utf8, kCFStringEncodingUTF8);
+    if (!str) return NULL;
+    CTFontRef font = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, ptSize, NULL);
+    if (!font) font = CTFontCreateWithName(CFSTR("Helvetica"), ptSize, NULL);
+    if (!font) { CFRelease(str); return NULL; }
+    const void *keys[] = { kCTFontAttributeName, kCTForegroundColorAttributeName };
+    CGColorRef fg = CGColorCreateGenericRGB(0.93, 0.95, 0.94, 1.0);
+    const void *vals[] = { font, fg };
+    CFDictionaryRef attrs = CFDictionaryCreate(NULL, keys, vals, 2,
+                                               &kCFTypeDictionaryKeyCallBacks,
+                                               &kCFTypeDictionaryValueCallBacks);
+    CFAttributedStringRef astr = CFAttributedStringCreate(NULL, str, attrs);
+    CTLineRef line = CTLineCreateWithAttributedString(astr);
+    CGFloat ascent = 0, descent = 0;
+    const double width = CTLineGetTypographicBounds(line, &ascent, &descent, NULL);
+    CGFloat wpt = ceil((CGFloat)width);
+    CGFloat hpt = ceil(ascent + descent);
+    if (wpt < 1) wpt = 1;
+    if (hpt < 1) hpt = 1;
+
+    const size_t wpx = (size_t)(wpt * scale);
+    const size_t hpx = (size_t)(hpt * scale);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(NULL, wpx, hpx, 8, wpx * 4, cs,
+                                             kCGImageAlphaPremultipliedLast |
+                                             kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(cs);
+    CGImageRef img = NULL;
+    if (ctx) {
+        CGContextScaleCTM(ctx, scale, scale);
+        CGContextSetTextPosition(ctx, 0, descent);
+        CTLineDraw(line, ctx);
+        img = CGBitmapContextCreateImage(ctx);
+        CGContextRelease(ctx);
+    }
+    CFRelease(line);
+    CFRelease(astr);
+    CFRelease(attrs);
+    CGColorRelease(fg);
+    CFRelease(font);
+    CFRelease(str);
+    if (outPoints) *outPoints = CGSizeMake(wpt, hpt);
+    return img;
+}
+
+void tb_metal_plane_set_reconnect_badge(int visible, const char *label) {
+    if (!visible || !label || !label[0] || !g.ready || !g.layer) {
+        tb_reconnect_badge_detach();
+        return;
+    }
+
+    CALayer *host = g.layer.superlayer ?: g.layer;
+    CGRect b = host.bounds;
+    if (b.size.width <= 0 || b.size.height <= 0) b = g.layer.bounds;
+    if (b.size.width <= 0 || b.size.height <= 0) return;
+
+    const CGFloat scale = g.layer.contentsScale > 0 ? g.layer.contentsScale : 2.0;
+    CGFloat unit = b.size.height / 1440.0;
+    if (unit < 0.85) unit = 0.85;
+    if (unit > 2.5) unit = 2.5;
+    const CGFloat fontPt = 15.0 * unit;
+
+    const int same = g.reconnectBadge
+        && g.reconnectBadge.superlayer == host
+        && g.reconnect_font_pt == fontPt
+        && g.reconnect_scale == scale
+        && g.reconnect_host.width == b.size.width
+        && g.reconnect_host.height == b.size.height
+        && strncmp(g.reconnect_label, label, sizeof(g.reconnect_label)) == 0;
+    if (same) return;
+
+    @autoreleasepool {
+        const int creating = (g.reconnectBadge == nil);
+        if (creating) {
+            NSDictionary *noAnim = @{
+                @"position": [NSNull null], @"bounds": [NSNull null],
+                @"frame": [NSNull null], @"contents": [NSNull null],
+                @"hidden": [NSNull null], @"opacity": [NSNull null],
+                @"backgroundColor": [NSNull null], @"cornerRadius": [NSNull null],
+                @"borderWidth": [NSNull null], @"borderColor": [NSNull null],
+                @"transform": [NSNull null]
+            };
+            CALayer *badge = [CALayer layer];
+            badge.zPosition = 900;   /* under the cursor plane (1000), over the video */
+            badge.actions = noAnim;
+            badge.contentsScale = scale;
+            CGColorRef bg = CGColorCreateGenericRGB(0.05, 0.05, 0.06, 0.78);
+            CGColorRef edge = CGColorCreateGenericRGB(1, 1, 1, 0.16);
+            badge.backgroundColor = bg;
+            badge.borderWidth = 1.0;
+            badge.borderColor = edge;
+            CGColorRelease(bg);
+            CGColorRelease(edge);
+
+            CALayer *spin = [CALayer layer];
+            spin.actions = noAnim;
+            spin.contentsScale = scale;
+            CGImageRef ticks = tb_reconnect_spinner_image(scale);
+            if (ticks) spin.contents = (__bridge id)ticks;
+
+            CALayer *text = [CALayer layer];
+            text.actions = noAnim;
+            text.contentsScale = scale;
+
+            [badge addSublayer:spin];
+            [badge addSublayer:text];
+            g.reconnectBadge = badge;
+            g.reconnectSpinner = spin;
+            g.reconnectText = text;
+
+            /* 12 ticks × 90 ms, matching the SDL spinner's phase clock.
+             * Added outside a disabled transaction so the render server
+             * actually runs it; the layer actions above only suppress the
+             * implicit fade that would otherwise play on insert. */
+            CABasicAnimation *spinAnim = [CABasicAnimation animationWithKeyPath:@"transform.rotation.z"];
+            spinAnim.fromValue = @0;
+            spinAnim.toValue = @(-6.283185307179586);
+            spinAnim.duration = 1.08;
+            spinAnim.repeatCount = HUGE_VALF;
+            spinAnim.removedOnCompletion = NO;
+            [spin addAnimation:spinAnim forKey:@"spin"];
+        }
+
+        CGSize textPt = CGSizeZero;
+        CGImageRef textImg = tb_reconnect_text_image(label, fontPt, scale, &textPt);
+        if (textImg) {
+            g.reconnectText.contents = (__bridge id)textImg;
+            g.reconnectText.contentsScale = scale;
+            CGImageRelease(textImg);
+        }
+        g.reconnectSpinner.contentsScale = scale;
+        CGImageRef ticks = tb_reconnect_spinner_image(scale);
+        if (ticks) g.reconnectSpinner.contents = (__bridge id)ticks;
+
+        const CGFloat spin = 18.0 * unit;
+        const CGFloat gap = 8.0 * unit;
+        const CGFloat padX = 14.0 * unit;
+        const CGFloat padY = 9.0 * unit;
+        const CGFloat margin = 36.0 * unit;
+        const CGFloat textW = textPt.width > 1 ? textPt.width : fontPt * 8;
+        const CGFloat textH = textPt.height > 1 ? textPt.height : fontPt;
+        const CGFloat contentH = spin > textH ? spin : textH;
+        const CGFloat pillW = padX + spin + gap + textW + padX;
+        const CGFloat pillH = padY + contentH + padY;
+        NSView *nsView = (__bridge NSView *)g.view;
+        const int flipped = (nsView && [nsView isKindOfClass:[NSView class]] && nsView.isFlipped) ? 1 : 0;
+        const CGFloat x = (b.size.width - pillW) / 2.0;
+        const CGFloat y = flipped ? (b.size.height - margin - pillH) : margin;
+
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        if (g.reconnectBadge.superlayer != host) {
+            [g.reconnectBadge removeFromSuperlayer];
+            [host addSublayer:g.reconnectBadge];
+        }
+        g.reconnectBadge.frame = CGRectMake(x, y, pillW, pillH);
+        g.reconnectBadge.cornerRadius = pillH / 2.0;
+        g.reconnectSpinner.frame = CGRectMake(padX, (pillH - spin) / 2.0, spin, spin);
+        g.reconnectText.frame = CGRectMake(padX + spin + gap, (pillH - textH) / 2.0, textW, textH);
+        [CATransaction commit];
+
+        snprintf(g.reconnect_label, sizeof(g.reconnect_label), "%s", label);
+        g.reconnect_font_pt = fontPt;
+        g.reconnect_scale = scale;
+        g.reconnect_host = b.size;
+        if (creating) fprintf(stderr, "[metal] reconnecting indicator shown\n");
+    }
 }
 
 void tb_metal_plane_set_hidden(int hidden) {

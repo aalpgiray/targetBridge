@@ -25,6 +25,7 @@
 #include "tb_logship.h"
 #include "tb_health.h"
 #include "tb_wake_watch.h"
+#include "tb_reconnect_hold.h"
 
 #include <SDL.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -101,6 +102,19 @@
  * 2s of true silence has elapsed -- faster than waiting for the passive
  * 10s idle reaper, not slower, so this cannot re-lock out a dead sender. */
 #define TB_NEW_SESSION_GRACE_MS 2000
+
+/* How long the last frame stays up after an unexpected disconnect.
+ *
+ * The wake trace (receiver-local.log, 2026-10-29): the stale-session close
+ * releases the Metal plane, the sender's TCP session is back ~50 ms later,
+ * and the new plane plus first frame arrive 2–3 s after that. The waiting
+ * screen in between is the plane being gone, not the sender being slow.
+ * Ten seconds covers that gap, including the sender's connect/disconnect/
+ * connect burst, and is the same order as TB_SENDER_IDLE_TIMEOUT_MS so a
+ * dead sender still ends on the waiting screen promptly.
+ *
+ * TB_RECONNECT_HOLD_MS=0 turns it off. See tb_reconnect_hold.h. The
+ * startup log prints the value actually in force. */
 
 /* While idle (no client attached), re-publish Bonjour on this tick so a
  * sender that lost the receiver mid-session -- for any reason, sleep, cable
@@ -330,6 +344,11 @@ struct app {
      * just a transient probe like a UI-language push). Gates the fullscreen
      * "connecting" splash so a bare/short-lived connection doesn't flash it. */
     int      session_active;
+    /* Last frame kept on screen across an unexpected disconnect. See
+     * tb_reconnect_hold.h. reconnect_grace_ms is TB_RECONNECT_HOLD_MS unless
+     * the environment overrides it; 0 disables the hold. */
+    struct tb_reconnect_hold reconnect;
+    uint64_t reconnect_grace_ms;
 
     char     ip_text[64];
     char     tb_ip_text[64];
@@ -1168,11 +1187,22 @@ static void tb_receiver_apply_input_control_mode(struct app *a, const uint8_t *p
 
 /* ---- Callbacks: decoder → display ------------------------------------ */
 
+/* A frame is being accepted for display. If we were sitting on the previous
+ * session's picture, that wait is over and the badge comes down before the
+ * main loop paints, so the waiting screen does not get a turn in between. */
+static void tb_mark_video_frame(struct app *a) {
+    a->have_video_frame = 1;
+    if (!tb_reconnect_hold_active(&a->reconnect)) return;
+    tb_reconnect_hold_note_frame(&a->reconnect);
+    tb_metal_plane_set_reconnect_badge(0, NULL);
+    fprintf(stderr, "[main] live frame resumed; reconnect hold cleared\n");
+}
+
 static void on_frame(const uint8_t *y, int y_stride,
                      const uint8_t *uv, int uv_stride,
                      int w, int h, void *ud) {
     struct app *a = (struct app *)ud;
-    a->have_video_frame = 1;
+    tb_mark_video_frame(a);
     tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
     {
         char width_text[16];
@@ -1226,7 +1256,7 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
         return;  /* unknown format */
     }
 
-    a->have_video_frame = 1;
+    tb_mark_video_frame(a);
     tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
     {
         char width_text[16];
@@ -1297,7 +1327,7 @@ static void handle_raw_dpcm(struct app *a, const uint8_t *payload, size_t len) {
         return;
     }
     tb_note_frame_latency(a, first_byte);
-    a->have_video_frame = 1;
+    tb_mark_video_frame(a);
     tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
     a->frames++;
 }
@@ -2970,7 +3000,48 @@ static void drop_pending_network(struct app *a) {
     pthread_mutex_unlock(&a->net_lock);
 }
 
+/* Drop the held picture and let the SDL waiting screen own the window.
+ *
+ * This is the old close_client tail: leave fullscreen, release the Metal
+ * plane, hide the cursor. Explicit stop and an expired grace both come
+ * through here. An unexpected disconnect that is still inside the grace
+ * does not. */
+static void tb_release_held_picture(struct app *a) {
+    tb_reconnect_hold_clear(&a->reconnect);
+    tb_metal_plane_set_reconnect_badge(0, NULL);
+    SDL_EnableScreenSaver();
+    tb_disp_set_connection_state(a->disp, 0);
+    tb_metal_plane_set_hidden(1);
+    tb_disp_set_cursor(a->disp, 0, 0, 1, 1, 0, 0);
+}
+
+static uint64_t tb_reconnect_grace_from_env(void) {
+    const char *e = getenv("TB_RECONNECT_HOLD_MS");
+    if (!e || !e[0]) return TB_RECONNECT_HOLD_MS;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(e, &end, 10);
+    if (end == e || *end != '\0' || errno != 0) {
+        fprintf(stderr, "[main] TB_RECONNECT_HOLD_MS='%s' is not a number; using %llu\n",
+                e, (unsigned long long)TB_RECONNECT_HOLD_MS);
+        return TB_RECONNECT_HOLD_MS;
+    }
+    return (uint64_t)v;
+}
+
 static void close_client(struct app *a) {
+    /* Captured before the resets below. close_requested is the sender's
+     * TEARDOWN (the user pressed stop). had_picture is "a frame is actually
+     * on screen", including one we are already holding from the previous
+     * socket — the sender's second dial of a burst must not be treated as
+     * a session that never showed anything. */
+    const int explicit_stop = a->close_requested;
+    const int had_picture = a->have_video_frame || tb_reconnect_hold_active(&a->reconnect);
+    const uint64_t now = now_ms();
+    const int hold = tb_reconnect_should_hold(explicit_stop, had_picture, &a->reconnect,
+                                              now, a->reconnect_grace_ms);
+    const int hold_starting = hold && !tb_reconnect_hold_active(&a->reconnect);
+
     tb_health_session_end();
     tb_mic_capture_stop();
     g_mic_app = NULL;
@@ -2982,25 +3053,46 @@ static void close_client(struct app *a) {
     a->close_requested = 0;
     a->have_video_frame = 0;
     snprintf(a->input_control_mode, sizeof(a->input_control_mode), "off");
-    SDL_EnableScreenSaver();
     tb_receiver_refresh_input_capture(a);
-    tb_disp_set_connection_state(a->disp, 0);
-    /* Take the video layer down with the session.
+    /* The plane stays up on an unexpected disconnect.
      *
-     * The Metal plane is layered OVER the SDL window and holds the last frame it
-     * drew. Teardown left it visible, so the idle screen was rendered underneath
-     * a stale frame that never went away: the receiver looked frozen, and the
-     * only way out was killing it. Everything else here was already reset -- the
-     * decoder, the parser, the audio ring -- but the thing actually on screen
-     * was not.
+     * It is layered OVER the SDL window and holds the last frame it drew.
+     * Releasing it here is what made a wake show the waiting screen for the
+     * two or three seconds until the next frame rebuilt it: the idle UI is
+     * not drawn on top of the plane, it is what you see once the plane is
+     * gone, and both tb_disp_render_status and tb_disp_render_connecting call
+     * set_hidden themselves. Leaving the plane up with those calls still
+     * running would just tear it down a tick later.
      *
-     * set_hidden(1) releases the plane outright (it calls
-     * tb_metal_plane_shutdown), and the render path re-creates it lazily on the
-     * next session's first frame -- display.c already guards every render with
-     * `if (!tb_metal_plane_available()) tb_metal_plane_init(d->win)`. There is no
-     * set_hidden(0) to pair with this, and none is needed. */
-    tb_metal_plane_set_hidden(1);
-    tb_disp_set_cursor(a->disp, 0, 0, 1, 1, 0, 0);
+     * So a hold skips the release AND the main loop skips those two draws.
+     * The cursor layer stays attached (its bitmap survives; the sender only
+     * resends a shape change) but the sprite is hidden until the next cursor
+     * packet — tb_disp_set_cursor would also repaint the SDL texture, and
+     * is_connected is still set, so that repaint is exactly the flash this
+     * is avoiding. Screensaver stays off so the panel we just woke does not
+     * blank the held frame.
+     *
+     * Explicit teardown, grace expiry, and a disconnect with nothing on
+     * screen still release the plane. That is the frozen-over-idle bug this
+     * used to fix, and it is still the bug if the waiting screen comes back
+     * while the plane is up. Audio, the health assertion, the parser and the
+     * decoder reset on every close either way: the hold is a picture, not a
+     * live session. */
+    if (hold) {
+        tb_reconnect_hold_begin(&a->reconnect, now, a->reconnect_grace_ms);
+        tb_reconnect_hold_note_disconnect(&a->reconnect);
+        SDL_DisableScreenSaver();
+        tb_metal_plane_set_cursor(0, 0, 1, 1, 0, 0);
+        if (hold_starting) {
+            fprintf(stderr, "[main] unexpected disconnect; holding last frame for %llu ms\n",
+                    (unsigned long long)a->reconnect_grace_ms);
+        }
+    } else {
+        if (tb_reconnect_hold_active(&a->reconnect)) {
+            fprintf(stderr, "[main] reconnect hold ended; returning to waiting screen\n");
+        }
+        tb_release_held_picture(a);
+    }
     tb_refresh_idle_localized_strings(a);
     a->last_clipboard_text[0] = '\0';
     tb_parser_free(&a->parser);
@@ -3125,6 +3217,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[pace] presentation pacing %s\n",
                 a.pace_enabled ? "on (TB_PACE=0 disables)" : "off");
     }
+    a.reconnect_grace_ms = tb_reconnect_grace_from_env();
+    fprintf(stderr, "[main] reconnect hold %llu ms (TB_RECONNECT_HOLD_MS overrides, 0 disables)\n",
+            (unsigned long long)a.reconnect_grace_ms);
     a.reader1 = (struct tb_link_reader *)calloc(1, sizeof(*a.reader1));
     a.ctrl_q  = (struct tb_ctrl_msg *)calloc(TB_CTRL_QUEUE_MAX, sizeof(*a.ctrl_q));
     if (!a.reader1 || !a.ctrl_q) {
@@ -3349,6 +3444,10 @@ int main(int argc, char **argv) {
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] client connected\n");
+                if (tb_reconnect_hold_active(&a.reconnect)) {
+                    tb_reconnect_hold_note_connect(&a.reconnect, t);
+                    fprintf(stderr, "[main] sender reconnected during hold; staying on last frame\n");
+                }
                 /* Audio output runs only while a client is attached (see
                  * close_client() and the "Audio output open/close/watchdog"
                  * comment above for why pausing the device isn't enough and
@@ -3445,7 +3544,21 @@ int main(int argc, char **argv) {
          * packet path on purpose — see tb_metal_plane_flush_cursor. */
         tb_metal_plane_flush_cursor();
 
-        if (a.client_fd < 0 || !a.session_active) {
+        if (tb_reconnect_hold_should_drop(&a.reconnect, t, a.client_fd >= 0, a.reconnect_grace_ms)) {
+            fprintf(stderr, "[main] reconnect hold expired; returning to waiting screen\n");
+            tb_release_held_picture(&a);
+        }
+
+        if (tb_reconnect_hold_active(&a.reconnect) && !a.have_video_frame) {
+            /* Not the status screen and not the connecting splash. Both of
+             * those call tb_metal_plane_set_hidden, which is the teardown
+             * that flashes the waiting screen, and the status path also
+             * leaves fullscreen. The last drawable is already on the plane;
+             * the badge is a layer above it. The SDL repaint is only for a
+             * stream whose last frame lives in an SDL texture. */
+            tb_metal_plane_set_reconnect_badge(1, tb_i18n_get("receiver.status.reconnecting"));
+            if (!tb_metal_plane_available()) tb_disp_render_reconnect_hold(a.disp);
+        } else if (a.client_fd < 0 || !a.session_active) {
             /* No client, or a connection that hasn't started a real streaming
              * session (e.g. a transient UI-language push during discovery):
              * stay on the windowed waiting screen, don't flash fullscreen. */

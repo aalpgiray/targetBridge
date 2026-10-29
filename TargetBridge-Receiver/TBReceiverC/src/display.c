@@ -1809,6 +1809,65 @@ void tb_disp_render_connecting(struct tb_display *d) {
     SDL_RenderPresent(d->ren);
 }
 
+/* The connecting splash's spinner, shrunk and parked at the bottom. Same
+ * 12 ticks and the same green, so a reconnect reads as the same app. */
+static void tb_disp_draw_reconnect_spinner(struct tb_display *d, int drawable_w, int drawable_h) {
+    if (!d || !d->ren) return;
+
+    static const int vectors[12][2] = {
+        { 0, -100 }, { 50, -87 }, { 87, -50 }, { 100, 0 },
+        { 87, 50 }, { 50, 87 }, { 0, 100 }, { -50, 87 },
+        { -87, 50 }, { -100, 0 }, { -87, -50 }, { -50, -87 }
+    };
+    const int min_side = drawable_w < drawable_h ? drawable_w : drawable_h;
+    int radius = min_side / 90;
+    if (radius < 10) radius = 10;
+    int segment = radius / 2;
+    if (segment < 4) segment = 4;
+    const int center_x = drawable_w / 2;
+    int center_y = drawable_h - (radius + segment) * 3;
+    if (center_y < radius + segment) center_y = drawable_h / 2;
+    const int phase = (int)((SDL_GetTicks() / 90u) % 12u);
+
+    SDL_BlendMode old_blend = SDL_BLENDMODE_NONE;
+    SDL_GetRenderDrawBlendMode(d->ren, &old_blend);
+    SDL_SetRenderDrawBlendMode(d->ren, SDL_BLENDMODE_BLEND);
+    for (int i = 0; i < 12; i++) {
+        const int age = (i - phase + 12) % 12;
+        const Uint8 alpha = (Uint8)(54 + (11 - age) * 18);
+        const int x1 = center_x + vectors[i][0] * radius / 100;
+        const int y1 = center_y + vectors[i][1] * radius / 100;
+        const int x2 = center_x + vectors[i][0] * (radius + segment) / 100;
+        const int y2 = center_y + vectors[i][1] * (radius + segment) / 100;
+        SDL_SetRenderDrawColor(d->ren, 84, 225, 137, alpha);
+        SDL_RenderDrawLine(d->ren, x1, y1, x2, y2);
+    }
+    SDL_SetRenderDrawBlendMode(d->ren, old_blend);
+}
+
+void tb_disp_render_reconnect_hold(struct tb_display *d) {
+    /* NV12 (and the 8-bit SDL fallback) keep the last frame in d->tex, not in
+     * the Metal plane. Repainting that texture leaves fullscreen alone.
+     * Status and connecting both call tb_metal_plane_set_hidden and leave
+     * fullscreen; this must not. */
+    if (!d || !d->ren || !d->win || !d->tex) return;
+
+    static uint32_t last_present = 0;
+    const uint32_t now = SDL_GetTicks();
+    if (last_present != 0 && now - last_present < 90u) return;
+    last_present = now;
+
+    int drawable_w = 0, drawable_h = 0;
+    if (SDL_GetRendererOutputSize(d->ren, &drawable_w, &drawable_h) < 0 ||
+        drawable_w <= 0 || drawable_h <= 0) {
+        drawable_w = 980;
+        drawable_h = 620;
+    }
+    SDL_RenderCopy(d->ren, d->tex, NULL, NULL);
+    tb_disp_draw_reconnect_spinner(d, drawable_w, drawable_h);
+    SDL_RenderPresent(d->ren);
+}
+
 void tb_disp_set_brightness(struct tb_display *d, double level) {
     (void)d;
     if (level < 0.0) level = 0.0;

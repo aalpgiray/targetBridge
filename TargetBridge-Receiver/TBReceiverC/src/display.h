@@ -126,4 +126,9 @@ void tb_disp_render_status(struct tb_display *d,
                            const char *permissions);
 void tb_disp_render_connecting(struct tb_display *d);
 
+/* Keep the last SDL video texture on screen and draw a small spinner over it.
+ * For streams that never created the Metal plane. Does not leave fullscreen
+ * and does not release a Metal plane. */
+void tb_disp_render_reconnect_hold(struct tb_display *d);
+
 #endif
