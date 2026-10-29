@@ -27,9 +27,11 @@ static void test_explicit_stop_never_holds(void) {
     struct tb_reconnect_hold h;
     tb_reconnect_hold_clear(&h);
     CHECK(!tb_reconnect_should_hold(1, 1, &h, 1000, TB_RECONNECT_HOLD_MS),
-          "sender teardown with a picture still goes to the waiting screen");
+          "user stop with a picture still goes to the waiting screen");
     CHECK(!tb_reconnect_should_hold(1, 0, &h, 1000, TB_RECONNECT_HOLD_MS),
-          "sender teardown with no picture does not hold");
+          "user stop with no picture does not hold");
+    CHECK(tb_reconnect_should_hold(0, 1, &h, 1000, TB_RECONNECT_HOLD_MS),
+          "a teardown that is not the stop button keeps the picture");
 }
 
 static void test_no_picture_and_disabled(void) {
@@ -158,6 +160,27 @@ static void test_sleep_does_not_consume_the_grace(void) {
           "the same close without the sleep credit gives up the picture");
 }
 
+static void test_sender_asleep_suspends_the_deadline(void) {
+    struct tb_reconnect_hold h;
+    tb_reconnect_hold_clear(&h);
+    tb_reconnect_hold_begin(&h, 1000, 10000);
+    tb_reconnect_hold_set_deadline_suspended(&h, 1);
+    CHECK(!tb_reconnect_hold_should_drop(&h, 1000 + 60000, 0, 10000),
+          "while the sender display is asleep the grace does not expire");
+    CHECK(tb_reconnect_should_hold(0, 1, &h, 1000 + 60000, 10000),
+          "a later close during that sleep still keeps the picture");
+    CHECK(!tb_reconnect_should_hold(1, 1, &h, 1000 + 60000, 10000),
+          "the stop button still wins while the deadline is suspended");
+    CHECK(!tb_sender_asleep_hold_expired(TB_SENDER_ASLEEP_HOLD_MS - 1),
+          "receiver-awake time under the cap keeps the suspension");
+    CHECK(tb_sender_asleep_hold_expired(TB_SENDER_ASLEEP_HOLD_MS),
+          "the cap is receiver-awake time, after which the grace runs again");
+
+    tb_reconnect_hold_set_deadline_suspended(&h, 0);
+    CHECK(tb_reconnect_hold_should_drop(&h, 1000 + 60000, 0, 10000),
+          "lifting the suspension on an already-past deadline drops the picture");
+}
+
 static void test_stall_credit_keeps_the_picture(void) {
     struct tb_reconnect_hold idle;
     tb_reconnect_hold_clear(&idle);
@@ -205,6 +228,7 @@ int main(void) {
     test_expired_hold_is_not_renewed();
     test_connect_and_frame_outside_a_hold();
     test_sleep_does_not_consume_the_grace();
+    test_sender_asleep_suspends_the_deadline();
     test_stall_credit_keeps_the_picture();
 
     if (g_failures) {

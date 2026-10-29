@@ -2423,6 +2423,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// can cancel a stale one instead of leaving it to fire later against a
     /// session that has since moved on.
     private var linkLossReconnectWorkItem: DispatchWorkItem?
+    /// A screensDidWake that is really the lock screen settling is cancelled
+    /// if screensDidSleep arrives again before this fires. Same 2s as the
+    /// liveness probe: shorter than that, a flap must not start a redial.
+    private var pendingDisplayWake: DispatchWorkItem?
     /// Non-nil between an explicit display-sleep signal and its wake, holding
     /// the reason reported to the receiver ("displaySleep" or "systemSleep").
     ///
@@ -2839,6 +2843,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 guard let self, let conn, self.connection === conn else { return }
                 guard self.isConnected || self.isStreaming else { return }
 
+                // The display is already down. A non-viable path here is the
+                // iMac following that sleep, not a cable pull. Tearing down
+                // redials (link-loss is 2s, then 5s) and each dial that
+                // reaches hello is then stop()'d. Measured 2026-10-29 18:02.
+                // Leave the session; the wake probe reconnects if it is dead.
+                guard self.senderDisplaySleepReason == nil else { return }
                 guard !viable else {
                     // Recovered — cancel any pending teardown and say so, since
                     // a flap that never becomes a drop is otherwise invisible.
@@ -2857,6 +2867,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                         guard let self, let conn, self.connection === conn else { return }
                         self.pendingViabilityTeardown = nil
                         guard self.isConnected || self.isStreaming else { return }
+                        if self.senderDisplaySleepReason != nil {
+                            TBLog.connection.notice("connect: still non-viable, but the display is asleep — leaving the session for wake")
+                            return
+                        }
                         TBLog.connection.notice("connect: still non-viable; link is gone, tearing down")
                         // The path stayed non-viable past the grace window —
                         // this is the link dying out from under us (cable
@@ -2907,6 +2921,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     self.lastConnectionStateDetail = "waiting(\(error.localizedDescription))"
                     TBLog.connection.warning("connect: waiting — \(error.localizedDescription, privacy: .public)")
                 case .failed(let error):
+                    if self.senderDisplaySleepReason != nil {
+                        TBTelemetryReporter.emit("connect: FAILED during display sleep — \(error); leaving the session for wake")
+                        return
+                    }
                     TBTelemetryReporter.emit("connect: FAILED — \(error)")
                     self.lastConnectionStateDetail = "failed(\(error.localizedDescription))"
                     let detail = TBConnectionDiagnostics.failureDetail(
@@ -2925,6 +2943,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     // teardown below.
                     self.stop(resetStatusTo: nil, isRecoverable: true)
                 case .cancelled:
+                    if self.senderDisplaySleepReason != nil {
+                        TBTelemetryReporter.emit("connect: cancelled during display sleep — leaving the session for wake")
+                        return
+                    }
                     // Clear the object, not just the flag.
                     //
                     // This used to set isConnected = false and stop. The UI then
@@ -3125,7 +3147,24 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         if persistArrangement {
             persistExtendedDisplayArrangementIfNeeded()
         }
-        sendTeardown(reason: "sender_stop")
+        /* The receiver drops the picture only for a person pressing stop.
+         * Every internal stop used to say "sender_stop" too, so a display
+         * sleep that lost the link (viability, a failed redial) looked like
+         * that button. Measured 2026-10-29 18:02: the MacBook's display was
+         * already asleep, a dial reached hello twice (ready, then the
+         * profile), and stop() tore it down ~60ms later. */
+        let asleepReason = senderDisplaySleepReason
+        let teardownReason: String
+        if userInitiatedStop {
+            teardownReason = "user_stop"
+        } else if let asleepReason {
+            teardownReason = asleepReason
+        } else if isRecoverable {
+            teardownReason = "link_loss"
+        } else {
+            teardownReason = "internal"
+        }
+        sendTeardown(reason: teardownReason)
         connectTimeoutWorkItem?.cancel()
         connectTimeoutWorkItem = nil
         heartbeatTimer?.invalidate()
@@ -3180,12 +3219,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         activeCodecName = nil
         isConnected = false
         isStreaming = false
-        // A session that ends while the display is asleep must not leave the
-        // sleep state latched: the next session would then suppress the first
-        // asleep:true (transitions only) and the receiver would hold its panel
-        // awake for that whole sleep. The receiver re-enables its screen saver
-        // on disconnect anyway, so there is nothing to send here.
-        senderDisplaySleepReason = nil
+        // A deliberate stop clears the sleep latch so the next session can
+        // send asleep:true again. A stop while the display is still down
+        // keeps the latch: clearing it here is what let the link-loss loop
+        // redial during the 18:02 sleep, and the wake path is what reconnects.
         isCableTesting = false
         isCableTestConnection = false
         if let status {
@@ -3208,8 +3245,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // site; `wasLive` (captured at entry, before this function cleared
         // `isConnected`/`isStreaming`) confirms there was something worth
         // getting back.
-        if isRecoverable, wasLive {
+        if userInitiatedStop {
+            senderDisplaySleepReason = nil
+        }
+        if isRecoverable, wasLive, senderDisplaySleepReason == nil {
             scheduleLinkLossReconnect()
+        } else if isRecoverable, wasLive {
+            NSLog("TargetBridge: link lost during display sleep — not redialing until the display wakes")
+            TBTelemetryReporter.emit("link-loss reconnect: display asleep — not scheduling")
         }
     }
 
@@ -3266,6 +3309,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             TBTelemetryReporter.emit("link-loss reconnect: wake-reconnect already owns recovery — ignoring")
             return
         }
+        guard senderDisplaySleepReason == nil else {
+            TBTelemetryReporter.emit("link-loss reconnect: display asleep — not scheduling")
+            return
+        }
         guard !receiverIP.isEmpty, !localInterfaceIP.isEmpty else {
             TBTelemetryReporter.emit("link-loss reconnect: aborted — receiverIP/localInterfaceIP empty")
             return
@@ -3277,6 +3324,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
     private func fireNextLinkLossReconnectAttempt() {
         guard isAutoReconnectingAfterLinkLoss else { return }
+        if senderDisplaySleepReason != nil {
+            NSLog("TargetBridge: link-loss reconnect — display asleep, dropping the pending dial")
+            TBTelemetryReporter.emit("link-loss reconnect: display asleep — dropping pending dial")
+            isAutoReconnectingAfterLinkLoss = false
+            linkLossReconnectAttempt = 0
+            linkLossReconnectWorkItem = nil
+            return
+        }
         linkLossReconnectAttempt += 1
         if linkLossReconnectAttempt > Self.linkLossReconnectAttemptCeiling {
             NSLog("TargetBridge: link-loss reconnect — giving up after \(Self.linkLossReconnectAttemptCeiling) attempts")
@@ -3583,6 +3638,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     self.drainPackets()
                 }
                 if error != nil || isDone {
+                    if self.senderDisplaySleepReason != nil {
+                        TBTelemetryReporter.emit(
+                            "receive: ended during display sleep — isDone=\(isDone) "
+                            + "error=\(error.map { "\($0)" } ?? "none"); leaving the session for wake")
+                        return
+                    }
                     // Record which end hung up and in what state. A clean EOF
                     // (isDone, no error) during the handshake is the signature
                     // seen in the receiver's log -- connected, profile sent,
@@ -5328,6 +5389,19 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// this transition and gains nothing by staying held on an already-dark
     /// screen.
     private func handleDisplaySleep(fullSystem: Bool) {
+        // A wake notification during lock settling is not the display coming
+        // back. Drop it before the transition guard, including when this
+        // sleep is a repeat and the guard below returns.
+        pendingDisplayWake?.cancel()
+        pendingDisplayWake = nil
+        if isAutoReconnectingAfterLinkLoss || linkLossReconnectWorkItem != nil {
+            linkLossReconnectWorkItem?.cancel()
+            linkLossReconnectWorkItem = nil
+            isAutoReconnectingAfterLinkLoss = false
+            linkLossReconnectAttempt = 0
+            NSLog("TargetBridge: display asleep — cancelling link-loss redial")
+            TBTelemetryReporter.emit("display sleep: link-loss redial cancelled")
+        }
         // Nothing to tell a receiver we are not connected to, and its panel is
         // only ever released by this packet — with no session it keeps today's
         // always-on behaviour, which is the safe direction.
@@ -5404,6 +5478,23 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// display-sleep case, which must reach the cheap "still alive" branch
     /// and change nothing else.
     private func handleDisplayWake() {
+        guard senderDisplaySleepReason != nil else { return }
+        // Lock settling delivers screensDidWake and then screensDidSleep again.
+        // Acting on the first one cleared the sleep latch and redialed into
+        // the 18:02 hello/teardown loop. Wait the liveness-probe interval; a
+        // sleep in that window cancels this.
+        pendingDisplayWake?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.commitDisplayWake()
+            }
+        }
+        pendingDisplayWake = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.wakeLivenessProbeTimeout, execute: work)
+    }
+
+    private func commitDisplayWake() {
+        pendingDisplayWake = nil
         guard let reason = senderDisplaySleepReason else { return }
         senderDisplaySleepReason = nil
         // Re-acquire first, before the `autoRestartOnWake` guard below. The
@@ -5526,6 +5617,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // this function needs to protect either; the normal connect timeout
         // watchdog already covers that case.
         guard isStreaming else { return }
+        guard senderDisplaySleepReason == nil else {
+            NSLog("TargetBridge: \(reason) — display still asleep, not probing or redialing")
+            TBTelemetryReporter.emit("wake (\(reason)): display still asleep — not redialing")
+            return
+        }
         guard !isVerifyingConnectionAfterWake else { return }
         // The automatic link-loss reconnect loop is the other owner of "we
         // are trying to reconnect right now" (see `scheduleLinkLossReconnect`
@@ -5599,6 +5695,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// `targetbridge://connect`, cable test, …). Adding a second capture-start
     /// call here would race that one.
     private func attemptWakeReconnect(reason: String) {
+        guard senderDisplaySleepReason == nil else {
+            NSLog("TargetBridge: \(reason) — display still asleep, not redialing")
+            TBTelemetryReporter.emit("wake (\(reason)): display still asleep — not redialing")
+            return
+        }
         guard !receiverIP.isEmpty, !localInterfaceIP.isEmpty else {
             NSLog("TargetBridge: \(reason) — cannot reconnect: receiverIP or localInterfaceIP is empty")
             TBTelemetryReporter.emit("wake (\(reason)): reconnect aborted — receiverIP/localInterfaceIP empty")

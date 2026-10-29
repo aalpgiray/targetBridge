@@ -339,6 +339,14 @@ struct app {
 
     uint64_t last_recv_ms;
     int      close_requested;
+    /* close_requested is any TB_PKT_TEARDOWN. This is only the stop button
+     * and targetbridge://disconnect. A display-sleep teardown is not. */
+    int      close_is_user_stop;
+    /* Last sender-display-sleep packet said the MacBook's display is down.
+     * The reconnect grace does not run while this is set. */
+    int      sender_display_asleep;
+    uint64_t sender_asleep_awake_ms;
+    uint64_t sender_asleep_sample_ms;
     int      have_video_frame;
     /* A real streaming session has begun (the sender sent a session packet, not
      * just a transient probe like a UI-language push). Gates the fullscreen
@@ -2159,6 +2167,7 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
             reason[0] = '\0';
             extract_json_string_field(payload, len, "\"reason\"", reason, sizeof(reason));
             if (asleep) {
+                a->sender_display_asleep = 1;
                 SDL_EnableScreenSaver();
                 fprintf(stderr, "[main] sender display asleep; panel may sleep\n");
                 /* Full sleep on ANY asleep:true, not just reason "systemSleep".
@@ -2184,6 +2193,16 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
                 a->audio_suspended_for_sleep = 1;
                 request_system_sleep();
             } else {
+                a->sender_display_asleep = 0;
+                if (tb_reconnect_hold_active(&a->reconnect)) {
+                    tb_reconnect_hold_set_deadline_suspended(&a->reconnect, 0);
+                    const uint64_t woke = now_ms();
+                    if (a->reconnect.until_ms < woke)
+                        a->reconnect.until_ms = woke + a->reconnect_grace_ms;
+                    if (a->reconnect.sender_returned)
+                        a->reconnect.connected_ms = woke;
+                    fprintf(stderr, "[main] sender display awake; reconnect grace restarted\n");
+                }
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] sender display awake; holding panel awake\n");
                 /* Sleep was requested but never happened (display came back
@@ -2200,11 +2219,26 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
     case TB_PKT_TEST_DATA:
         /* Performance test data; discard */
         break;
-    case TB_PKT_TEARDOWN:
-        fprintf(stderr, "[main] teardown requested by sender\n");
+    case TB_PKT_TEARDOWN: {
+        char reason[32];
+        reason[0] = '\0';
+        extract_json_string_field(payload, len, "\"reason\"", reason, sizeof(reason));
+        if (reason[0] == '\0') snprintf(reason, sizeof(reason), "sender_stop");
+        /* user_stop is the stop button and targetbridge://disconnect.
+         * sender_stop is what every teardown used to say, including those,
+         * so an older sender's stop button still drops the picture. */
+        const int user = strcmp(reason, "user_stop") == 0 || strcmp(reason, "sender_stop") == 0;
+        a->close_is_user_stop = user;
+        if (user) {
+            a->sender_display_asleep = 0;
+        } else if (strcmp(reason, "displaySleep") == 0 || strcmp(reason, "systemSleep") == 0) {
+            a->sender_display_asleep = 1;
+        }
+        fprintf(stderr, "[main] teardown requested by sender (%s)\n", reason);
         tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.session_closed_by_sender");
         a->close_requested = 1;
         break;
+    }
     default:
         fprintf(stderr, "[main] unknown pkt type=0x%02x\n", type);
         break;
@@ -3287,6 +3321,36 @@ static void tb_note_system_sleep(struct app *a, uint64_t mono_now) {
     a->awake_sample_ms = awake;
 }
 
+/* The 10s grace is time the sender was gone while its display was up.
+ * While that display is asleep the deadline is suspended, and only time
+ * this machine was awake counts toward the cap. System sleep adds almost
+ * nothing to awake_ms, so the nap neither expires the hold nor burns the
+ * cap. Called once per iteration, before should_drop. */
+static void tb_reconnect_track_sender_asleep(struct app *a, uint64_t now) {
+    if (!a->sender_display_asleep || !tb_reconnect_hold_active(&a->reconnect)) {
+        a->sender_asleep_awake_ms = 0;
+        a->sender_asleep_sample_ms = 0;
+        tb_reconnect_hold_set_deadline_suspended(&a->reconnect, 0);
+        return;
+    }
+    const uint64_t awake = awake_ms();
+    if (a->sender_asleep_sample_ms != 0 && awake >= a->sender_asleep_sample_ms)
+        a->sender_asleep_awake_ms += awake - a->sender_asleep_sample_ms;
+    a->sender_asleep_sample_ms = awake;
+    if (tb_sender_asleep_hold_expired(a->sender_asleep_awake_ms)) {
+        fprintf(stderr,
+                "[main] sender-asleep hold reached %llu ms awake; grace running again\n",
+                (unsigned long long)a->sender_asleep_awake_ms);
+        a->sender_display_asleep = 0;
+        a->sender_asleep_awake_ms = 0;
+        a->sender_asleep_sample_ms = 0;
+        tb_reconnect_hold_set_deadline_suspended(&a->reconnect, 0);
+        if (a->reconnect.until_ms < now) a->reconnect.until_ms = now;
+        return;
+    }
+    tb_reconnect_hold_set_deadline_suspended(&a->reconnect, 1);
+}
+
 static void tb_reconnect_credit_loop_stall(struct app *a) {
     if (!a || a->loop_tick_ms == 0) return;
     if (!tb_reconnect_hold_active(&a->reconnect)) return;
@@ -3312,13 +3376,14 @@ static void close_client(struct app *a) {
      * now_ms() had stepped past the 10s grace while this process was stuck,
      * so the picture was released. Explicit stop does not get that extension:
      * the person asked for the waiting screen. */
-    if (!a->close_requested) tb_reconnect_credit_loop_stall(a);
-    /* Captured before the resets below. close_requested is the sender's
-     * TEARDOWN (the user pressed stop). had_picture is "a frame is actually
-     * on screen", including one we are already holding from the previous
-     * socket — the sender's second dial of a burst must not be treated as
-     * a session that never showed anything. */
-    const int explicit_stop = a->close_requested;
+    if (!(a->close_requested && a->close_is_user_stop)) tb_reconnect_credit_loop_stall(a);
+    /* Captured before the resets below. explicit_stop is the stop button or
+     * targetbridge://disconnect. Any other teardown (display sleep, link
+     * loss, an internal sender stop) keeps the picture. had_picture is "a
+     * frame is actually on screen", including one we are already holding
+     * from the previous socket — the sender's second dial of a burst must
+     * not be treated as a session that never showed anything. */
+    const int explicit_stop = a->close_requested && a->close_is_user_stop;
     const int had_picture = a->have_video_frame || tb_reconnect_hold_active(&a->reconnect);
     const uint64_t now = now_ms();
     const int hold = tb_reconnect_should_hold(explicit_stop, had_picture, &a->reconnect,
@@ -3334,6 +3399,7 @@ static void close_client(struct app *a) {
     a->client_fd = -1;
     a->session_active = 0;
     a->close_requested = 0;
+    a->close_is_user_stop = 0;
     a->have_video_frame = 0;
     snprintf(a->input_control_mode, sizeof(a->input_control_mode), "off");
     tb_receiver_refresh_input_capture(a);
@@ -3858,6 +3924,7 @@ int main(int argc, char **argv) {
          * the same check covers the picture we are keeping. */
         tb_disp_reassert_fullscreen_if_needed(a.disp);
         tb_reconnect_credit_loop_stall(&a);
+        tb_reconnect_track_sender_asleep(&a, t);
 
         if (tb_reconnect_hold_should_drop(&a.reconnect, t, a.client_fd >= 0, a.reconnect_grace_ms)) {
             fprintf(stderr, "[main] reconnect hold expired; returning to waiting screen\n");

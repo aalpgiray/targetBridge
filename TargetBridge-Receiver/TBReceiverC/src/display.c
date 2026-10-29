@@ -630,6 +630,12 @@ void tb_disp_reassert_fullscreen_if_needed(struct tb_display *d) {
      * flag already matches. */
     const int covers = tb_window_covers_screen();
     if (covers == 1) {
+        /* The ordinary set_connection_state path already entered fullscreen
+         * and does not log. An armed restore that finds the window covering
+         * the screen stands down the same way. No "[disp] restoring
+         * fullscreen" line in that case is the window already being fullscreen. */
+        if (d->fullscreen_reapply_left > 0)
+            fprintf(stderr, "[disp] fullscreen covers the screen\n");
         d->fullscreen_reapply_left = 0;
         return;
     }
