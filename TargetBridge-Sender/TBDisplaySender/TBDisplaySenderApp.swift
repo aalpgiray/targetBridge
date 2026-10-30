@@ -71,6 +71,15 @@ final class TBAppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
+    /// The process is about to drop the loopback sink, and the driver will
+    /// withdraw the device once its probes are refused. Restore first, while
+    /// the device is still published, so the previous output is selected.
+    /// The status-item Quit item does this too; this covers every other
+    /// terminate path. A second call is a no-op once the default has moved.
+    func applicationWillTerminate(_ notification: Notification) {
+        TBDefaultOutputGuard.shared.restoreIfSelected()
+    }
+
     /// Clicking the Dock icon reopens a window — through the SAME path the menu
     /// uses, so only one owner ever creates one.
     ///

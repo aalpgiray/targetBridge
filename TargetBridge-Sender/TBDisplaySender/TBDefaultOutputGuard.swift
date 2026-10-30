@@ -3,11 +3,16 @@ import Foundation
 
 /// Stops the Mac being left pointed at a silent device.
 ///
-/// Once the user selects TargetBridge as their output it stays selected after
-/// the session ends — the device is still there, so macOS has no reason to
-/// switch away and sound simply disappears until someone works out why. This
-/// watches which device is default, remembers the last one that wasn't ours,
-/// and puts it back when streaming stops.
+/// The sender closes the loopback sink a few seconds after the last receiver
+/// stops streaming, and the driver then removes the device. Removing it does
+/// make macOS switch away — that is why the driver calls `RemoveDevice`
+/// rather than only marking the device not-alive — but CoreAudio picks some
+/// other output, not necessarily the one the user had. This watches which
+/// device is default, remembers the last one that wasn't ours, and puts it
+/// back when the sink actually closes. Capture teardown must not call
+/// `restoreIfSelected()`: a display-sleep pause and a short reconnect leave
+/// the device in place on purpose, and restoring there would yank the
+/// selected output.
 ///
 /// A lock-guarded singleton rather than statics: the CoreAudio listener fires
 /// on an arbitrary thread, so the remembered device is genuinely shared state.
