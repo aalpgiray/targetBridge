@@ -111,6 +111,12 @@ want "microphone capture"               1 "tb_mic_capture"         TargetBridge-
 want "mic forwarding"                   1 "TBMicForwarder"         TargetBridge-Sender
 want "default-output guard"             1 "TBDefaultOutputGuard"   TargetBridge-Sender
 want "volume mirroring"                 1 "TBAudioDeviceVolumeObserver" TargetBridge-Sender
+# The driver withdraws the device only after the loopback sink refuses its
+# probes. Opening that socket for the whole time the app is running left
+# "TargetBridge" in Sound settings with no receiver connected. The sink now
+# follows a live stream, and audioDeviceWithdrawGrace is the few seconds a
+# reconnect or capture restart may be down without the device leaving.
+want "audio device only while streaming" 1 "audioDeviceWithdrawGrace" TargetBridge-Sender/TBDisplaySender
 
 echo "== menu bar / display control =============================="
 want "V-Sync toggle"                    1 "vsync\|vSync"           TargetBridge-Sender/TBDisplaySender TargetBridge-Sender/TBDisplayShared

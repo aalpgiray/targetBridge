@@ -116,8 +116,8 @@ final class TBDisplaySenderService: ObservableObject {
         }
     }
     /// Switch the system output to the TargetBridge device when a stream
-    /// starts, and back (via the existing `TBDefaultOutputGuard.restoreIfSelected()`)
-    /// when it ends.
+    /// starts, and back (via `TBDefaultOutputGuard.restoreIfSelected()`)
+    /// when the sink closes — after the grace, not the instant streaming stops.
     ///
     /// Off by default: taking over the user's audio output is not something
     /// to do uninvited. With it on, casting behaves like plugging in a
@@ -147,27 +147,33 @@ final class TBDisplaySenderService: ObservableObject {
             objectWillChange.send()
         }
     }
-    /// The audio driver's loopback listener, owned by the APP rather than by a
-    /// session.
+    /// The audio driver's loopback listener.
     ///
-    /// WHY IT LIVES HERE
-    ///
-    /// The driver probes this port once a second and withdraws its audio device
-    /// after three refusals — deliberately, so a device cannot sit selected and
-    /// silent (see Driver.cpp's liveness loop). While the socket was opened by
-    /// the video pipeline and closed on session teardown, that meant the
-    /// TargetBridge output device only existed *during a stream*: end the
-    /// session, or lose the link, and it disappeared from macOS three seconds
-    /// later. The whole point of the driver feature is a native output device
-    /// that is always there to select.
-    ///
-    /// So the socket now opens with the app and closes with it. "Alive" comes to
-    /// mean "TargetBridge is running", which is what the driver's probe was
-    /// really asking all along.
+    /// The driver probes this port once a second and withdraws its device after
+    /// three refusals (Driver.cpp). The socket is bound only while a receiver
+    /// session is streaming, plus `audioDeviceWithdrawGrace` after the last one
+    /// stops. Binding it for the whole time the app is running left
+    /// "TargetBridge" in Sound settings with no iMac on the other end.
     private var audioDriverReceiver: TBAudioDriverReceiver?
-    /// One subscription per session, watching for isStreaming to become true
-    /// so the audio output can follow it when `autoSelectAudioOutput` is on.
-    /// See `observeStreamingForAudioDriver()`.
+    /// Pending close of `audioDriverReceiver`. Cancelled if a session starts
+    /// streaming again before `audioDeviceWithdrawGrace` elapses.
+    private var audioDriverWithdrawWork: DispatchWorkItem?
+    /// How long the sink stays open after the last receiver stops streaming.
+    ///
+    /// The driver then needs up to about three seconds of refused probes before
+    /// it removes the device, so the Sound list updates a few seconds after
+    /// this. 8s covers a link-loss redial (first attempt at 2s, second at 7s)
+    /// and a soft capture restart; one refused probe during a slow handshake
+    /// does not withdraw the device, because the driver requires three in a
+    /// row. Display sleep does not start this clock: `isStreaming` stays true
+    /// while capture is paused. A link that stays dead closes here, and the
+    /// device is gone about 11s after the receiver disappeared — the same
+    /// scale as the receiver's 10s reconnect hold, not the multi-minute redial
+    /// loop.
+    private let audioDeviceWithdrawGrace: TimeInterval = 8
+    /// One subscription per session, watching `isStreaming` so the loopback
+    /// sink follows a live receiver and, when `autoSelectAudioOutput` is on,
+    /// the system output follows too. See `observeStreamingForAudioDriver()`.
     private var audioDriverStreamObservers: Set<AnyCancellable> = []
     private var sessionCancellables: [UUID: AnyCancellable] = [:]
     private let receiverDiscovery = TBReceiverDiscovery()
@@ -230,7 +236,8 @@ final class TBDisplaySenderService: ObservableObject {
         refreshLocalInterfaces()
         addonStore.refresh()
         restorePersistedSessions()
-        // Publish the audio device immediately, not on first stream.
+        // No receiver yet: leave the sink closed so the driver withdraws the
+        // device. A live session opens it from `observeStreamingForAudioDriver`.
         refreshAudioDriverListener()
         observeAudioDeviceSelection()
         observeStreamingForAudioDriver()
@@ -247,19 +254,36 @@ final class TBDisplaySenderService: ObservableObject {
         }
     }
 
-    /// Open the driver's loopback port so the audio device stays published.
-    /// Idempotent, and safe to call whenever the addon state changes.
+    /// Bind the driver's loopback port while a receiver is streaming, and
+    /// close it once none has been for `audioDeviceWithdrawGrace`.
+    ///
+    /// Idempotent. Called when the audio-driver addon changes and whenever a
+    /// session's `isStreaming` changes. The addon turning off closes
+    /// immediately: that is the user removing the device, not a blip.
     func refreshAudioDriverListener() {
         guard audioDriverAvailable else {
-            if audioDriverReceiver != nil {
-                audioDriverReceiver?.stop()
-                audioDriverReceiver = nil
-                TBLog.connection.notice("audio driver listener: stopped (addon disabled) — device will withdraw")
-            }
+            stopAudioDriverListener(reason: "addon disabled")
             return
         }
-        guard audioDriverReceiver == nil else { return }
+        if anyStreaming {
+            audioDriverWithdrawWork?.cancel()
+            audioDriverWithdrawWork = nil
+            startAudioDriverListenerIfNeeded()
+            return
+        }
+        // The sink is already closed (app launch with no receiver, or the
+        // grace already elapsed). The driver still publishes the device until
+        // a few probes are refused, and macOS will not pick the previous
+        // output on its own. Restore while the device is still in the list.
+        guard audioDriverReceiver != nil else {
+            TBDefaultOutputGuard.shared.restoreIfSelected()
+            return
+        }
+        scheduleAudioDeviceWithdrawIfListening()
+    }
 
+    private func startAudioDriverListenerIfNeeded() {
+        guard audioDriverReceiver == nil else { return }
         let rx = TBAudioDriverReceiver { [weak self] pcm in
             Task { @MainActor [weak self] in
                 self?.routeDriverAudio(pcm)
@@ -267,10 +291,53 @@ final class TBDisplaySenderService: ObservableObject {
         }
         if rx.start() {
             audioDriverReceiver = rx
-            TBLog.connection.notice("audio driver listener: up — device stays published while the app runs")
+            TBLog.connection.notice("audio driver listener: up — device publishes while a receiver is streaming")
         } else {
             TBLog.connection.error("audio driver listener: bind failed; the audio device will withdraw")
         }
+    }
+
+    /// Arm one delayed close. A second call while the grace is already running
+    /// leaves the original deadline alone, so a burst of `isStreaming = false`
+    /// (every session reporting in) does not stretch it.
+    private func scheduleAudioDeviceWithdrawIfListening() {
+        guard audioDriverReceiver != nil else { return }
+        guard audioDriverWithdrawWork == nil else { return }
+        let grace = audioDeviceWithdrawGrace
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.withdrawAudioDeviceIfStillIdle()
+            }
+        }
+        audioDriverWithdrawWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + grace, execute: work)
+        TBLog.connection.notice("audio driver listener: no receiver — device stays \(Int(grace), privacy: .public)s")
+    }
+
+    private func withdrawAudioDeviceIfStillIdle() {
+        audioDriverWithdrawWork = nil
+        guard audioDriverAvailable, !anyStreaming else { return }
+        stopAudioDriverListener(reason: "no receiver")
+    }
+
+    /// Close the sink and, while the device is still published, point the
+    /// default output back at the previous device. Restoring first matters:
+    /// CoreAudio's own switch on device removal picks some other output, and
+    /// `TBDefaultOutputGuard` is what remembers the one the user had.
+    /// Capture teardown must not call this — a display-sleep pause and the
+    /// first moments of a link-loss redial both tear capture down while the
+    /// device is supposed to stay selected.
+    private func stopAudioDriverListener(reason: String) {
+        audioDriverWithdrawWork?.cancel()
+        audioDriverWithdrawWork = nil
+        // Restore even if this process never bound. Disabling the addon, or
+        // quitting, can leave the device selected for the few seconds the
+        // driver takes to notice nobody is listening.
+        TBDefaultOutputGuard.shared.restoreIfSelected()
+        guard audioDriverReceiver != nil else { return }
+        audioDriverReceiver?.stop()
+        audioDriverReceiver = nil
+        TBLog.connection.notice("audio driver listener: stopped (\(reason, privacy: .public)) — device will withdraw")
     }
 
     /// Selecting our device in Sound settings is a request to send audio to the
@@ -299,50 +366,45 @@ final class TBDisplaySenderService: ObservableObject {
         }
     }
 
-    /// Switch the audio output to ours whenever any session's stream starts,
-    /// when `autoSelectAudioOutput` is on.
+    /// Publish the audio device for a live receiver, and follow the stream
+    /// with the system output when `autoSelectAudioOutput` is on.
     ///
     /// Driven from `$isStreaming` through Combine rather than patched into
     /// each of the several start paths (manual connect, wake-reconnect,
     /// link-loss backoff reconnect, Bonjour idle-rediscovery reconnect) —
-    /// all of them converge on the session setting `isStreaming = true` in
-    /// `startCapture`/`startDirectDisplayStream`, so one subscription per
-    /// session covers every trigger with no separate wiring per reconnect
-    /// path. Ported from commit 144a721 ("fix(sender): the audio device
-    /// exists only while a stream can carry sound").
+    /// all of them converge on the session setting `isStreaming` in
+    /// `startCapture`/`startDirectDisplayStream` and in `stop`. One
+    /// subscription per session covers every trigger. `refreshAudioDriverListener()`
+    /// reads `anyStreaming`, so a session that is idle does not close the sink
+    /// out from under another that is still up.
     ///
-    /// Calls `TBDefaultOutputGuard.shared.selectOursWhenPublished()` directly
-    /// rather than routing through `refreshAudioDriverListener()`: unlike the
-    /// original commit, this app's listener is NOT gated on `anyStreaming` —
-    /// it opens at app launch and stays up for the app's whole lifetime (see
-    /// that function's own doc comment) — so there is no "listener just
-    /// started" edge to hang the select off. `selectOursWhenPublished()`
-    /// polls for up to 8s regardless of whether the device happens to be
-    /// published already, which covers both the common case (listener has
-    /// been up for a while, device already published) and the rarer one
-    /// (audio driver addon just turned on, or the very first stream right
-    /// after launch, where the driver's 1 Hz probe has not yet landed).
+    /// `selectOursWhenPublished()` polls for up to 8s. The sink opens on this
+    /// same edge, and the driver only republishes on its next answered probe
+    /// (1 Hz), so a fixed delay misses the device the way commit 144a721 measured.
     ///
     /// Rebuilt from scratch each time sessions change: a stale subscription
-    /// to a removed session would keep it alive.
+    /// to a removed session would keep it alive. `@Published` replays the
+    /// current value, and `refreshAudioDriverListener()` is idempotent, so
+    /// rebuilding does not flap the socket.
     private func observeStreamingForAudioDriver() {
         audioDriverStreamObservers.removeAll()
         for session in sessions {
             session.$isStreaming
                 .removeDuplicates()
-                .filter { $0 }
                 .receive(on: DispatchQueue.main)
-                .sink { [weak self] _ in
-                    guard let self, self.autoSelectAudioOutput, self.audioDriverAvailable else { return }
+                .sink { [weak self] streaming in
+                    guard let self else { return }
+                    self.refreshAudioDriverListener()
+                    guard streaming, self.autoSelectAudioOutput, self.audioDriverAvailable else { return }
                     TBDefaultOutputGuard.shared.selectOursWhenPublished()
                 }
                 .store(in: &audioDriverStreamObservers)
         }
     }
 
-    /// Hand PCM to whichever session can actually carry it. With no live session
-    /// the audio is dropped here — the device stays present, which is the point:
-    /// selectable like any output, silent until something is streaming.
+    /// Hand PCM to whichever session can actually carry it. During the short
+    /// grace after the last session stops, samples are dropped here; the
+    /// device is still published so a reconnect does not have to republish it.
     private func routeDriverAudio(_ pcm: Data) {
         guard let session = sessions.first(where: { $0.isStreaming && $0.audioEnabled }) else { return }
         session.acceptDriverAudio(pcm)

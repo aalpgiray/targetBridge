@@ -5927,8 +5927,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// format, so it bypasses the converter entirely.
     /// PCM handed over by the app-level driver listener.
     ///
-    /// The socket is NOT owned here any more — see TBDisplaySenderService's
-    /// audio driver listener for why it has to outlive any one session.
+    /// The socket is not owned here. The app binds it while any session is
+    /// streaming and closes it after a short grace with no receiver, which is
+    /// what makes the device leave Sound settings. This session only forwards.
     func acceptDriverAudio(_ pcm: Data) {
         guard audioEnabled, isStreaming else { return }
         let payload = receiverSupportsFloat32Audio ? pcm : Self.int16(fromFloat32: pcm)
@@ -5937,8 +5938,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
     private func startAudioDeviceCaptureIfNeeded() {
         guard audioEnabled, audioDriverAvailable else { return }
-        // The listener itself now starts with the app. Only the volume mirror is
-        // per-session, because it follows the receiver's hardware volume.
+        // The sink opens from the app when `isStreaming` becomes true, which
+        // has already happened by the time capture reaches here. Only the
+        // volume mirror is per-session, because it follows the receiver's
+        // hardware volume.
         startAudioVolumeMirror(uid: TBAudioDriverReceiver.deviceUID)
     }
 
@@ -5983,21 +5986,18 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func stopAudioDeviceCapture() {
-        // Stop first: the driver notices the silence and retires the device,
-        // which is the backstop for the cases the restore below cannot cover
-        // (crash, force quit).
-        // If the user is listening through our virtual device, hand the system
-        // back to its previous output — otherwise the device stays selected
-        // with nothing behind it and sound just stops with no explanation.
-        if audioDriverAvailable {
-            TBDefaultOutputGuard.shared.restoreIfSelected()
-        }
         micForwarder?.stop()
         micForwarder = nil
-        // The driver listener is deliberately NOT stopped here. It belongs to the
-        // app, not the session: the driver withdraws its audio device the moment
-        // nothing answers on the sink port, so closing it at teardown made the
-        // output device vanish from macOS every time a stream ended.
+        // Do not close the sink and do not restore the default output here.
+        // Display sleep pauses capture through this function while
+        // `isStreaming` stays true, and a link-loss `stop()` reaches it a
+        // couple of seconds before the redial. Either one would move the
+        // user's selected output and, if the socket closed, drop the device
+        // out of Sound settings for a blip the receiver is still holding.
+        // The app closes the sink after `audioDeviceWithdrawGrace` with no
+        // session streaming, and restores the previous output then — while
+        // the device is still published, so the remembered output wins over
+        // whichever device CoreAudio would pick when the driver removes it.
         audioVolumeObserver?.stop()
         audioVolumeObserver = nil
     }
