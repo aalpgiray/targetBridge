@@ -138,10 +138,11 @@ version, receiver model, cable type, and selected transport with the report.
 Select **DPCM RGB 10-bit (lossless)** in **Video compression** to use DPCM with
 any stream profile while keeping its resolution and frame rate. The receiver
 must advertise DPCM support; an explicit DPCM choice reports an error instead
-of silently switching transports. **Automatic** preserves the legacy DPCM
-profiles’ NV12 or hardware-codec fallback for older receivers. Explicit H.264
-or HEVC overrides a DPCM profile’s default compression. The choice is saved
-per receiver. Sustained frame rate still depends on both Macs and the link.
+of silently switching transports. Saved Automatic+DPCM profiles migrate to
+**Automatic (DPCM preferred)**, preserving their NV12 or hardware-codec fallback
+for older receivers. Explicit H.264 or HEVC selects that codec independently of
+the resolution. Each session retains its compression choice across discovery
+refreshes and uses the receiver default only when selecting a different receiver. Sustained frame rate still depends on both Macs and the link.
 
 `make test` also runs the hardware-free TBD2 reference codec suite at 8 and
 10 bits, including all 1024 RGB channel values. The Sender unit tests cover
@@ -174,3 +175,13 @@ legacy fallback/teardown, and rejection before oversized GPU allocations.
 Exit 77 from the GPU encoder test means Metal is unavailable, not that GPU validation passed. Run real
 screen capture and presentation separately on both Apple Silicon and Intel
 receivers; see [the DPCM transport contract](Lossless-5K60.md).
+
+### Receiver stream-profile display
+
+Run `python3 TargetBridge-Receiver/TBReceiverC/tests/test_stream_mode.py` to
+exercise the production handshake, language changes, frame metadata and
+connection reset with real translations and synthetic frames. Before a sender
+provides dimensions, the status page shows a waiting message. Requested
+resolution remains visible across language changes until a valid frame arrives;
+then received pixel dimensions take priority. Disconnect clears the previous
+session's dimensions. A fixed HiDPI desktop size is never used as stream metadata.

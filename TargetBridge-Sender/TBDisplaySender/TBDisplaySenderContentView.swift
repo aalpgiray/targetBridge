@@ -621,17 +621,22 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                     }
 
                     settingRow(TBDisplaySenderL10n.discoveredReceiver(service.language), details: discoveryDetails) {
-                        Picker(TBDisplaySenderL10n.discoveredReceiver(service.language), selection: $session.selectedReceiverID) {
+                        Picker(TBDisplaySenderL10n.discoveredReceiver(service.language), selection: Binding(
+                            get: { session.selectedReceiverID },
+                            set: { identity in
+                                if let receiver = service.discoveredReceivers.first(where: { $0.id == identity }) {
+                                    service.applyDiscoveredReceiver(receiver, to: session)
+                                } else {
+                                    session.selectedReceiverID = identity
+                                }
+                            }
+                        )) {
                             Text(TBDisplaySenderL10n.manualReceiverEntry(service.language)).tag("")
                             ForEach(service.discoveredReceivers) { receiver in
                                 Text(receiver.displayText).tag(receiver.id)
                             }
                         }
                         .pickerStyle(.menu)
-                        .onChange(of: session.selectedReceiverID) { _, newValue in
-                            guard let receiver = service.discoveredReceivers.first(where: { $0.id == newValue }) else { return }
-                            service.applyDiscoveredReceiver(receiver, to: session)
-                        }
                         .disabled(session.isConnected || session.isStreaming)
                     }
 
@@ -668,8 +673,8 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
 
                     settingRow(TBDisplaySenderL10n.streamProfile(service.language), details: streamProfileDetails) {
                         Picker(TBDisplaySenderL10n.streamProfile(service.language), selection: $session.capturePreset) {
-                            ForEach(TBDisplayCapturePreset.allCases, id: \.self) { preset in
-                                Text("\(preset.title(service.language)) · \(preset.description)").tag(preset)
+                            ForEach(TBDisplayCapturePreset.resolutionPresets, id: \.self) { preset in
+                                Text(preset.resolutionTitle).tag(preset)
                             }
                         }
                         .pickerStyle(.menu)
@@ -691,7 +696,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                                 set: { service.setCodecPreference($0, for: session) }
                             )
                         ) {
-                            ForEach(TBDisplayCodecPreference.allCases) { preference in
+                            ForEach(TBDisplayCodecPreference.menuChoices(current: session.codecPreference)) { preference in
                                 Text(TBDisplaySenderL10n.codecPreferenceTitle(
                                     preference,
                                     language: service.language
@@ -1115,13 +1120,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
     }
 
     private var streamProfileDetails: String {
-        switch service.language {
-        case .italian: return "Parti da preset conservativi su Wi-Fi o reti lente, poi sali se la stabilita rimane buona."
-        case .english: return "Start with conservative presets on Wi-Fi or slower links, then move up if stability stays good."
-        case .german: return "Beginne bei WLAN oder langsameren Verbindungen mit konservativen Profilen und wähle höhere Einstellungen, wenn die Verbindung stabil bleibt."
-        case .french: return "Commencez avec des préréglages prudents sur Wi-Fi ou les liaisons lentes, puis augmentez-les si la stabilité reste bonne."
-        case .chinese: return "在 Wi‑Fi 或较慢链路上先使用保守预设，稳定后再逐步提高。"
-        }
+        TBDisplaySenderL10n.streamProfileHint(service.language)
     }
 
     private var audioDetails: String {

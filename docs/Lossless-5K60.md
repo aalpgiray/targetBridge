@@ -1,18 +1,21 @@
 # Experimental 10-bit RGB DPCM transport
 
-Select **4.5K** (`retina4_5k60`) as the stream profile and **DPCM RGB 10-bit
-(lossless)** under **Video compression** to capture 4480 × 2520 packed 10-bit
+Select **4480 × 2520 · 60 FPS** (`retina4_5k60`) under **Resolution and frame rate**,
+and **DPCM RGB 10-bit (lossless)** under **Video compression** to capture 4480 × 2520 packed 10-bit
 RGB. This matches the [24-inch M1 iMac's native resolution](https://support.apple.com/en-gb/111895),
 but the profile is not limited to that model. DPCM can be selected with any
 stream profile; compression does not change its resolution or frame-rate limit.
-The selection is remembered for each receiver.
+The selection is remembered for the session and used as a default when choosing
+that receiver again. Refreshing a discovered receiver does not overwrite an
+existing session choice.
 
-The legacy **4.5K DPCM** (`native4_5kRaw60`) and **5K DPCM**
-(`native5kRaw60`) profiles remain available at 4480 × 2520 and 5120 × 2880,
-respectively, both targeting up to 60 FPS. With **Automatic** compression,
-these profiles retain their DPCM preference and compatibility fallback for old
-receivers. Explicit H.264 or HEVC overrides that profile default. Ordinary
-profiles with **Automatic** keep the existing hardware-codec selection.
+Resolution choices contain only dimensions and frame rates. The legacy
+`native4_5kRaw60` and `native5kRaw60` identifiers remain supported for saved
+settings and command-line aliases, but no longer appear as duplicate DPCM
+resolution entries. Old Automatic+DPCM settings retain their compatibility
+fallback as **Automatic (DPCM preferred)** in Video compression; changing only the resolution keeps that
+choice. Explicit H.264 or HEVC overrides are preserved. Ordinary profiles with
+**Automatic** keep the existing hardware-codec selection.
 
 A negotiated DPCM session requests packed 10-bit RGB (`l10r`, ARGB2101010
 little endian) from ScreenCaptureKit and losslessly transmits the captured RGB
@@ -57,8 +60,8 @@ panel scanout are outside the codec's bit-exact guarantee. Capture remains SDR.
 | DPCM selected, receiver advertises a working Metal DPCM decoder | Display P3 10-bit RGB, TBD2 (`0x25`) |
 | Negotiated DPCM receiver also advertises `supportsDPCMAdaptiveColor` | 10-bit TBD2 with reversible per-tile colour decorrelation |
 | Explicit DPCM, receiver lacks DPCM support | Error before capture; no silent NV12 or hardware-codec fallback |
-| Automatic + legacy DPCM profile, old receiver supports raw NV12 | 8-bit NV12, existing raw packet (`0x22`) |
-| Automatic + legacy DPCM profile, receiver supports neither DPCM nor raw NV12 | Existing HEVC/H.264 path, subject to encoder availability |
+| Migrated automatic DPCM compatibility mode, old receiver supports raw NV12 | 8-bit NV12, existing raw packet (`0x22`) |
+| Migrated automatic DPCM compatibility mode, receiver supports neither DPCM nor raw NV12 | Existing HEVC/H.264 path, subject to encoder availability |
 | Automatic + ordinary profile | Existing encoded path, or explicitly enabled `RAW=1` NV12 |
 | Explicit H.264 or HEVC with any profile | Hardware-codec path; overrides the profile default and `RAW=1` |
 

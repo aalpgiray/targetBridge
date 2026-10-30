@@ -40,6 +40,201 @@ final class TBDisplayProfileTests: XCTestCase {
 }
 
 @MainActor
+final class TBStreamSelectionMigrationTests: XCTestCase {
+    private func makeSession() -> TBDisplaySenderSession {
+        TBDisplaySenderSession(language: .english, largeCursor: false,
+                               preventDisplaySleep: false, autoRestartOnWake: false,
+                               audioEnabled: false)
+    }
+
+    func testLegacyDPCMAutomaticSelectionSurvivesChangingOnlyResolution() {
+        let session = makeSession()
+        session.capturePreset = .native5kRaw60
+        XCTAssertEqual(session.capturePreset, .native5k60Experimental)
+        XCTAssertEqual(session.codecPreference.rawValue, "automaticDPCM")
+        session.capturePreset = .standard1080p
+        XCTAssertEqual(TBVideoTransport.resolve(
+            preference: session.codecPreference, preset: session.capturePreset,
+            supportsDPCM: true, supportsRawNV12: true
+        ), .dpcm10Bit)
+        XCTAssertEqual(TBVideoTransport.resolve(
+            preference: session.codecPreference, preset: session.capturePreset,
+            supportsDPCM: false, supportsRawNV12: true
+        ), .rawNV12)
+        session.codecPreference = .automatic
+        session.capturePreset = .native5k60Experimental
+        XCTAssertEqual(TBVideoTransport.resolve(
+            preference: session.codecPreference, preset: session.capturePreset,
+            supportsDPCM: true, supportsRawNV12: true
+        ), .encoded)
+    }
+
+    func testLegacySelectionsPreserveExplicitCompressionAndCanonicalGeometry() {
+        for legacy in [TBDisplayCapturePreset.native4_5kRaw60, .native5kRaw60] {
+            for preference in [TBDisplayCodecPreference.h264, .hevc, .dpcm] {
+                let session = makeSession()
+                session.codecPreference = preference
+                session.capturePreset = legacy
+                XCTAssertEqual(session.codecPreference, preference)
+                XCTAssertEqual(session.capturePreset.width, legacy.width)
+                XCTAssertEqual(session.capturePreset.height, legacy.height)
+                XCTAssertEqual(session.capturePreset.expectedFrameRate, legacy.expectedFrameRate)
+                XCTAssertTrue(TBDisplayCapturePreset.resolutionPresets.contains(session.capturePreset))
+            }
+        }
+    }
+
+    func testSavedSessionsMigrateIndependentlyAndRoundTripWithoutReintroducingLegacyPresets() throws {
+        let common: [String: Any] = [
+            "transportKind": "thunderboltBridge", "localInterfaceIP": "", "receiverIP": "169.254.1.2",
+            "selectedReceiverID": "TargetBridge Migration Test|169.254.1.2", "captureSource": "desktopMirror",
+            "audioEnabled": false, "brightness": 0.5, "inputGestureMode": "direct"
+        ]
+        var raw: [[String: Any]] = []
+        for (preset, preference) in [("native4_5kRaw60", nil), ("native5kRaw60", "automatic"),
+                                     ("native5kRaw60", "h264")] {
+            var value = common
+            value["capturePreset"] = preset
+            if let preference { value["codecPreference"] = preference }
+            raw.append(value)
+        }
+        var configs = try JSONDecoder().decode([TBDisplaySenderService.PersistedSession].self,
+                                               from: JSONSerialization.data(withJSONObject: raw))
+        for index in configs.indices { configs[index].normalizeCaptureSelection() }
+        XCTAssertEqual(configs.map(\.capturePreset), ["retina4_5k60", "native5k60Experimental", "native5k60Experimental"])
+        XCTAssertEqual(configs.map(\.codecPreference), ["automaticDPCM", "automaticDPCM", "h264"])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let saved = try encoder.encode(configs)
+        var restored = try JSONDecoder().decode([TBDisplaySenderService.PersistedSession].self, from: saved)
+        for index in restored.indices { restored[index].normalizeCaptureSelection() }
+        XCTAssertEqual(try encoder.encode(restored), saved, "A second launch must not migrate again")
+        // Explicitly choosing ordinary Auto after migration must stick on restart.
+        restored[0].codecPreference = "automatic"
+        restored[0].normalizeCaptureSelection()
+        XCTAssertEqual(restored[0].codecPreference, "automatic")
+        XCTAssertEqual(restored[0].capturePreset, "retina4_5k60")
+    }
+
+    private func receiver(id: String = "A4E28721-22A7-42A9-89D7-70F3DBB0E906") -> TBDiscoveredReceiver {
+        TBDiscoveredReceiver(serviceName: "TargetBridge Migration Test", receiverName: "Migration Test",
+                             receiverID: id, preferredIP: "169.254.2.3", thunderboltIP: "169.254.2.3",
+                             networkIP: "", panelSummary: "", version: "3.6.0",
+                             supportsHEVCDecode: true, hostName: nil)
+    }
+
+    func testBonjourAndIdentityMigrationDoNotOverrideEachSessionsSavedCompression() {
+        let receiver = receiver()
+        for alias in [receiver.stableIdentity, receiver.receiverID, "service:\(receiver.serviceName)",
+                      "\(receiver.serviceName)|169.254.1.2"] {
+            var receiverDefaults = ["service:\(receiver.serviceName)": "automatic"]
+            TBReceiverPreferenceMigration.migrateCodecs(
+                &receiverDefaults, identity: receiver.stableIdentity, serviceName: receiver.serviceName,
+                matchesIdentity: receiver.matchesPersistedIdentity)
+            let defaultCodec = receiverDefaults[receiver.stableIdentity].flatMap(TBDisplayCodecPreference.init(rawValue:))
+            for legacy in [TBDisplayCapturePreset.native4_5kRaw60] {
+                let session = makeSession()
+                session.selectedReceiverID = alias
+                session.capturePreset = legacy
+                let expected = session.codecPreference
+                for _ in 0..<3 {
+                    XCTAssertFalse(session.updateDiscoveredReceiver(receiver, defaultCodecPreference: defaultCodec),
+                                   "Same-receiver refresh must not request display-profile restoration")
+                    XCTAssertEqual(session.capturePreset, legacy.canonical)
+                    XCTAssertEqual(session.codecPreference, expected)
+                    XCTAssertEqual(session.selectedReceiverID, receiver.stableIdentity)
+                    XCTAssertEqual(session.receiverIP, "169.254.2.3")
+                }
+                // A saved session remains authoritative even if another session
+                // has more recently changed the receiver's default to HEVC.
+                session.updateDiscoveredReceiver(receiver, defaultCodecPreference: .hevc)
+                XCTAssertEqual(session.codecPreference, expected)
+            }
+        }
+        let newSession = makeSession()
+        XCTAssertTrue(newSession.updateDiscoveredReceiver(receiver, defaultCodecPreference: .hevc))
+        XCTAssertEqual(newSession.codecPreference, .hevc)
+        let other = self.receiver(id: "8D3FC604-AC90-4EB0-A090-2412B3CA9979")
+        XCTAssertTrue(newSession.updateDiscoveredReceiver(other, defaultCodecPreference: .h264))
+        XCTAssertEqual(newSession.codecPreference, .h264)
+    }
+
+    func testAddingSessionKeepsBothResolutionAndMigratedCompression() {
+        for legacy in [TBDisplayCapturePreset.native5kRaw60] {
+            let previous = makeSession()
+            previous.capturePreset = legacy
+            let added = makeSession()
+            added.inheritStreamSelection(from: previous)
+            XCTAssertEqual(added.capturePreset, previous.capturePreset)
+            XCTAssertEqual(added.codecPreference, previous.codecPreference)
+            added.capturePreset = .standard1080p
+            XCTAssertEqual(added.codecPreference, previous.codecPreference)
+        }
+    }
+
+    func testLegacyCLIProfileAliasesShareMigrationAndRespectExplicitCompression() throws {
+        for alias in ["4.5k-dpcm", "imacm1-dpcm", "NATIVE4_5KRAW60", "native5kRaw60"] {
+            let preset = try XCTUnwrap(TBSenderAutomation.parsePreset(alias), alias)
+            let session = makeSession()
+            session.capturePreset = preset
+            XCTAssertEqual(session.capturePreset, preset.canonical, alias)
+            XCTAssertEqual(session.codecPreference, .automaticDPCM, alias)
+            session.codecPreference = .hevc
+            session.capturePreset = preset
+            XCTAssertEqual(session.codecPreference, .hevc, alias)
+        }
+    }
+
+    func testResolutionMenuHasNoCompressionDuplicatesAndCompatibilityChoiceOnlyAppearsWhenActive() {
+        let presets = TBDisplayCapturePreset.resolutionPresets
+        XCTAssertFalse(presets.contains(.native4_5kRaw60))
+        XCTAssertFalse(presets.contains(.native5kRaw60))
+        XCTAssertTrue(presets.contains(.retina4_5k60))
+        XCTAssertTrue(presets.contains(.native5k60Experimental))
+        XCTAssertEqual(Set(presets.map(\.resolutionTitle)).count, presets.count)
+        XCTAssertEqual(TBDisplayCapturePreset.standard1080p.resolutionTitle, "1920 × 1080 · 30 FPS")
+        for selection in TBDisplayCodecPreference.allCases {
+            let choices = TBDisplayCodecPreference.menuChoices(current: selection)
+            XCTAssertTrue(choices.contains(selection))
+            XCTAssertEqual(choices.contains(.automaticDPCM), selection == .automaticDPCM)
+        }
+        for language in TBDisplaySenderLanguage.allCases {
+            let title = TBDisplaySenderL10n.codecPreferenceTitle(.automaticDPCM, language: language)
+            let hint = TBDisplaySenderL10n.codecPreferenceHint(.automaticDPCM, language: language)
+            XCTAssertTrue(title.contains("DPCM"))
+            XCTAssertTrue(hint.contains("NV12"))
+            XCTAssertFalse(title.contains("sender.codec"))
+            XCTAssertFalse(TBDisplaySenderL10n.streamProfileHint(language).contains("sender.stream"))
+        }
+    }
+
+    func testMigratedDPCMUsesOldFallbackSettingsAndReportsActualRequestedTransport() throws {
+        for legacy in [TBDisplayCapturePreset.native4_5kRaw60, .native5kRaw60] {
+            let session = makeSession()
+            session.capturePreset = legacy
+            let settings = session.codecPreference.captureSettings(for: session.capturePreset)
+            XCTAssertEqual(settings.averageBitRate, 120_000_000)
+            XCTAssertEqual(TBVideoTransport.encoded.captureQueueDepth(for: settings), legacy.queueDepth)
+            XCTAssertEqual(TBVideoTransport.rawNV12.captureQueueDepth(for: settings), legacy.queueDepth)
+            XCTAssertEqual(TBVideoTransport.dpcm10Bit.captureQueueDepth(for: settings), legacy.queueDepth)
+            XCTAssertTrue(session.streamResolutionText.contains("DPCM RGB 10-bit"))
+            for (dpcm, nv12, expected): (Bool?, Bool?, TBVideoTransport) in [
+                (true, true, .dpcm10Bit), (false, true, .rawNV12), (nil, nil, .encoded)
+            ] {
+                XCTAssertEqual(TBVideoTransport.resolve(preference: session.codecPreference,
+                    preset: session.capturePreset, supportsDPCM: dpcm, supportsRawNV12: nv12), expected)
+            }
+        }
+        let choice = try XCTUnwrap(TBDisplaySenderSession.chooseCodec(
+            preference: .automaticDPCM, preset: .native5k60Experimental,
+            receiverSupportsHEVC: false, senderSupportsH264: true, senderSupportsHEVC: true))
+        XCTAssertEqual(choice.codecType, kCMVideoCodecType_H264)
+        let saved = try JSONEncoder().encode(TBDisplayCodecPreference.automaticDPCM)
+        XCTAssertEqual(try JSONDecoder().decode(TBDisplayCodecPreference.self, from: saved), .automaticDPCM)
+    }
+}
+
+@MainActor
 final class TBCompressionPreferenceTests: XCTestCase {
     func testDPCMCanBeSelectedForEveryPresetWithoutChangingSizeOrFrameRate() throws {
         for preset in TBDisplayCapturePreset.allCases {
@@ -139,7 +334,8 @@ final class TBCompressionPreferenceTests: XCTestCase {
 
     func testSavedCodecPreferencesRoundTripWithoutChangingExistingValues() throws {
         let preferences: [(String, TBDisplayCodecPreference)] = [
-            ("automatic", .automatic), ("h264", .h264), ("hevc", .hevc), ("dpcm", .dpcm)
+            ("automatic", .automatic), ("automaticDPCM", .automaticDPCM),
+            ("h264", .h264), ("hevc", .hevc), ("dpcm", .dpcm)
         ]
         XCTAssertEqual(TBDisplayCodecPreference.allCases, preferences.map(\.1))
         for (value, preference) in preferences {

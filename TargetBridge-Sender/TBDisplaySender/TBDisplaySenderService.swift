@@ -161,6 +161,20 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    /// Legacy combined presets remain decodable and usable by CLI aliases.
+    /// The menu exposes each resolution/frame-rate pair only once.
+    static var resolutionPresets: [Self] { allCases.filter { $0.canonical == $0 } }
+
+    var canonical: Self {
+        switch self {
+        case .native4_5kRaw60: return .retina4_5k60
+        case .native5kRaw60: return .native5k60Experimental
+        default: return self
+        }
+    }
+
+    var resolutionTitle: String { "\(width) × \(height) · \(expectedFrameRate) FPS" }
+
     var title: String {
         switch self {
         case .standard1080p:
@@ -545,6 +559,9 @@ enum TBVideoTransport: Equatable {
             return supportsDPCM == true ? .dpcm10Bit : nil
         case .h264, .hevc:
             return .encoded
+        case .automaticDPCM:
+            return resolve(wantsDPCM: true, supportsDPCM: supportsDPCM,
+                           supportsRawNV12: supportsRawNV12, rawOverride: rawOverride)
         case .automatic:
             return resolve(wantsDPCM: preset.isRawPassthrough, supportsDPCM: supportsDPCM,
                            supportsRawNV12: supportsRawNV12, rawOverride: rawOverride)
@@ -733,15 +750,38 @@ struct TBFrameRatePacer {
 
 enum TBDisplayCodecPreference: String, CaseIterable, Identifiable, Codable {
     case automatic
+    /// Only restored legacy DPCM configurations expose this compatibility choice.
+    case automaticDPCM
     case h264
     case hevc
     case dpcm
 
     var id: String { rawValue }
 
+    static func menuChoices(current: Self) -> [Self] {
+        allCases.filter { $0 != .automaticDPCM || current == .automaticDPCM }
+    }
+
+    func normalized(for preset: TBDisplayCapturePreset) -> Self {
+        guard self == .automatic || self == .automaticDPCM else { return self }
+        if preset.isRawPassthrough { return .automaticDPCM }
+        return self
+    }
+
+    /// Keep the old 120 Mbps encoded fallback and eight capture surfaces for
+    /// restored DPCM configurations; ordinary resolution presets keep their defaults.
+    func captureSettings(for preset: TBDisplayCapturePreset) -> TBDisplayCapturePreset {
+        guard self == .automaticDPCM else { return preset }
+        switch preset {
+        case .retina4_5k60: return .native4_5kRaw60
+        case .native5k60Experimental: return .native5kRaw60
+        default: return preset
+        }
+    }
+
     func requestedTransport(for preset: TBDisplayCapturePreset) -> TBVideoTransport {
         switch self {
-        case .dpcm: return .dpcm10Bit
+        case .dpcm, .automaticDPCM: return .dpcm10Bit
         case .h264, .hevc: return .encoded
         case .automatic:
             return preset.isRawPassthrough ? .dpcm10Bit : .encoded
@@ -753,7 +793,7 @@ enum TBDisplayCodecPreference: String, CaseIterable, Identifiable, Codable {
         case .h264: return "H.264"
         case .hevc: return "HEVC"
         case .automatic: return preset.codecName
-        case .dpcm: return requestedTransport(for: preset).codecName(encoded: preset.codecName)
+        case .dpcm, .automaticDPCM: return requestedTransport(for: preset).codecName(encoded: preset.codecName)
         }
     }
 }
@@ -1761,6 +1801,15 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
 
     @Published var capturePreset: TBDisplayCapturePreset = .standard1440p {
         didSet {
+            // This is also the CLI/legacy-settings entry point. Resolve the
+            // transport intent before removing its old combined preset tag.
+            let preference = codecPreference.normalized(for: capturePreset)
+            // @Published re-enters didSet when assigned here, including an
+            // unchanged value. Only replace a legacy tag to avoid recursion.
+            if capturePreset != capturePreset.canonical {
+                capturePreset = capturePreset.canonical
+            }
+            if preference != codecPreference { codecPreference = preference }
             if !isStreaming {
                 refreshConfiguredStreamSummary()
             }
@@ -1773,6 +1822,24 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             }
         }
     }
+    /// Receiver defaults initialize a newly selected receiver; a Bonjour address
+    /// or identity refresh must not replace this session's saved compression.
+    @discardableResult
+    func updateDiscoveredReceiver(_ receiver: TBDiscoveredReceiver,
+                                  defaultCodecPreference: TBDisplayCodecPreference? = nil) -> Bool {
+        let sameReceiver = receiver.matchesPersistedIdentity(selectedReceiverID)
+        selectedReceiverID = receiver.stableIdentity
+        receiverIP = receiver.ip(for: transportKind)
+        receiverSupportsHEVCDecodeHint = receiver.supportsHEVCDecode
+        if !sameReceiver { codecPreference = defaultCodecPreference ?? .automatic }
+        return !sameReceiver
+    }
+
+    func inheritStreamSelection(from previous: TBDisplaySenderSession) {
+        codecPreference = previous.codecPreference
+        capturePreset = previous.capturePreset
+    }
+
     @Published var captureSource: TBDisplayCaptureSource = .desktopMirror {
         didSet {
             if !isStreaming {
@@ -1967,7 +2034,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         let preferredCodec: CMVideoCodecType
 
         switch preference {
-        case .automatic:
+        case .automatic, .automaticDPCM:
             preferredCodec = preset.codecType == kCMVideoCodecType_HEVC || hevcAvailable
                 ? kCMVideoCodecType_HEVC
                 : kCMVideoCodecType_H264
@@ -3291,7 +3358,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 return false
             }
 
-            let preset = capturePreset
+            let preset = codecPreference.captureSettings(for: capturePreset)
             guard let transport = resolvedTransport(for: profile) else {
                 setStatus(.captureError(unsupportedTransportMessage))
                 return false
