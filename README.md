@@ -1,3 +1,10 @@
+> [!IMPORTANT]
+> **A personal update from the maintainer**
+>
+> First, thank you to everyone who uses, tests, contributes to, and supports TargetBridge. Unexpected health issues have recently prevented me from continuing work on new features. Thank you for your patience and understanding while I focus on my health.
+>
+> If TargetBridge has been useful to you, please consider [supporting the project through GitHub Sponsors](https://github.com/sponsors/swellweb), with a one-time or monthly contribution. Your support helps sustain maintenance and future updates so more people can benefit. Contributions are entirely optional; testing, feedback, and code contributions are just as appreciated.
+
 ![TargetBridge Overview](images/connection-diagram.svg)
 
 # TargetBridge
@@ -30,18 +37,25 @@ and improves the project. A special thank-you for this release goes to:
 - [@preggocl](https://github.com/preggocl) for the physical Receiver display profile and the software decode fallback.
 - [@Betafer](https://github.com/Betafer) for input-queue safety, cursor work, idle audio/display handling, watchdog protection, monitor shielding, and build improvements.
 
-## TargetBridge 3.5.2
+## TargetBridge 3.6.0
 
-TargetBridge 3.5.2 is a focused maintenance update to the Input Dockstation.
-When the Receiver is the input master, Shift and Command now remain active for
-multi-file selection even when the keyboard is connected to the Receiver and
-the mouse or trackpad is used locally on the Sender. This fixes Finder range
-selection and non-contiguous selection without changing ordinary local input.
+TargetBridge 3.6.0 improves everyday connection setup and makes the display
+pipeline more adaptable without changing the stable default workflows:
 
-It also includes the video queue, capture-health and permission-status fixes
-prepared for this maintenance line. For the wider 3.5.1 maintenance work,
-including Receiver display profiles, idle resource handling, and compatibility
-with older Macs:
+- remembers a discovered Receiver by its stable identity instead of losing the
+  selection when its Thunderbolt or network IP changes
+- migrates saved display profiles, codec choices, and extended-desktop placement
+  when upgrading from the previous Receiver identities
+- offers per-Receiver H.264, HEVC, or automatic hardware codec selection with
+  a safe fallback when a selected codec is unavailable
+- adds `Full HD` and `Full HD 60` 1:1 stream profiles for non-Retina 1080p
+  receivers
+- uses direct virtual-display capture in a genuinely headless mirror session,
+  while keeping system-audio relay active
+- adds a built-in permission assistant for Screen Recording, Accessibility,
+  and Input Monitoring
+
+The release also retains the 3.5 maintenance work:
 
 - preserve keyboard and mouse release events when the Receiver input queue is under pressure
 - preserve native macOS cursor shapes by default, including the screenshot crosshair; the custom overlay is reserved for the explicit large-cursor option
@@ -54,8 +68,8 @@ with older Macs:
 - keep local notification banners behind the active monitor surface across display/fullscreen transitions
 - package SDL runtimes safely and support explicit build/version overrides
 
-See the [full 3.5.2 release notes](docs/releases/3.5.2.md), the
-[3.5.1 release notes](docs/releases/3.5.1.md), and the
+See the [full 3.6.0 release notes](docs/releases/3.6.0.md), the
+[3.5.2 release notes](docs/releases/3.5.2.md), and the
 [testing guide](docs/Testing.md), including the new monitor-shield lifecycle test.
 
 It also keeps the established multi-Mac workspace features:
@@ -84,6 +98,8 @@ It also keeps the established multi-Mac workspace features:
 - Overview hub: [docs/Features.md](docs/Features.md)
 - Mirror mode and Extended Desktop: [docs/Features.md#display-modes](docs/Features.md#display-modes)
 - Guided configuration check: [docs/Features.md#guided-configuration-check](docs/Features.md#guided-configuration-check)
+- Stream profiles and per-Receiver codecs: [docs/Features.md#stream-profiles-and-codecs](docs/Features.md#stream-profiles-and-codecs)
+- Permission assistant: [docs/Features.md#permission-assistant](docs/Features.md#permission-assistant)
 - Multi-receiver layouts: [docs/Features.md#multi-receiver-workflows](docs/Features.md#multi-receiver-workflows)
 - Network Link (experimental): [docs/Features.md#network-link-experimental](docs/Features.md#network-link-experimental)
 - Audio Relay: [docs/Features.md#audio-relay](docs/Features.md#audio-relay)
@@ -114,7 +130,8 @@ TargetBridge now has a conservative manifest-based addon system. Official manife
 ## Requirements
 
 - Sender: Apple Silicon Mac (M1 or later) or Intel Mac, macOS 14 Sonoma or later. Apple Silicon remains the primary tested path; Intel Sender builds are available for broader testing.
-- Receiver: Intel or Apple Silicon Mac, macOS 11 Big Sur or later
+- Pre-built Receiver: macOS 14 Sonoma or later on Intel; macOS 15 Sequoia or later on Apple Silicon.
+- The Receiver source targets macOS 11, but builds for older systems require compatible libraries. Older-system packaging remains tracked in [#167](https://github.com/swellweb/targetBridge/issues/167).
 - Thunderbolt cable
 - See also [docs/Hardware.md](docs/Hardware.md) for hardware details, tested cables, adapters, and Thunderbolt networking ideas.
 
@@ -144,6 +161,7 @@ If you build from source, app outputs go into `build/` folder.
 - `Input Dockstation` may also require `Accessibility` and `Input Monitoring`, depending on the active role.
 - Receiver may require `Accessibility` or `Input Monitoring` when it participates in input relay.
 - In practice, `Input Dockstation` is a two-sided feature: one Mac captures input, the other injects it, so permissions may be needed on both Sender and Receiver.
+- On the Sender, use the `Permissions` toolbar button to review live status and request the native macOS prompts. macOS still requires confirmation from the person using the Mac; TargetBridge cannot grant or overwrite these permissions automatically. Official updates keep a stable app identity so future releases can retain consent already granted to the app installed in `Applications`. See [Signing and permission continuity](docs/Sender-Signing.md).
 - See [docs/Addons.md#input-dockstation](docs/Addons.md#input-dockstation) for the permission matrix.
 
 ## Quick start

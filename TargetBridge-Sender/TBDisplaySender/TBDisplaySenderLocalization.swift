@@ -488,6 +488,38 @@ enum TBDisplaySenderL10n {
         ])
     }
 
+    static func videoCompression(_ language: TBDisplaySenderLanguage) -> String {
+        text("sender.codec.label", language)
+    }
+
+    static func streamProfileHint(_ language: TBDisplaySenderLanguage) -> String {
+        text("sender.stream_profile.hint", language)
+    }
+
+    static func codecPreferenceTitle(
+        _ preference: TBDisplayCodecPreference,
+        language: TBDisplaySenderLanguage
+    ) -> String {
+        text("sender.codec.\(preference.rawValue)", language)
+    }
+
+    static func codecPreferenceHint(
+        _ preference: TBDisplayCodecPreference,
+        language: TBDisplaySenderLanguage,
+        preset: TBDisplayCapturePreset? = nil
+    ) -> String {
+        if preference == .automatic, let preset {
+            if preset.isRawPassthrough {
+                return text("sender.codec.hint.automatic.dpcm", language)
+            }
+        }
+        return text("sender.codec.hint.\(preference.rawValue)", language)
+    }
+
+    static func codecUnavailable(_ language: TBDisplaySenderLanguage) -> String {
+        text("sender.codec.unavailable", language)
+    }
+
     static func missingScreenRecordingPermission(language: TBDisplaySenderLanguage) -> String {
         text("sender.error.screen_recording_permission", language)
     }
@@ -559,6 +591,10 @@ enum TBDisplaySenderL10n {
 extension TBDisplayCapturePreset {
     func title(_ language: TBDisplaySenderLanguage) -> String {
         switch self {
+        case .standard1080p:
+            return TBDisplaySenderL10n.text("sender.profile.full_hd", language)
+        case .smooth1080p60:
+            return TBDisplaySenderL10n.text("sender.profile.full_hd_60", language)
         case .standard1440p:
             return TBDisplaySenderL10n.text("sender.profile.standard", language)
         case .smooth1440p60:
@@ -569,6 +605,10 @@ extension TBDisplayCapturePreset {
             return TBDisplaySenderL10n.text("sender.profile.crisp", language)
         case .retina4k60:
             return TBDisplaySenderL10n.text("sender.profile.retina_4k", language)
+        case .retina4_5k60:
+            return TBDisplaySenderL10n.text("sender.profile.retina_4_5k", language)
+        case .native4_5kRaw60:
+            return TBDisplaySenderL10n.text("sender.profile.native_4_5k_dpcm", language)
         case .native5k:
             return TBDisplaySenderL10n.text("sender.profile.native_5k", language)
         case .native5k60Experimental:
