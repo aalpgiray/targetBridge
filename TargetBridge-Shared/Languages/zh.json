@@ -175,6 +175,7 @@
   "receiver.status.sender_connected_profile_sent": "发送端已连接，已发送配置",
   "receiver.status.session_accepted_waiting_frames": "会话已接受，等待画面帧",
   "receiver.status.session_closed_by_sender": "发送端已关闭会话",
+  "receiver.status.reconnecting": "正在重新连接",
   "receiver.status.sender_connected_negotiating": "发送端已连接，协商中",
   "receiver.status.identifying": "识别中",
   "receiver.network.not_detected": "未检测到",

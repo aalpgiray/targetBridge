@@ -19,6 +19,7 @@
 #include "idle_watchdog.h"
 #include "receiver_profile.h"
 #include "proto.h"
+#include "tb_reconnect_hold.h"
 #include "tb_gesture_bridge.h"
 #include "tb_display_tweaks.h"
 #include "tb_i18n.h"
@@ -55,6 +56,11 @@
  * (5 missed heartbeats) means it died without a FIN. */
 #define TB_SENDER_IDLE_TIMEOUT_MS 10000
 
+/* A brand-new session is protected this long against a second overlapping
+ * dial. Past it, a new accept replaces a session that has gone quiet, so a
+ * wake redial is not locked out by a stale socket. See the accept loop. */
+#define TB_NEW_SESSION_GRACE_MS 2000
+
 struct app {
     struct tb_display *disp;
     struct tb_decoder *dec;
@@ -76,7 +82,22 @@ struct app {
 
     uint64_t last_recv_ms;      /* idle watchdog: last time the sender sent anything */
     int      close_requested;
+    /* close_requested is any TB_PKT_TEARDOWN. This is only the stop button
+     * and targetbridge://disconnect. A display-sleep teardown is not. */
+    int      close_is_user_stop;
+    /* Last sender-display-sleep packet said the MacBook's display is down.
+     * The reconnect grace does not run while this is set. */
+    int      sender_display_asleep;
+    uint64_t sender_asleep_awake_ms;
+    uint64_t sender_asleep_sample_ms;
     int      have_video_frame;
+    struct tb_reconnect_hold reconnect;
+    uint64_t reconnect_grace_ms;
+    /* Previous iteration's CLOCK_MONOTONIC and CLOCK_UPTIME_RAW, so a system
+     * sleep (monotonic jumps, uptime does not) can be credited to the hold
+     * and taken out of the sender-idle clock. */
+    uint64_t mono_sample_ms;
+    uint64_t awake_sample_ms;
     /* A real streaming session has begun (the sender sent a session packet, not
      * just a transient probe like a UI-language push). Gates the fullscreen
      * "connecting" splash so a bare/short-lived connection doesn't flash it. */
@@ -173,6 +194,48 @@ static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+
+/* Time the machine was awake. CLOCK_MONOTONIC on macOS keeps ticking through
+ * system sleep; CLOCK_UPTIME_RAW does not. The difference is the nap. */
+static uint64_t awake_ms(void) {
+#if defined(CLOCK_UPTIME_RAW)
+    const clockid_t clk = CLOCK_UPTIME_RAW;
+#elif defined(CLOCK_MONOTONIC_RAW)
+    const clockid_t clk = CLOCK_MONOTONIC_RAW;
+#else
+    const clockid_t clk = CLOCK_MONOTONIC;
+#endif
+    struct timespec ts;
+    if (clock_gettime(clk, &ts) != 0) return now_ms();
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static uint64_t tb_reconnect_grace_ms(void) {
+    const char *e = getenv("TB_RECONNECT_HOLD_MS");
+    if (!e || !e[0]) return TB_RECONNECT_HOLD_MS;
+    char *end = NULL;
+    unsigned long long v = strtoull(e, &end, 10);
+    if (end == e || (end && *end != '\0')) {
+        fprintf(stderr, "[main] TB_RECONNECT_HOLD_MS='%s' is not a number; using %llu\n",
+                e, (unsigned long long)TB_RECONNECT_HOLD_MS);
+        return TB_RECONNECT_HOLD_MS;
+    }
+    return (uint64_t)v;
+}
+
+/* A frame is on screen. A frame that arrives during a hold is the sender
+ * coming back, so the hold ends. A frame that arrives while we are still
+ * connected does not clear sender_display_asleep: in-flight frames follow
+ * the sleep packet and must not cancel it. */
+static void tb_note_live_frame(struct app *a) {
+    if (!a) return;
+    const int held = tb_reconnect_hold_active(&a->reconnect);
+    a->have_video_frame = 1;
+    if (!held) return;
+    tb_reconnect_hold_note_frame(&a->reconnect);
+    a->sender_display_asleep = 0;
+    fprintf(stderr, "[main] live frame resumed; reconnect hold cleared\n");
 }
 
 static void tb_copy_i18n(char *dest, size_t size, const char *key);
@@ -940,7 +1003,7 @@ static void on_frame(const uint8_t *y, int y_stride,
                      const uint8_t *uv, int uv_stride,
                      int w, int h, void *ud) {
     struct app *a = (struct app *)ud;
-    a->have_video_frame = 1;
+    tb_note_live_frame(a);
     tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
     {
         char width_text[16];
@@ -980,7 +1043,7 @@ static void handle_raw_frame(struct app *a, const uint8_t *p, size_t len) {
     const uint8_t *y  = p + 17;
     const uint8_t *uv = y + y_size;
 
-    a->have_video_frame = 1;
+    tb_note_live_frame(a);
     tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.stream_active");
     {
         char width_text[16];
@@ -1300,11 +1363,61 @@ static void on_packet(uint8_t type, const uint8_t *payload, size_t len, void *ud
     case TB_PKT_TEST_DATA:
         /* Performance test data; discard */
         break;
-    case TB_PKT_TEARDOWN:
-        fprintf(stderr, "[main] teardown requested by sender\n");
+    case TB_PKT_TEARDOWN: {
+        char reason[32];
+        reason[0] = '\0';
+        extract_json_string_field(payload, len, "\"reason\"", reason, sizeof(reason));
+        if (reason[0] == '\0') snprintf(reason, sizeof(reason), "%s", "unspecified");
+        /* user_stop is the stop button and targetbridge://disconnect.
+         * sender_stop / sender_user_stop are the same request from older
+         * senders. displaySleep and systemSleep are not. */
+        const int user = strcmp(reason, "user_stop") == 0
+            || strcmp(reason, "sender_stop") == 0
+            || strcmp(reason, "sender_user_stop") == 0;
+        a->close_is_user_stop = user;
+        if (user) {
+            a->sender_display_asleep = 0;
+        } else if (strcmp(reason, "displaySleep") == 0 || strcmp(reason, "systemSleep") == 0) {
+            a->sender_display_asleep = 1;
+        }
+        fprintf(stderr, "[main] teardown requested by sender (%s)\n", reason);
         tb_copy_i18n(a->status_text, sizeof(a->status_text), "receiver.status.session_closed_by_sender");
         a->close_requested = 1;
         break;
+    }
+    case TB_PKT_SENDER_DISPLAY_SLEEP: {
+        int asleep = 0;
+        char reason[32];
+        reason[0] = '\0';
+        if (!extract_json_bool_field(payload, len, "\"asleep\"", &asleep)) break;
+        extract_json_string_field(payload, len, "\"reason\"", reason, sizeof(reason));
+        if (asleep) {
+            a->sender_display_asleep = 1;
+            a->sender_asleep_awake_ms = 0;
+            a->sender_asleep_sample_ms = 0;
+            if (tb_reconnect_hold_active(&a->reconnect)) {
+                tb_reconnect_hold_set_deadline_suspended(&a->reconnect, 1);
+            }
+            fprintf(stderr, "[main] sender display asleep (%s)\n",
+                    reason[0] ? reason : "unspecified");
+        } else {
+            a->sender_display_asleep = 0;
+            a->sender_asleep_awake_ms = 0;
+            a->sender_asleep_sample_ms = 0;
+            if (tb_reconnect_hold_active(&a->reconnect)) {
+                tb_reconnect_hold_set_deadline_suspended(&a->reconnect, 0);
+                const uint64_t woke = now_ms();
+                if (a->reconnect.until_ms < woke)
+                    a->reconnect.until_ms = woke + a->reconnect_grace_ms;
+                if (a->reconnect.sender_returned)
+                    a->reconnect.connected_ms = woke;
+                fprintf(stderr, "[main] sender display awake; reconnect grace restarted\n");
+            } else {
+                fprintf(stderr, "[main] sender display awake\n");
+            }
+        }
+        break;
+    }
     default:
         fprintf(stderr, "[main] unknown pkt type=0x%02x\n", type);
         break;
@@ -1901,23 +2014,107 @@ static void send_receiver_info(struct app *a) {
     free(pkt);
 }
 
+/* Drop the held picture and let the waiting screen own the window.
+ * Explicit stop and an expired grace both come through here. An unexpected
+ * disconnect that is still inside the grace does not. */
+static void tb_release_held_picture(struct app *a) {
+    tb_reconnect_hold_clear(&a->reconnect);
+    a->sender_display_asleep = 0;
+    a->sender_asleep_awake_ms = 0;
+    a->sender_asleep_sample_ms = 0;
+    a->have_video_frame = 0;
+    SDL_EnableScreenSaver();
+    tb_disp_set_connection_state(a->disp, 0);
+    tb_disp_set_cursor(a->disp, 0, 0, 1, 1, 0, 0, 0);
+    tb_refresh_idle_localized_strings(a);
+}
+
+/* CLOCK_MONOTONIC jumps across system sleep; the awake clock does not.
+ * Credit that nap to a hold that is already up, and take it out of the
+ * sender-idle clock so a nap is not read as the sender dying. */
+static void tb_note_system_sleep(struct app *a, uint64_t mono_now) {
+    const uint64_t awake = awake_ms();
+    if (a->mono_sample_ms != 0 && a->awake_sample_ms != 0 &&
+        mono_now >= a->mono_sample_ms && awake >= a->awake_sample_ms) {
+        const uint64_t d_mono = mono_now - a->mono_sample_ms;
+        const uint64_t d_awake = awake - a->awake_sample_ms;
+        if (d_mono > d_awake && d_mono - d_awake >= 500) {
+            const uint64_t slept = d_mono - d_awake;
+            if (a->last_recv_ms != 0) a->last_recv_ms += slept;
+            if (tb_reconnect_hold_active(&a->reconnect)) {
+                tb_reconnect_hold_credit_stall(&a->reconnect, slept);
+                fprintf(stderr, "[main] credited %llu ms of system sleep to the reconnect hold\n",
+                        (unsigned long long)slept);
+            }
+        }
+    }
+    a->mono_sample_ms = mono_now;
+    a->awake_sample_ms = awake;
+}
+
+/* While the sender's display is asleep, the grace does not run. The cap is
+ * receiver-awake time, so this machine's own sleep does not eat it. */
+static void tb_reconnect_track_sender_asleep(struct app *a, uint64_t now) {
+    if (!a->sender_display_asleep || !tb_reconnect_hold_active(&a->reconnect)) {
+        a->sender_asleep_sample_ms = 0;
+        if (!a->sender_display_asleep) a->sender_asleep_awake_ms = 0;
+        return;
+    }
+    const uint64_t awake = awake_ms();
+    if (a->sender_asleep_sample_ms != 0 && awake >= a->sender_asleep_sample_ms) {
+        a->sender_asleep_awake_ms += awake - a->sender_asleep_sample_ms;
+    }
+    a->sender_asleep_sample_ms = awake;
+    if (tb_sender_asleep_hold_expired(a->sender_asleep_awake_ms)) {
+        fprintf(stderr, "[main] sender-asleep hold cap reached; reconnect grace running\n");
+        a->sender_display_asleep = 0;
+        a->sender_asleep_awake_ms = 0;
+        a->sender_asleep_sample_ms = 0;
+        tb_reconnect_hold_set_deadline_suspended(&a->reconnect, 0);
+        if (a->reconnect.until_ms < now) a->reconnect.until_ms = now;
+        return;
+    }
+    tb_reconnect_hold_set_deadline_suspended(&a->reconnect, 1);
+}
+
 static void close_client(struct app *a) {
     if (a->client_fd >= 0) close(a->client_fd);
     a->client_fd = -1;
     a->session_active = 0;
+
+    const int explicit_stop = a->close_requested && a->close_is_user_stop;
+    const int had_picture = a->have_video_frame || tb_reconnect_hold_active(&a->reconnect);
+    const uint64_t now = now_ms();
+    const int hold = tb_reconnect_should_hold(explicit_stop, had_picture, &a->reconnect,
+                                              now, a->reconnect_grace_ms);
+    const int hold_starting = hold && !tb_reconnect_hold_active(&a->reconnect);
+
     a->close_requested = 0;
-    a->have_video_frame = 0;
+    a->close_is_user_stop = 0;
     snprintf(a->input_control_mode, sizeof(a->input_control_mode), "off");
-    SDL_EnableScreenSaver();
     tb_receiver_refresh_input_capture(a);
-    tb_disp_set_connection_state(a->disp, 0);
-    tb_disp_set_cursor(a->disp, 0, 0, 1, 1, 0, 0, 0);
-    tb_refresh_idle_localized_strings(a);
     a->last_clipboard_text[0] = '\0';
     tb_parser_free(&a->parser);
     tb_parser_init(&a->parser, on_packet, a);
     tb_dec_reset(a->dec);   /* fresh decoder for next session */
     tb_audio_close_for_idle(a);
+
+    if (hold) {
+        tb_reconnect_hold_begin(&a->reconnect, now, a->reconnect_grace_ms);
+        tb_reconnect_hold_note_disconnect(&a->reconnect);
+        if (a->sender_display_asleep) {
+            tb_reconnect_hold_set_deadline_suspended(&a->reconnect, 1);
+        }
+        a->have_video_frame = 0;
+        SDL_DisableScreenSaver();
+        tb_disp_set_cursor(a->disp, 0, 0, 1, 1, 0, 0, 0);
+        if (hold_starting) {
+            fprintf(stderr, "[main] unexpected disconnect; holding last frame for %llu ms\n",
+                    (unsigned long long)a->reconnect_grace_ms);
+        }
+    } else {
+        tb_release_held_picture(a);
+    }
     fprintf(stderr, "[main] client disconnected\n");
 }
 
@@ -2007,6 +2204,9 @@ int main(int argc, char **argv) {
     memset(&a, 0, sizeof(a));
     a.server_fd = -1;
     a.client_fd = -1;
+    a.reconnect_grace_ms = tb_reconnect_grace_ms();
+    fprintf(stderr, "[main] reconnect hold %llu ms (TB_RECONNECT_HOLD_MS overrides, 0 disables)\n",
+            (unsigned long long)a.reconnect_grace_ms);
     if (tb_receiver_load_or_create_id(a.receiver_id, sizeof(a.receiver_id),
                                      CFSTR("com.targetbridge.receiver")) == 0) {
         fprintf(stderr, "[identity] receiver ID ready\n");
@@ -2079,6 +2279,8 @@ int main(int argc, char **argv) {
         }
 
         uint64_t t = now_ms();
+        tb_note_system_sleep(&a, t);
+        tb_reconnect_track_sender_asleep(&a, t);
 
         if (t - a.last_ip_check_ms >= 1000) {
             char refreshed_tb_ip[64] = {0};
@@ -2131,9 +2333,39 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* A dial that arrives while a session looks live is the sender
+         * coming back after sleep or a dropped link, not a second client.
+         * A session that delivered bytes in the last TB_NEW_SESSION_GRACE_MS
+         * is still the live one; anything quieter is replaced so the redial
+         * is not locked out by a stale socket. */
+        int replacement_fd = -1;
+        if (a.client_fd >= 0) {
+            int stale;
+            while ((stale = tb_net_accept(a.server_fd)) >= 0) {
+                if (replacement_fd >= 0) {
+                    fprintf(stderr, "[main] closing superseded dial\n");
+                    close(replacement_fd);
+                }
+                replacement_fd = stale;
+            }
+            if (replacement_fd >= 0) {
+                const uint64_t since_last_recv_ms = t > a.last_recv_ms ? t - a.last_recv_ms : 0;
+                if (since_last_recv_ms < TB_NEW_SESSION_GRACE_MS) {
+                    fprintf(stderr,
+                            "[main] new dial %llu ms after last data; keeping current session\n",
+                            (unsigned long long)since_last_recv_ms);
+                    close(replacement_fd);
+                    replacement_fd = -1;
+                } else {
+                    fprintf(stderr, "[main] new dial while session quiet; replacing stale session\n");
+                    close_client(&a);
+                }
+            }
+        }
+
         /* Accept new client */
         if (a.client_fd < 0) {
-            int c = tb_net_accept(a.server_fd);
+            int c = replacement_fd >= 0 ? replacement_fd : tb_net_accept(a.server_fd);
             if (c >= 0) {
                 a.client_fd = c;
                 a.have_video_frame = 0;
@@ -2143,6 +2375,10 @@ int main(int argc, char **argv) {
                 a.last_recv_ms = t;
                 SDL_DisableScreenSaver();
                 fprintf(stderr, "[main] client connected\n");
+                if (tb_reconnect_hold_active(&a.reconnect)) {
+                    tb_reconnect_hold_note_connect(&a.reconnect, t);
+                    fprintf(stderr, "[main] sender reconnected during hold; staying on last frame\n");
+                }
                 tb_parser_free(&a.parser);
                 tb_parser_init(&a.parser, on_packet, &a);
                 tb_receiver_refresh_input_capture(&a);
@@ -2196,7 +2432,14 @@ int main(int argc, char **argv) {
             tb_receiver_send_display_tweaks_if_changed(&a);
         }
 
-        if (a.client_fd < 0 || !a.session_active) {
+        if (tb_reconnect_hold_should_drop(&a.reconnect, t, a.client_fd >= 0, a.reconnect_grace_ms)) {
+            fprintf(stderr, "[main] reconnect hold expired; returning to waiting screen\n");
+            tb_release_held_picture(&a);
+        }
+
+        if (tb_reconnect_hold_active(&a.reconnect) && !a.have_video_frame) {
+            tb_disp_render_reconnect_hold(a.disp, tb_i18n_get("receiver.status.reconnecting"));
+        } else if (a.client_fd < 0 || !a.session_active) {
             /* No client, or a connection that hasn't started a real streaming
              * session (e.g. a transient UI-language push during discovery):
              * stay on the windowed waiting screen, don't flash fullscreen. */

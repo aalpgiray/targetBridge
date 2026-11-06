@@ -76,4 +76,9 @@ void tb_disp_render_status(struct tb_display *d,
                            const char *permissions);
 void tb_disp_render_connecting(struct tb_display *d);
 
+/* Keep the last video texture on screen and draw a small spinner over it.
+ * Does not leave fullscreen and does not drop the texture. `label` is shown
+ * in the window title (the localized "reconnecting" string). */
+void tb_disp_render_reconnect_hold(struct tb_display *d, const char *label);
+
 #endif

@@ -22,7 +22,8 @@
  *   (see handle_raw_frame in main.c; sender-side sendRawFrame)
  *
  * type 0x30 = heartbeat (JSON)
- * type 0x31 = teardown (JSON)
+ * type 0x31 = teardown (JSON {"reason":"user_stop"|"displaySleep"|"systemSleep"|...})
+ * type 0x3A = sender display sleep (JSON {"asleep":bool,"reason":"displaySleep"|"systemSleep"})
  * type 0x32 = cursor position (JSON)
  * type 0x33 = input relay event (JSON)
  * type 0x34 = input control mode update (JSON)
@@ -59,6 +60,10 @@
  * Both are private CoreBrightness features, so the receiver reports whether it
  * can honour them in its display profile. */
 #define TB_PKT_DISPLAY_TWEAKS   0x38
+/* Sender-authoritative panel sleep, sender -> receiver. Transitions only.
+ * {"asleep":bool,"reason":"displaySleep"|"systemSleep"}. The reconnect grace
+ * does not run while the sender's display is asleep. */
+#define TB_PKT_SENDER_DISPLAY_SLEEP 0x3A
 #define TB_PKT_TEST_DATA        0x40
 
 #define TB_HDR_BYTES        5   /* 4 length + 1 type */

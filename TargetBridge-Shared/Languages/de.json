@@ -175,6 +175,7 @@
   "receiver.status.sender_connected_profile_sent": "Sender verbunden, Profil gesendet",
   "receiver.status.session_accepted_waiting_frames": "Sitzung akzeptiert, warte auf Bildinhalte",
   "receiver.status.session_closed_by_sender": "Sitzung vom Sender geschlossen",
+  "receiver.status.reconnecting": "Erneut verbinden",
   "receiver.status.sender_connected_negotiating": "Sender verbunden, Aushandlung läuft",
   "receiver.status.identifying": "Identifizierung",
   "receiver.network.not_detected": "nicht erkannt",

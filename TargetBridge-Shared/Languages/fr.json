@@ -175,6 +175,7 @@
   "receiver.status.sender_connected_profile_sent": "sender connecté, profil envoyé",
   "receiver.status.session_accepted_waiting_frames": "session acceptée, en attente des images",
   "receiver.status.session_closed_by_sender": "session fermée par le sender",
+  "receiver.status.reconnecting": "Reconnexion",
   "receiver.status.sender_connected_negotiating": "sender connecté, négociation en cours",
   "receiver.status.identifying": "identification",
   "receiver.network.not_detected": "non détecté",
