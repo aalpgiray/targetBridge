@@ -194,10 +194,11 @@ enum TBDisplayCapturePreset: String, CaseIterable, Identifiable {
     }
 
     /// ScreenCaptureKit treats `minimumFrameInterval` as a throttle rather than
-    /// a target cadence. Requesting headroom avoids losing refreshes to scheduler
-    /// tolerance; `TBFrameRatePacer` applies the exact output ceiling later.
+    /// a target cadence. Requesting twice the preset rate made the virtual
+    /// display composite frames the sender then discarded. The request matches
+    /// the preset; `TBFrameRatePacer` still enforces that ceiling.
     var captureRequestFrameRate: Int {
-        expectedFrameRate >= 48 ? expectedFrameRate * 2 : expectedFrameRate
+        expectedFrameRate
     }
 
     var maxKeyFrameInterval: Int {
@@ -2038,7 +2039,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 captureHeight: preset.height,
                 codec: codecName(for: helloCodecType)
             )
-        ) else { return }
+        ) else {
+            TBLog.connection.error("hello: failed to encode — the receiver will never see it")
+            return
+        }
         send(packet)
     }
 
@@ -3840,7 +3844,23 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func send(_ packet: Data) {
-        connection?.send(content: packet, completion: .contentProcessed({ _ in }))
+        // A discarded completion made a packet that never left the socket look
+        // the same as one that did. Nil connection is reported separately: that
+        // is a caller ordering bug, not a network failure.
+        guard let connection else {
+            TBLog.connection.error("send: dropped \(packet.count, privacy: .public) bytes — connection is nil")
+            return
+        }
+        let byteCount = packet.count
+        connection.send(content: packet, completion: .contentProcessed({ [weak self] error in
+            guard let error else { return }
+            Task { @MainActor [weak self] in
+                TBLog.connection.error(
+                    "send: failed after \(byteCount, privacy: .public) bytes — \(error.localizedDescription, privacy: .public)"
+                )
+                self?.lastConnectionStateDetail = "send failed: \(error.localizedDescription)"
+            }
+        }))
     }
 
     func sendInputEvent(_ event: TBMonitorInputEvent) {

@@ -22,6 +22,8 @@
 #include "tb_gesture_bridge.h"
 #include "tb_display_tweaks.h"
 #include "tb_i18n.h"
+#include "tb_appnap.h"
+#include "tb_local_log.h"
 
 #include <SDL.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -1963,6 +1965,12 @@ int main(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--windowed") == 0) fullscreen = 0;
     }
+
+    /* Before anything else logs or draws. The local file survives a dead
+     * link, and the activity keeps the render loop running when this app
+     * is not frontmost. Neither one blocks idle system sleep. */
+    tb_local_log_start();
+    tb_appnap_hold_awake();
 
     char startup_language_pref[8];
     tb_receiver_load_language_preference(startup_language_pref, sizeof(startup_language_pref));

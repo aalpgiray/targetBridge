@@ -116,6 +116,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
     <string>11.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAppSleepDisabled</key>
+    <true/>
 </dict>
 </plist>
 EOF

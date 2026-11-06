@@ -154,11 +154,11 @@ final class TBSenderAutomationParsingTests: XCTestCase {
         XCTAssertEqual(TBDisplayCapturePreset.native5k60Experimental.queueDepth, 5)
     }
 
-    func testHighFrameRatePresetsRequestCaptureHeadroom() {
+    func testCaptureRequestFrameRateMatchesThePreset() {
         XCTAssertEqual(TBDisplayCapturePreset.standard1440p.captureRequestFrameRate, 30)
-        XCTAssertEqual(TBDisplayCapturePreset.smooth1440p60.captureRequestFrameRate, 120)
-        XCTAssertEqual(TBDisplayCapturePreset.retina4k60.captureRequestFrameRate, 120)
-        XCTAssertEqual(TBDisplayCapturePreset.native5k.captureRequestFrameRate, 96)
+        XCTAssertEqual(TBDisplayCapturePreset.smooth1440p60.captureRequestFrameRate, 60)
+        XCTAssertEqual(TBDisplayCapturePreset.retina4k60.captureRequestFrameRate, 60)
+        XCTAssertEqual(TBDisplayCapturePreset.native5k.captureRequestFrameRate, 48)
     }
 
     func testAutomaticCodecUsesH264WhenHEVCIsUnavailable() {
