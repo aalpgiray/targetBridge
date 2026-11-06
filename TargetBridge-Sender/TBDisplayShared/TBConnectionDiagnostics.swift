@@ -451,6 +451,39 @@ enum TBConnectionDiagnostics {
         TBConnectionProbeError.socketFailure("\(operation): \(String(cString: strerror(errno)))")
     }
 
+    /// Source-address pinning is only for link-local destinations.
+    ///
+    /// `169.254/16` has no specific route, so the table sends it out the
+    /// primary interface (usually Wi-Fi) and a Thunderbolt Bridge dial leaves
+    /// by the wrong link. A routable address already has its own route, and
+    /// pinning it can make Network.framework reject the dial with `ENETDOWN`
+    /// (`NWError` 50) before a packet leaves — measured on a Thunderbolt
+    /// MacBook↔iMac link, where the same dial without the pin reached ready
+    /// in milliseconds while `nc` from the same host succeeded the whole time.
+    ///
+    /// Scoped link-local hosts (`169.254.x%bridge0`) still count: the address
+    /// is link-local even after the zone suffix is attached.
+    static func needsSourceAddressPin(receiverIP: String) -> Bool {
+        receiverIP.hasPrefix("169.254.")
+    }
+
+    /// How long a dial may sit in `.waiting` before the sender tears it down.
+    ///
+    /// Five seconds was too tight. A bundled app's first local-network
+    /// connection sits in `.waiting` while macOS resolves its local-network
+    /// policy, and that is not a failure — Network.framework retries and
+    /// succeeds. Measured on the same Thunderbolt link: ready at 201ms with
+    /// no source pin, and ready at 5203ms with one. Against a 5000ms deadline
+    /// the second case loses by 200ms and reports "Connection timed out —
+    /// last network state: waiting(Network is down)", which looks like a dead
+    /// link and is really the sender giving up early.
+    ///
+    /// The deadline exists so an unreachable receiver cannot hang the UI
+    /// forever, so it only has to be shorter than a person's patience, not
+    /// shorter than the stack's own recovery. 20s is past every measured
+    /// success and still bounded.
+    static let connectAttemptTimeout: TimeInterval = 20
+
     /// For a link-local (`169.254.x`) receiver reached through bridgeX,
     /// returns `"<ip>%<interface>"` so the Thunderbolt dial is scoped to the
     /// interface that owns `localIP`. Direct USB-NCM enX links remain

@@ -2,8 +2,9 @@ import XCTest
 @testable import TargetBridge
 
 /// Tests for the connect-path helpers: link-local interface scoping (the fix
-/// for Thunderbolt Bridge dials leaving via the wrong interface) and the
-/// failure-detail composer that keeps diagnostics attached to errors.
+/// for Thunderbolt Bridge dials leaving via the wrong interface), source-address
+/// pinning, the connect deadline, and the failure-detail composer that keeps
+/// diagnostics attached to errors.
 final class TBConnectionDiagnosticsTests: XCTestCase {
 
     private typealias Interface = TBConnectionDiagnostics.LocalInterface
@@ -45,6 +46,22 @@ final class TBConnectionDiagnosticsTests: XCTestCase {
         XCTAssertFalse(TBConnectionDiagnostics.isDirectLinkInterface(name: "en8", ip: "192.168.178.93"))
         XCTAssertFalse(TBConnectionDiagnostics.isDirectLinkInterface(name: "en8", ip: "169.254.300.1"))
         XCTAssertFalse(TBConnectionDiagnostics.isDirectLinkInterface(name: "en8", ip: "169.254.1"))
+    }
+
+    // MARK: - source address pin
+
+    func testSourceAddressPinIsOnlyForLinkLocalDestinations() {
+        XCTAssertTrue(TBConnectionDiagnostics.needsSourceAddressPin(receiverIP: "169.254.89.80"))
+        XCTAssertTrue(TBConnectionDiagnostics.needsSourceAddressPin(receiverIP: "169.254.89.80%bridge0"))
+        XCTAssertFalse(TBConnectionDiagnostics.needsSourceAddressPin(receiverIP: "10.0.1.2"))
+        XCTAssertFalse(TBConnectionDiagnostics.needsSourceAddressPin(receiverIP: "192.168.1.64"))
+        XCTAssertFalse(TBConnectionDiagnostics.needsSourceAddressPin(receiverIP: "imac.local"))
+        XCTAssertFalse(TBConnectionDiagnostics.needsSourceAddressPin(receiverIP: ""))
+    }
+
+    func testConnectAttemptTimeoutOutlastsLocalNetworkPolicyWait() {
+        // 5s killed dials that were still in `.waiting`. 20s is the measured bound.
+        XCTAssertEqual(TBConnectionDiagnostics.connectAttemptTimeout, 20)
     }
 
     // MARK: - scopedReceiverHost

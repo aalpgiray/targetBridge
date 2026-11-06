@@ -1609,7 +1609,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         let params = NWParameters(tls: nil, tcp: tcpOptions)
         params.allowLocalEndpointReuse = true
         params.serviceClass = .interactiveVideo
-        if let localPort = NWEndpoint.Port(rawValue: 0) {
+        // Pin the source address only for link-local peers. A routable
+        // address already has a route, and the pin makes Network.framework
+        // fail that dial with ENETDOWN. See `needsSourceAddressPin`.
+        if TBConnectionDiagnostics.needsSourceAddressPin(receiverIP: receiverIP),
+           let localPort = NWEndpoint.Port(rawValue: 0) {
             params.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(localInterfaceIP), port: localPort)
         }
 
@@ -3825,7 +3829,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
         
         connectTimeoutWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0, execute: workItem)
+        // See `TBConnectionDiagnostics.connectAttemptTimeout`: 5s kills dials
+        // that are still in `.waiting` while macOS resolves local-network policy.
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + TBConnectionDiagnostics.connectAttemptTimeout,
+            execute: workItem
+        )
     }
 
     private func processAudio(_ sampleBuffer: CMSampleBuffer) {
