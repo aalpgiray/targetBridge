@@ -61,7 +61,14 @@
  * profile, which is conditional on a working Metal decoder: decoding costs
  * ~44 million bit extractions per 5K frame, which this receiver's CPU cannot
  * afford (measured 166 ms single-threaded on the target iMac, against 6.5 ms on
- * its GPU). A silent peer is an old peer and keeps getting TB_PKT_RAW_FRAME. */
+ * its GPU). A silent peer is an old peer and keeps getting TB_PKT_RAW_FRAME.
+ *
+ * TB_DPCM_FLAG_ADAPTIVE_COLOR is a second, negotiated step. It is set only
+ * when the profile also said "supportsDPCMAdaptiveColor". Seed bit 31 then
+ * selects each tile's coding space: raw RGB, or reversible (B-G), G, (R-G).
+ * The decoder adds G back after the residuals. An older receiver must be
+ * sent the flag clear, or it would reconstruct the transformed samples as
+ * RGB. */
 #define TB_PKT_RAW_DPCM         0x25
 /* One horizontal BAND of a TBD2 frame. Payload is a 28-byte header, big-endian
  * like the rest of the protocol, followed by a TBD2 blob covering rows

@@ -62,6 +62,13 @@ echo "== lossless 5K transfer (TBD2) =============================="
 want "codec reference impl"              1 "tb_dpcm_encode"    TargetBridge-Shared/codec
 want "GPU encoder"                      1 "tb_dpcm_gpu_encode" TargetBridge-Shared/codec
 want "async encode entry point"         1 "encode_bands_async" TargetBridge-Shared/codec TargetBridge-Sender
+# Adaptive colour is negotiated. The async encoder — the path a 5K frame
+# actually takes — must be able to set the flag, and the receiver must
+# advertise the capability. Losing either side sends transformed samples to
+# a decoder that will read them as RGB.
+want "adaptive color flag"              1 "TB_DPCM_FLAG_ADAPTIVE_COLOR" TargetBridge-Shared/codec
+want "adaptive color capability"        2 "supportsDPCMAdaptiveColor" TargetBridge-Sender TargetBridge-Receiver
+want "async encoder takes adaptive"     1 "dpcmAdaptiveColor" TargetBridge-Sender/TBDisplaySender
 want "sender async encode context"      1 "TBDPCMAsyncEncode"  TargetBridge-Sender
 want "GPU decode on the receiver"       1 "render_dpcm_slice"  TargetBridge-Receiver/TBReceiverC/src
 # All three live in one file, so check each name rather than counting files.

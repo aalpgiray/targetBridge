@@ -127,6 +127,7 @@ struct tb_dpcm_gpu_params {
     uint32_t widthOff, seedOff, payOff;
     uint32_t bits;      /* 8 or 10; channel c sits at bit c*bits */
     uint32_t alpha;     /* opaque alpha, pre-shifted for this depth */
+    uint32_t adaptiveColor; /* seed bit 31 may select reversible B-G / R-G */
     /* Where in the destination this blob belongs. A slice is simply a shorter
      * frame written further down the surface, which is why slicing needed no new
      * codec: the tiles were already independent.
@@ -816,7 +817,7 @@ static NSString *tb_shader_source(void) {
     "struct DpcmParams {\n"
     "  uint width, height, tilesX, tilesY, tileCount, outStridePx;\n"
     "  uint widthOff, seedOff, payOff;\n"
-    "  uint bits, alpha, rowOffset, colOffset;\n"
+    "  uint bits, alpha, adaptiveColor, rowOffset, colOffset;\n"
     "};\n"
     "static inline uint tb_width_get(device const uchar *plane, uint idx) {\n"
     "  uchar b = plane[idx >> 1];\n"
@@ -907,7 +908,13 @@ static NSString *tb_shader_source(void) {
     "  const int3 seed = int3(int((sraw >> (0u * P.bits)) & mask),\n"
     "                         int((sraw >> (1u * P.bits)) & mask),\n"
     "                         int((sraw >> (2u * P.bits)) & mask));\n"
-    "  const uint3 v = uint3(seed + acc) & mask;\n"
+    "  uint3 v = uint3(seed + acc) & mask;\n"
+    /* The seed marker selects the tile's coding space. Add G back only after
+     * all three transformed channels have been reconstructed. */
+    "  if (P.adaptiveColor != 0u && (sraw & 0x80000000u) != 0u) {\n"
+    "    v.x = (v.x + v.y) & mask;\n"
+    "    v.z = (v.z + v.y) & mask;\n"
+    "  }\n"
     "  out[(P.rowOffset + tyi * 8u + y) * P.outStridePx + (P.colOffset + txi * 8u + x)] =\n"
     "      P.alpha | v.x | (v.y << P.bits) | (v.z << (2u * P.bits));\n"
     "}\n";
@@ -1754,6 +1761,7 @@ int tb_metal_plane_render_dpcm_slice(const uint8_t *blob, size_t len,
             (uint32_t)in.payload_off,
             in.ten_bit ? 10u : 8u,
             in.ten_bit ? (3u << 30) : (0xFFu << 24),
+            in.adaptive_color ? 1u : 0u,
             (uint32_t)y0, (uint32_t)x0
         };
 

@@ -127,6 +127,10 @@ struct TBMonitorDisplayProfile: Codable {
     /// receiver only claims this if the compute pipeline actually built, since
     /// decoding on a CPU is far too slow at 5K to stand in.
     var supportsDPCM: Bool?
+    /// Whether the receiver understands TB_DPCM_FLAG_ADAPTIVE_COLOR. Absent
+    /// means no, which is what an older receiver says by saying nothing. The
+    /// sender then keeps the legacy RGB coding and leaves the flag clear.
+    var supportsDPCMAdaptiveColor: Bool?
     /// Whether the receiver can place a band at a row offset and present only on
     /// the last one. Absent means whole frames only.
     /// Whether the receiver can place a region by column as well as row, i.e.

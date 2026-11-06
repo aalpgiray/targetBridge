@@ -100,6 +100,16 @@ extern "C" {
 /* flags */
 #define TB_DPCM_FLAG_ALPHA_OMITTED  0x01u
 #define TB_DPCM_FLAG_TEN_BIT        0x02u /* samples are 10-bit ('l10r') */
+#define TB_DPCM_FLAG_ADAPTIVE_COLOR 0x04u
+
+/* Negotiated extension (supportsDPCMAdaptiveColor). With this frame flag,
+ * bit 31 of each seed selects the reversible (B-G, G, R-G) domain, modulo
+ * 2^sampleDepth. Bits 0..3*depth-1 carry that domain's seed. Without the
+ * marker the tile stays RGB. Widths, prediction and layout are unchanged.
+ * Encoders select the transformed domain only when its sum of widths is
+ * strictly smaller, so no tile grows. Alpha stays omitted. A receiver that
+ * did not advertise the capability must be sent this flag clear. */
+#define TB_DPCM_SEED_ADAPTIVE_COLOR 0x80000000u
 
 /* Fixed-size prologue. All fields little-endian. Immediately followed by:
  *   group_count * uint32   group base offsets, in BITS into the payload
@@ -132,6 +142,7 @@ struct tb_dpcm_info {
     int      channels;           /* 3 */
     int      alpha_omitted;
     int      ten_bit;
+    int      adaptive_color;     /* frame flag; per-tile choice is in the seed */
     int      tiles_x, tiles_y;
     uint32_t tile_count;
     uint32_t group_count;
@@ -159,6 +170,12 @@ size_t tb_dpcm_max_size(int w, int h);
  * CPU stays free for the person using the machine. */
 size_t tb_dpcm_encode(const uint8_t *src, int stride, int w, int h,
                       int ten_bit, uint8_t *dst, size_t dst_cap);
+
+/* Same contract, with negotiated adaptive colour enabled. Never larger than
+ * tb_dpcm_encode on the same pixels. The blob sets TB_DPCM_FLAG_ADAPTIVE_COLOR
+ * and requires a decoder that advertised supportsDPCMAdaptiveColor. */
+size_t tb_dpcm_encode_adaptive(const uint8_t *src, int stride, int w, int h,
+                               int ten_bit, uint8_t *dst, size_t dst_cap);
 
 /* Validate a blob and fill in `out`. Returns 0 on success, non-zero if the blob
  * is malformed or inconsistent — this runs on untrusted network data, so every

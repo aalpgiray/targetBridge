@@ -525,6 +525,10 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// inside a 60 Hz period, and the receiver decodes into VRAM where there is
     /// no CPU-side image for a rectangle to patch.
     var dpcmEnabled = false
+    /// Receiver advertised supportsDPCMAdaptiveColor as well as supportsDPCM.
+    /// The async GPU encoder uses the green-difference domain only then.
+    /// An older receiver leaves this false and is sent the original format.
+    var dpcmAdaptiveColor = false
 
     /// Cap on frames actually sent, independent of how fast we capture.
     ///
@@ -1017,6 +1021,13 @@ private final class TBVideoPipeline: @unchecked Sendable {
     /// Compression achieved by the lossless codec, or 0 when it did not run.
     /// Guarded by `lock` like the other fields the UI reads off this thread.
     var dpcmRatio: Double { lock.lock(); defer { lock.unlock() }; return _dpcmRatio }
+    /// Running mean of encoded bytes (packet header reserve included, the same
+    /// quantity the first-frame log has always reported). Updated from the
+    /// encoder's queue; read under `lock`.
+    private var _dpcmMeanPayloadBytes: Int = 0
+    var dpcmMeanPayloadBytes: Int { lock.lock(); defer { lock.unlock() }; return _dpcmMeanPayloadBytes }
+    private var dpcmPayloadSum: Int = 0
+    private var dpcmPayloadCount: Int = 0
     private var _rawFormatIsBGRA = false
     private var _rawFormatIsTenBit = false
     var rawFormatIsBGRA: Bool { lock.lock(); defer { lock.unlock() }; return _rawFormatIsBGRA }
@@ -1531,14 +1542,27 @@ private final class TBVideoPipeline: @unchecked Sendable {
                         TBTelemetryReporter.noteEmit()
                         guard let self, ok, written > 0 else { return }
                         self.queue.async {
-                            guard !self.dpcmLogged else { return }
-                            self.dpcmLogged = true
+                            self.dpcmPayloadSum += written
+                            self.dpcmPayloadCount += 1
+                            let count = self.dpcmPayloadCount
+                            let mean = self.dpcmPayloadSum / count
                             let raw = stride * height
-                            TBLog.connection.info("dpcm: \(width, privacy: .public)x\(height, privacy: .public) \(isTenBit ? 10 : 8, privacy: .public)-bit \(raw / 1_000_000, privacy: .public) MB -> \(written / 1_000_000, privacy: .public) MB (\(String(format: "%.2fx", Double(raw) / Double(written)), privacy: .public)) \(sliceCount, privacy: .public) slice(s) async")
+                            let adaptive = self.dpcmAdaptiveColor
                             self.lock.lock()
-                            self._dpcmRatio = Double(raw) / Double(written)
+                            self._dpcmRatio = Double(raw) / Double(mean)
+                            self._dpcmMeanPayloadBytes = mean
                             self.lock.unlock()
-                            self.noteResolvedPath("lossless DPCM · \(width)x\(height) \(isTenBit ? 10 : 8)-bit · \(sliceCount) slice(s) · \(String(format: "%.2fx", Double(raw) / Double(written)))")
+                            // First frame, then once a second, then every five
+                            // seconds. Mean payload bytes are what an iMac run
+                            // can compare against the legacy RGB coding.
+                            let shouldLog = count == 1 || count == 60 || count % 300 == 0
+                            guard shouldLog else { return }
+                            let ratio = Double(raw) / Double(mean)
+                            TBLog.connection.info("dpcm: \(width, privacy: .public)x\(height, privacy: .public) \(isTenBit ? 10 : 8, privacy: .public)-bit adaptive=\(adaptive ? 1 : 0, privacy: .public) meanPayload=\(mean, privacy: .public) bytes over \(count, privacy: .public) frames (\(String(format: "%.2fx", ratio), privacy: .public)) async")
+                            if !self.dpcmLogged {
+                                self.dpcmLogged = true
+                                self.noteResolvedPath("lossless DPCM\(adaptive ? " adaptive" : "") · \(width)x\(height) \(isTenBit ? 10 : 8)-bit · \(sliceCount) slice(s) · \(String(format: "%.2fx", Double(raw) / Double(written))) · mean \(mean) bytes")
+                            }
                         }
                     })
 
@@ -1558,7 +1582,9 @@ private final class TBVideoPipeline: @unchecked Sendable {
                         base.assumingMemoryBound(to: UInt8.self),
                         Int32(stride), Int32(width),
                         Int32(rowsPerBand), Int32(sliceCount),
-                        isTenBit ? 1 : 0, reserve,
+                        isTenBit ? 1 : 0,
+                        dpcmAdaptiveColor ? 1 : 0,
+                        reserve,
                         tbDPCMAsyncDone, opaque)
                     if submitted != 0 {
                         Unmanaged<TBDPCMFrameContext>.fromOpaque(opaque).release()
@@ -2300,6 +2326,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     /// older format instead of noise.
     private var receiverSupportsFloat32Audio = false
     private var receiverSupportsDPCM = false
+    /// Absent on the profile means an older receiver. Adaptive colour stays off.
+    private var receiverSupportsDPCMAdaptiveColor = false
     private var activeProfile: TBMonitorDisplayProfile?
     private var activeCodecType: CMVideoCodecType?
     private var activeCodecName: String?
@@ -4146,8 +4174,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         // value is stored and applied at construction; the optional assignment
         // covers a profile that turns up on an already-running pipeline.
         receiverSupportsDPCM = profile.supportsDPCM ?? false
+        // Absent means an older receiver. Adaptive colour is sent only when
+        // both capabilities are present; otherwise the async encoder keeps
+        // the flag clear and the original RGB residuals.
+        receiverSupportsDPCMAdaptiveColor = profile.supportsDPCMAdaptiveColor ?? false
+        let adaptive = receiverSupportsDPCM && receiverSupportsDPCMAdaptiveColor
         pipeline?.dpcmEnabled = receiverSupportsDPCM
-        TBLog.connection.info("receiver caps: dpcm=\(self.receiverSupportsDPCM, privacy: .public) float32Audio=\(self.receiverSupportsFloat32Audio, privacy: .public)")
+        pipeline?.dpcmAdaptiveColor = adaptive
+        TBLog.connection.info("receiver caps: dpcm=\(self.receiverSupportsDPCM, privacy: .public) adaptiveColor=\(adaptive, privacy: .public) float32Audio=\(self.receiverSupportsFloat32Audio, privacy: .public)")
         // The shipped-log file is a rolling record across sessions, so mark
         // where this one starts; without it a reader cannot tell one run's
         // output from the next.
@@ -4276,6 +4310,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 }
             )
             pipeline.dpcmEnabled = receiverSupportsDPCM
+            pipeline.dpcmAdaptiveColor = receiverSupportsDPCM && receiverSupportsDPCMAdaptiveColor
             guard pipeline.start() else { return false }
             startAudioDeviceCaptureIfNeeded()
             self.pipeline = pipeline

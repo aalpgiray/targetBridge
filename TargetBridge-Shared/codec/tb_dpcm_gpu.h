@@ -82,6 +82,17 @@ size_t tb_dpcm_gpu_encode(tb_dpcm_gpu *e,
                           int ten_bit, size_t header_reserve,
                           const uint8_t **out_blob);
 
+/* Same as tb_dpcm_gpu_encode, but each tile may use the reversible
+ * (B-G, G, R-G) domain when that sum of widths is strictly smaller.
+ * The blob sets TB_DPCM_FLAG_ADAPTIVE_COLOR. The legacy call above never
+ * does, which is what an older receiver must be sent. The async entry
+ * below is the path the sender actually runs; this one exists so the GPU
+ * output can be compared byte-for-byte with tb_dpcm_encode_adaptive. */
+size_t tb_dpcm_gpu_encode_adaptive(tb_dpcm_gpu *e,
+                                   const uint8_t *src, int stride, int w, int h,
+                                   int ten_bit, size_t header_reserve,
+                                   const uint8_t **out_blob);
+
 /* One encoded band, as returned by tb_dpcm_gpu_encode_bands(). Same ownership
  * rule as the single-frame call: the memory belongs to the encoder and stays
  * valid only until the next encode. */
@@ -186,9 +197,14 @@ typedef void (*tb_dpcm_gpu_done)(void *ctx, int ok,
  *
  * Completion order matches submission order — one command queue, and the plan
  * stage is serial. */
+/* `adaptive_color` is non-zero only when the receiver advertised
+ * supportsDPCMAdaptiveColor. The shaders then pick the smaller domain per
+ * tile and the completion handler sets TB_DPCM_FLAG_ADAPTIVE_COLOR. Zero
+ * keeps the original RGB coding, byte-for-byte with tb_dpcm_encode. */
 int tb_dpcm_gpu_encode_bands_async(tb_dpcm_gpu *e,
                                    const uint8_t *src, int stride, int w, int band_h,
-                                   int band_count, int ten_bit, size_t header_reserve,
+                                   int band_count, int ten_bit, int adaptive_color,
+                                   size_t header_reserve,
                                    tb_dpcm_gpu_done done, void *ctx);
 
 /* Wait for every in-flight frame to finish. Call before destroying the encoder

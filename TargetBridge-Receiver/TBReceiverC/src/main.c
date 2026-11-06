@@ -2825,14 +2825,18 @@ static void send_receiver_info(struct app *a) {
     }
     escaped_name[out] = '\0';
 
-    char json[1024];
+    /* Same Metal decoder serves both wire formats. Adaptive colour is a
+     * separate capability so an older sender's absence of the key, and a
+     * newer sender talking to an older receiver, both leave the flag clear. */
+    const char *supports_dpcm = tb_disp_supports_dpcm() ? "true" : "false";
+    char json[1280];
     int json_len = snprintf(
         json,
         sizeof(json),
         "{\"receiverName\":\"%s\",\"panelWidth\":%u,\"panelHeight\":%u,"
         "\"modeWidth\":%u,\"modeHeight\":%u,\"refreshRate\":60,"
         "\"hiDPI\":true,\"captureWidth\":%u,\"captureHeight\":%u,"
-        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsFloat32Audio\":true,\"supportsDPCM\":%s,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s,"
+        "\"supportsHEVCDecode\":%s,\"supportsRawNV12\":true,\"supportsFloat32Audio\":true,\"supportsDPCM\":%s,\"supportsDPCMAdaptiveColor\":%s,\"inputMonitoringTrusted\":%s,\"accessibilityTrusted\":%s,"
         "\"supportsNightShift\":%s,\"supportsTrueTone\":%s}",
         escaped_name,
         panel_w,
@@ -2842,7 +2846,8 @@ static void send_receiver_info(struct app *a) {
         capture_w,
         capture_h,
         tb_dec_supports_hevc_hwdecode() ? "true" : "false",
-        tb_disp_supports_dpcm() ? "true" : "false",
+        supports_dpcm,
+        supports_dpcm,
         tb_receiver_input_monitoring_trusted() ? "true" : "false",
         tb_receiver_accessibility_trusted() ? "true" : "false",
         tb_night_shift_supported() ? "true" : "false",
