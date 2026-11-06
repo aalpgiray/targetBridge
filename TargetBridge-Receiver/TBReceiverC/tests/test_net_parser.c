@@ -73,6 +73,19 @@ static size_t build_packet(uint8_t *buf, uint8_t type, const void *payload, size
 
 /* ---- tests ------------------------------------------------------------- */
 
+static void test_thunderbolt_interface_classifier(void) {
+    CHECK(tb_net_interface_is_thunderbolt("bridge0", NULL), "bridge* is Thunderbolt without a display name");
+    CHECK(tb_net_interface_is_thunderbolt("bridge100", "Ethernet"), "bridge* wins over a generic display name");
+    CHECK(tb_net_interface_is_thunderbolt("en1", "Thunderbolt 1"), "macOS names a direct cable Thunderbolt N");
+    CHECK(tb_net_interface_is_thunderbolt("en1", "Thunderbolt Bridge"), "display name Thunderbolt Bridge");
+    CHECK(tb_net_interface_is_thunderbolt("en5", "thunderbolt"), "match is case-insensitive");
+    CHECK(!tb_net_interface_is_thunderbolt("en0", "Ethernet"), "ordinary Ethernet is not Thunderbolt");
+    CHECK(!tb_net_interface_is_thunderbolt("en0", "Wi-Fi"), "Wi-Fi is not Thunderbolt");
+    CHECK(!tb_net_interface_is_thunderbolt("en8", NULL), "unnamed en* is not Thunderbolt");
+    CHECK(!tb_net_interface_is_thunderbolt(NULL, NULL), "missing name is not Thunderbolt");
+    CHECK(!tb_net_interface_is_thunderbolt("en1", "Thunder"), "a prefix of the word is not enough");
+}
+
 static void test_link_local_ipv4_classifier(void) {
     CHECK(tb_net_is_link_local_ipv4("169.254.189.3"), "USB-NCM link-local address");
     CHECK(tb_net_is_link_local_ipv4("169.254.0.1"), "link-local lower boundary");
@@ -223,6 +236,7 @@ static void test_large_payload_roundtrip(void) {
 }
 
 int main(void) {
+    test_thunderbolt_interface_classifier();
     test_link_local_ipv4_classifier();
     test_single_packet_whole_feed();
     test_byte_by_byte_feed();

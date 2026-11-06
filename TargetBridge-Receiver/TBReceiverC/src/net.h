@@ -30,9 +30,17 @@ int  tb_net_listen   (uint16_t port);
 /* Accept one client. Returns client fd or -1. Sets non-blocking. */
 int  tb_net_accept   (int server_fd);
 
-/* Returns IP address of first bridge* interface (Thunderbolt Bridge) in buf.
+/* Returns the Thunderbolt IPv4 address in buf.
+ * A bridge* interface counts even with a static address, and so does an
+ * interface whose localized display name contains "Thunderbolt" (en* "Thunderbolt 1"
+ * is how macOS names a direct cable that is not the bridge service).
  * buf size must be at least INET_ADDRSTRLEN (16) bytes. Returns 0 on success. */
 int  tb_net_get_tb_ip(char *buf, size_t bufsz);
+
+/* 1 when `bsd_name` is a bridge* interface, or when `display_name` contains
+ * "Thunderbolt" (case-insensitive). `display_name` may be NULL.
+ * Exposed so tests can check the rule without a live interface list. */
+int  tb_net_interface_is_thunderbolt(const char *bsd_name, const char *display_name);
 
 /* Returns IP address of the first non-Thunderbolt enX/ethX interface using
  * IPv4 link-local addressing (169.254/16). macOS exposes direct USB-NCM

@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -171,6 +172,61 @@ enum tb_lan_interface_kind {
     TB_LAN_INTERFACE_WIFI = 2
 };
 
+int tb_net_interface_is_thunderbolt(const char *bsd_name, const char *display_name) {
+    if (bsd_name && strncmp(bsd_name, "bridge", 6) == 0) return 1;
+    if (!display_name || !*display_name) return 0;
+
+    /* Walk the display name so a localized prefix ("Thunderbolt 1",
+     * "Thunderbolt Bridge") still matches. strncasecmp stops at the first
+     * NUL, so a shorter tail cannot false-match the needle. */
+    const char *needle = "thunderbolt";
+    const size_t nlen = strlen(needle);
+    for (const char *p = display_name; *p; ++p) {
+        if (strncasecmp(p, needle, nlen) == 0) return 1;
+    }
+    return 0;
+}
+
+/* SCNetworkInterfaceGetInterfaceType returns "Ethernet" for Thunderbolt, so
+ * the localized display name is the only macOS signal that an en* device is
+ * the cable. The name is localized; a miss here falls through to bridge*
+ * detection rather than inventing a Thunderbolt link. */
+static int display_name_says_thunderbolt(const char *bsd_name) {
+#if defined(__APPLE__)
+    if (!bsd_name || !*bsd_name) return 0;
+    CFArrayRef all = SCNetworkInterfaceCopyAll();
+    if (!all) return 0;
+
+    int found = 0;
+    const CFIndex count = CFArrayGetCount(all);
+    for (CFIndex i = 0; i < count && !found; i++) {
+        SCNetworkInterfaceRef iface = (SCNetworkInterfaceRef)CFArrayGetValueAtIndex(all, i);
+        CFStringRef bsd = SCNetworkInterfaceGetBSDName(iface);
+        if (!bsd) continue;
+
+        char bsdbuf[IFNAMSIZ];
+        if (!CFStringGetCString(bsd, bsdbuf, sizeof bsdbuf, kCFStringEncodingUTF8)) continue;
+        if (strcmp(bsdbuf, bsd_name) != 0) continue;
+
+        CFStringRef display = SCNetworkInterfaceGetLocalizedDisplayName(iface);
+        if (!display) continue;
+        char namebuf[256];
+        if (!CFStringGetCString(display, namebuf, sizeof namebuf, kCFStringEncodingUTF8)) continue;
+        found = tb_net_interface_is_thunderbolt(NULL, namebuf);
+    }
+    CFRelease(all);
+    return found;
+#else
+    (void)bsd_name;
+    return 0;
+#endif
+}
+
+static int iface_is_thunderbolt(const char *name) {
+    if (tb_net_interface_is_thunderbolt(name, NULL)) return 1;
+    return display_name_says_thunderbolt(name);
+}
+
 static int interface_matches_kind(const char *name, enum tb_lan_interface_kind kind) {
     if (!name || !*name) return 0;
 #if defined(__APPLE__)
@@ -214,6 +270,7 @@ static int get_lan_ip_for_kind(char *buf, size_t bufsz, enum tb_lan_interface_ki
     for (struct ifaddrs *p = ifap; p; p = p->ifa_next) {
         if (!p->ifa_addr) continue;
         if (p->ifa_addr->sa_family != AF_INET) continue;
+        if (iface_is_thunderbolt(p->ifa_name)) continue;
         if (!interface_matches_kind(p->ifa_name, kind)) continue;
 
         char host[NI_MAXHOST];
@@ -236,24 +293,53 @@ int tb_net_is_link_local_ipv4(const char *host) {
     return a == 169 && b == 254 && c <= 255 && d <= 255;
 }
 
+static int up_ipv4_host(struct ifaddrs *p, char *host, size_t hostsz) {
+    if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) return 0;
+    if (!(p->ifa_flags & IFF_UP) || (p->ifa_flags & IFF_LOOPBACK)) return 0;
+    return getnameinfo(p->ifa_addr, sizeof(struct sockaddr_in),
+                       host, (socklen_t)hostsz, NULL, 0, NI_NUMERICHOST) == 0;
+}
+
 int tb_net_get_tb_ip(char *buf, size_t bufsz) {
     struct ifaddrs *ifap = NULL;
+    if (!buf || bufsz == 0) return -1;
+    buf[0] = '\0';
     if (getifaddrs(&ifap) != 0) return -1;
 
     int ret = -1;
+    char static_host[NI_MAXHOST] = {0};
+    /* bridge* is Thunderbolt Bridge whether macOS self-assigned 169.254
+     * or the cable was given a static address. Prefer the link-local
+     * address when both are present so an existing bridge0 dial does
+     * not move. */
     for (struct ifaddrs *p = ifap; p; p = p->ifa_next) {
-        if (!p->ifa_addr) continue;
-        if (p->ifa_addr->sa_family != AF_INET) continue;
-        if (strncmp(p->ifa_name, "bridge", 6) != 0) continue;
-
         char host[NI_MAXHOST];
-        if (getnameinfo(p->ifa_addr, sizeof(struct sockaddr_in),
-                        host, sizeof(host), NULL, 0, NI_NUMERICHOST) == 0) {
-            if (strncmp(host, "169.254.", 8) == 0) {
-                snprintf(buf, bufsz, "%s", host);
-                ret = 0;
-                break;
-            }
+        if (!up_ipv4_host(p, host, sizeof host)) continue;
+        if (!tb_net_interface_is_thunderbolt(p->ifa_name, NULL)) continue;
+        if (strncmp(host, "169.254.", 8) == 0) {
+            snprintf(buf, bufsz, "%s", host);
+            ret = 0;
+            break;
+        }
+        if (static_host[0] == '\0') snprintf(static_host, sizeof static_host, "%s", host);
+    }
+    if (ret != 0 && static_host[0] != '\0') {
+        snprintf(buf, bufsz, "%s", static_host);
+        ret = 0;
+    }
+
+    /* No bridge service: ask macOS. en1 named "Thunderbolt 1" with a
+     * static 10/8 address is the direct cable, and the address heuristic
+     * alone cannot see that. */
+    if (ret != 0) {
+        for (struct ifaddrs *p = ifap; p; p = p->ifa_next) {
+            char host[NI_MAXHOST];
+            if (!up_ipv4_host(p, host, sizeof host)) continue;
+            if (tb_net_interface_is_thunderbolt(p->ifa_name, NULL)) continue;
+            if (!display_name_says_thunderbolt(p->ifa_name)) continue;
+            snprintf(buf, bufsz, "%s", host);
+            ret = 0;
+            break;
         }
     }
     freeifaddrs(ifap);
@@ -271,6 +357,9 @@ int tb_net_get_link_local_ip(char *buf, size_t bufsz) {
         if (!p->ifa_addr) continue;
         if (p->ifa_addr->sa_family != AF_INET) continue;
         if (!is_likely_lan_interface_name(p->ifa_name)) continue;
+        /* A Thunderbolt en* can also be link-local. It belongs to tbIP,
+         * not to the USB-NCM address. */
+        if (iface_is_thunderbolt(p->ifa_name)) continue;
 
         char host[NI_MAXHOST];
         if (getnameinfo(p->ifa_addr, sizeof(struct sockaddr_in),

@@ -35,6 +35,37 @@ final class TBConnectionDiagnosticsTests: XCTestCase {
 
     // MARK: - Direct USB-NCM interface classification
 
+    func testStaticThunderboltBridgeAndNamedPortStayThunderbolt() {
+        XCTAssertEqual(
+            TBConnectionDiagnostics.pathKind(
+                for: Interface(name: "bridge0", ip: "10.0.1.1"),
+                hardwareKinds: [:]
+            ),
+            .thunderbolt
+        )
+        XCTAssertEqual(
+            TBConnectionDiagnostics.pathKind(
+                for: Interface(name: "en1", ip: "10.0.1.2"),
+                hardwareKinds: ["en1": .thunderbolt]
+            ),
+            .thunderbolt
+        )
+        XCTAssertEqual(
+            TBConnectionDiagnostics.pathKind(
+                for: Interface(name: "en0", ip: "10.77.77.1"),
+                hardwareKinds: ["en0": .ethernet]
+            ),
+            .ethernet
+        )
+        XCTAssertEqual(
+            TBConnectionDiagnostics.pathKind(
+                for: Interface(name: "en8", ip: "169.254.190.84"),
+                hardwareKinds: ["en8": .ethernet]
+            ),
+            .usb
+        )
+    }
+
     func testDirectLinkInterfaceAcceptsUSBNCMLinkLocalAddress() {
         XCTAssertTrue(TBConnectionDiagnostics.isDirectLinkInterface(name: "en8", ip: "169.254.190.84"))
         XCTAssertTrue(TBConnectionDiagnostics.isDirectLinkInterface(name: "eth2", ip: "169.254.1.2"))

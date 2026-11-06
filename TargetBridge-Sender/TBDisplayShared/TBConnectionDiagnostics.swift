@@ -173,7 +173,14 @@ enum TBConnectionDiagnostics {
                   let type = SCNetworkInterfaceGetInterfaceType(interface)
             else { continue }
             let bsdName = bsdNameValue as String
-            if CFEqual(type, kSCNetworkInterfaceTypeIEEE80211) {
+            // Thunderbolt's interface type is "Ethernet". The display name is
+            // the signal macOS actually publishes ("Thunderbolt 1",
+            // "Thunderbolt Bridge"). Checked first so a static address on that
+            // port is not classified as a normal LAN.
+            if let display = SCNetworkInterfaceGetLocalizedDisplayName(interface) as String?,
+               display.range(of: "thunderbolt", options: .caseInsensitive) != nil {
+                result[bsdName] = .thunderbolt
+            } else if CFEqual(type, kSCNetworkInterfaceTypeIEEE80211) {
                 result[bsdName] = .wifi
             } else if CFEqual(type, kSCNetworkInterfaceTypeEthernet) {
                 result[bsdName] = .ethernet
@@ -186,7 +193,11 @@ enum TBConnectionDiagnostics {
         for interface: LocalInterface,
         hardwareKinds: [String: TBConnectionPathKind]
     ) -> TBConnectionPathKind? {
-        if interface.name.hasPrefix("bridge"), isIPv4LinkLocal(interface.ip) {
+        // bridge* is the Thunderbolt Bridge service even when its address is
+        // static (10/8) rather than the self-assigned 169.254. An en* port is
+        // Thunderbolt only when macOS names it that way — a bare 10/8 address
+        // stays Ethernet, and a link-local en* stays USB-NCM.
+        if interface.name.hasPrefix("bridge") || hardwareKinds[interface.name] == .thunderbolt {
             return .thunderbolt
         }
         if isDirectLinkInterface(name: interface.name, ip: interface.ip) {

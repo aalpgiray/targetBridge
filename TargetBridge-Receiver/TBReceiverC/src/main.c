@@ -1983,7 +1983,7 @@ int main(int argc, char **argv) {
     if (tb_net_get_tb_ip(tb_ip, sizeof(tb_ip)) == 0) {
         printf("TBReceiver: Thunderbolt Bridge IP = %s\n", tb_ip);
     } else {
-        printf("TBReceiver: warning, no bridge IP detected (169.254.x.x)\n");
+        printf("TBReceiver: warning, no Thunderbolt interface detected\n");
     }
     if (tb_net_get_link_local_ip(usb_ip, sizeof(usb_ip)) == 0) {
         printf("TBReceiver: Direct USB-NCM IP = %s\n", usb_ip);

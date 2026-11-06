@@ -942,6 +942,7 @@ final class TBDisplaySenderService: ObservableObject {
         defer { freeifaddrs(ifaddr) }
 
         var interfaces: [TBLocalLinkInterface] = []
+        let hardwareKinds = TBConnectionDiagnostics.hardwarePathKinds()
         var pointer = ifaddr
         while let iface = pointer {
             defer { pointer = iface.pointee.ifa_next }
@@ -962,7 +963,10 @@ final class TBDisplaySenderService: ObservableObject {
                 NI_NUMERICHOST
             ) == 0 else { continue }
             let ip = String(cString: buffer)
-            if name.hasPrefix("bridge"), ip.hasPrefix("169.254.") {
+            // Same rule as TBConnectionDiagnostics.pathKind: a bridge* interface
+            // is Thunderbolt Bridge with either a self-assigned or a static
+            // address, and an en* interface is Thunderbolt when macOS says so.
+            if name.hasPrefix("bridge") || hardwareKinds[name] == .thunderbolt {
                 interfaces.append(TBLocalLinkInterface(name: name, ip: ip, transportKind: .thunderboltBridge))
                 continue
             }
