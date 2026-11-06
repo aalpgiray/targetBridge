@@ -294,8 +294,17 @@ final class TBInputRelayController {
     }
 
     private func beginKeepAwakeActivity() {
+        // Keep the relay responsive when TargetBridge is not frontmost, without
+        // a sleep assertion. idleSystemSleepDisabled would override
+        // userInitiatedAllowingIdleSystemSleep and pin the MacBook awake for
+        // as long as the relay is running.
+        let power = TBSleepSessionPolicy.streamingPower(preventDisplaySleep: false)
+        var options: ProcessInfo.ActivityOptions = []
+        if power.allowIdleSystemSleep {
+            options.insert(.userInitiatedAllowingIdleSystemSleep)
+        }
         activityToken = ProcessInfo.processInfo.beginActivity(
-            options: [.idleDisplaySleepDisabled, .idleSystemSleepDisabled, .userInitiatedAllowingIdleSystemSleep],
+            options: options,
             reason: Self.keepAwakeReason
         )
     }

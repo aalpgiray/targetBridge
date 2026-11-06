@@ -1243,7 +1243,16 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         }
     }
     @Published var largeCursor: Bool
-    @Published var preventDisplaySleep: Bool = true
+    @Published var preventDisplaySleep: Bool = true {
+        didSet {
+            guard preventDisplaySleep != oldValue else { return }
+            // The toggle is display-sleep only, and it has to take effect on
+            // a stream that is already running. System sleep is never blocked.
+            guard streamingActivity != nil else { return }
+            endCaptureActivity()
+            beginCaptureActivity(wakeDisplay: false)
+        }
+    }
     @Published var autoRestartOnWake: Bool = true
     @Published var verboseDisplayLogging: Bool = false {
         didSet {
@@ -1348,7 +1357,21 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     private var heartbeatSequence: UInt64 = 0
     private var statusState: TBDisplaySenderStatusState = .ready
     private var streamingActivity: NSObjectProtocol?
-    private var displayWakeAssertionID = IOPMAssertionID(0)
+    /// Set only by the public Stop entry (the button, quit, targetbridge://disconnect).
+    /// Wake reconnect and link-loss during display sleep both refuse to run while this is set.
+    private var userInitiatedStop = false
+    /// Non-nil only while this Mac's display is down. "displaySleep" or "systemSleep".
+    /// A dead link in that window is left for wake instead of torn down as Stop.
+    private var senderDisplaySleepReason: String?
+    private var capturePausedForDisplaySleep = false
+    private var wakeReconnectPending = false
+    private var pendingDisplayWake: DispatchWorkItem?
+    /// After a sleep wake commits, ignore the generic capture-restart wake
+    /// path briefly so the unlock notification does not restart capture twice.
+    private var suppressGenericWakeRestartUntil: Date?
+    /// Link loss in this window is still the nap ending, not the user pressing
+    /// Stop, so wake may redial instead of tearing the session down.
+    private var resumeAfterSleepUntil: Date?
     private var lastCheckedCursor: NSCursor?
     private var lastCheckedCursorType: Int = 0
     private var baselineDisplayIDs = Set<CGDirectDisplayID>()
@@ -1594,6 +1617,8 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     func connect() {
+        // A connect, manual or automatic, is no longer "the user pressed Stop".
+        userInitiatedStop = false
         guard connection == nil, !receiverIP.isEmpty, !localInterfaceIP.isEmpty else { return }
         connectTimeoutWorkItem?.cancel()
         connectTimeoutWorkItem = nil
@@ -1663,6 +1688,9 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     self.lastConnectionStateDetail = "waiting(\(error.localizedDescription))"
                     TBLog.connection.warning("connect: waiting — \(error.localizedDescription, privacy: .public)")
                 case .failed(let error):
+                    if self.leaveSessionForWake(detail: "connect failed: \(error.localizedDescription)") {
+                        return
+                    }
                     self.lastConnectionStateDetail = "failed(\(error.localizedDescription))"
                     let detail = TBConnectionDiagnostics.failureDetail(
                         receiverHost: self.receiverIP,
@@ -1809,11 +1837,14 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         persistArrangement: Bool = true,
         completion: (@MainActor @Sendable () -> Void)? = nil
     ) {
+        userInitiatedStop = true
+        pendingDisplayWake?.cancel()
+        pendingDisplayWake = nil
         TBSenderAutomation.suspendAutomaticReconnectAfterUserStop()
         stop(
             resetStatusTo: .stopped,
             persistArrangement: persistArrangement,
-            teardownReason: "sender_user_stop",
+            teardownReason: TBSleepSessionPolicy.userStop,
             teardownCompletion: completion
         )
     }
@@ -1838,6 +1869,25 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         teardownReason: String = "sender_internal_stop",
         teardownCompletion: (@MainActor @Sendable () -> Void)? = nil
     ) {
+        // Sleep is not Stop. A teardown requested while the display is down
+        // leaves the latched session for wake instead of sending user_stop.
+        if !TBSleepSessionPolicy.isExplicitUserStop(teardownReason),
+           leaveSessionForWake(detail: "stop while display asleep (\(teardownReason))") {
+            return
+        }
+        let reason = TBSleepSessionPolicy.teardownReason(
+            userInitiatedStop: userInitiatedStop,
+            requestedReason: teardownReason,
+            displayAsleepReason: senderDisplaySleepReason
+        )
+        if userInitiatedStop || TBSleepSessionPolicy.isExplicitUserStop(reason) {
+            senderDisplaySleepReason = nil
+            wakeReconnectPending = false
+            capturePausedForDisplaySleep = false
+            resumeAfterSleepUntil = nil
+            pendingDisplayWake?.cancel()
+            pendingDisplayWake = nil
+        }
         let connectionToClose = connection
         captureRestartGeneration &+= 1
         isRestartingCaptureAfterWake = false
@@ -1878,7 +1928,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         connectionToClose?.stateUpdateHandler = nil
         connection = nil
         sendTeardownAndClose(
-            reason: teardownReason,
+            reason: reason,
             over: connectionToClose,
             completion: teardownCompletion
         )
@@ -2100,6 +2150,17 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
         send(packet)
     }
 
+    /// Tells the receiver this Mac's display went down, or came back, so the
+    /// reconnect grace does not run across that nap. Transitions only.
+    private func sendSenderDisplaySleep(asleep: Bool, reason: String) {
+        guard isConnected, let packet = TBMonitorProtocol.makeJSONPacket(
+            type: .senderDisplaySleep,
+            value: TBMonitorSenderDisplaySleep(asleep: asleep, reason: reason)
+        ) else { return }
+        NSLog("TargetBridge: display sleep state → asleep=%d reason=%@", asleep ? 1 : 0, reason)
+        send(packet)
+    }
+
     private func sendTeardownAndClose(
         reason: String,
         over connection: NWConnection?,
@@ -2144,6 +2205,10 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                     self.drainPackets()
                 }
                 if error != nil || isDone {
+                    let detail = error.map { $0.localizedDescription } ?? "eof"
+                    if self.leaveSessionForWake(detail: "receive ended: \(detail)") {
+                        return
+                    }
                     if let error {
                         self.setStatus(.connectionClosed(error.localizedDescription))
                     } else if case .startingCapture = self.statusState {
@@ -2855,6 +2920,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
             delegate.onError = { [weak self] error in
                 Task { @MainActor [weak self] in
                     guard let self, self.pipeline === pipeline else { return }
+                    if self.shouldTreatCaptureStopAsDisplaySleep(error),
+                       self.isConnected || self.senderDisplaySleepReason != nil {
+                        self.handleDisplaySleep(fullSystem: false)
+                        return
+                    }
                     self.setStatus(.captureError(self.formattedCaptureErrorMessage(for: error)))
                     self.stop(resetStatusTo: nil)
                 }
@@ -3018,8 +3088,12 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func activityOptions() -> ProcessInfo.ActivityOptions {
-        var options: ProcessInfo.ActivityOptions = [.userInitiated, .idleSystemSleepDisabled]
-        if preventDisplaySleep {
+        let power = TBSleepSessionPolicy.streamingPower(preventDisplaySleep: preventDisplaySleep)
+        var options: ProcessInfo.ActivityOptions = []
+        if power.allowIdleSystemSleep {
+            options.insert(.userInitiatedAllowingIdleSystemSleep)
+        }
+        if power.preventIdleDisplaySleep {
             options.insert(.idleDisplaySleepDisabled)
         }
         return options
@@ -3032,14 +3106,21 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 reason: "TargetBridge streaming active"
             )
         }
-        guard wakeDisplay, preventDisplaySleep else { return }
+        let power = TBSleepSessionPolicy.streamingPower(preventDisplaySleep: preventDisplaySleep)
+        // A one-shot user-activity pulse can light a sleeping panel when a
+        // person starts a session. It is released immediately. Streaming does
+        // not hold an IOPM assertion, and the base activity allows idle system
+        // sleep. preventDisplaySleep only adds idle-display-sleep blocking.
+        guard wakeDisplay, preventDisplaySleep, !power.holdsSleepAssertion else { return }
 
+        var assertion = IOPMAssertionID(0)
         let result = IOPMAssertionDeclareUserActivity(
             "TargetBridge capture requested" as CFString,
             kIOPMUserActiveLocal,
-            &displayWakeAssertionID
+            &assertion
         )
         if result == kIOReturnSuccess {
+            IOPMAssertionRelease(assertion)
             TBLog.connection.info("capture: requested graphical-session wake")
         } else {
             TBLog.connection.error("capture: unable to wake graphical session result=\(result, privacy: .public)")
@@ -3047,10 +3128,6 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func endCaptureActivity() {
-        if displayWakeAssertionID != 0 {
-            IOPMAssertionRelease(displayWakeAssertionID)
-            displayWakeAssertionID = 0
-        }
         if let activity = streamingActivity {
             ProcessInfo.processInfo.endActivity(activity)
             streamingActivity = nil
@@ -3511,10 +3588,44 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
                 self?.handleSystemWake()
             }
         }
+        let displaySleepHandler: @Sendable (Notification) -> Void = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleDisplaySleep(fullSystem: false)
+            }
+        }
+        let systemSleepHandler: @Sendable (Notification) -> Void = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleDisplaySleep(fullSystem: true)
+            }
+        }
 
         wakeObservers.append(
             NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.screensDidSleepNotification,
+                object: nil,
+                queue: nil,
+                using: displaySleepHandler
+            )
+        )
+        wakeObservers.append(
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.willSleepNotification,
+                object: nil,
+                queue: nil,
+                using: systemSleepHandler
+            )
+        )
+        wakeObservers.append(
+            NSWorkspace.shared.notificationCenter.addObserver(
                 forName: NSWorkspace.screensDidWakeNotification,
+                object: nil,
+                queue: nil,
+                using: handler
+            )
+        )
+        wakeObservers.append(
+            NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didWakeNotification,
                 object: nil,
                 queue: nil,
                 using: handler
@@ -3651,8 +3762,236 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func handleSystemWake() {
+        if senderDisplaySleepReason != nil || capturePausedForDisplaySleep || wakeReconnectPending {
+            scheduleDisplayWakeCommit()
+            return
+        }
+        if let until = suppressGenericWakeRestartUntil, Date() < until {
+            return
+        }
         guard autoRestartOnWake else { return }
         scheduleCaptureRestart(reason: "system wake", delaySeconds: 1.0)
+    }
+
+    /// ScreenCaptureKit stops the stream when the display goes down
+    /// (`SCStreamErrorDomain` -3808) and that can land before screensDidSleep.
+    /// That stop is the display sleeping, not a capture fault.
+    private func shouldTreatCaptureStopAsDisplaySleep(_ error: Error) -> Bool {
+        if senderDisplaySleepReason != nil { return true }
+        let nsError = error as NSError
+        return nsError.domain == SCStreamErrorDomain && nsError.code == -3808
+    }
+
+    /// This Mac's display went down, or the whole machine is about to sleep.
+    /// Capture pauses. The connection, virtual display, and heartbeat stay
+    /// up, and the receiver is told so it can hold the last frame. This does
+    /// not call stop().
+    private func handleDisplaySleep(fullSystem: Bool) {
+        pendingDisplayWake?.cancel()
+        pendingDisplayWake = nil
+        guard isConnected || senderDisplaySleepReason != nil else { return }
+        let reason = fullSystem ? TBSleepSessionPolicy.systemSleep : TBSleepSessionPolicy.displaySleep
+        if senderDisplaySleepReason == reason { return }
+        if senderDisplaySleepReason == TBSleepSessionPolicy.systemSleep { return }
+        let alreadyAsleep = senderDisplaySleepReason != nil
+        senderDisplaySleepReason = reason
+        if isConnected {
+            sendSenderDisplaySleep(asleep: true, reason: reason)
+        }
+        if !alreadyAsleep, isStreaming, autoRestartOnWake {
+            NSLog("TargetBridge: display asleep (%@) — pausing capture; session stays up", reason)
+            pauseCaptureForSleep()
+        }
+        // The activity never blocks system sleep. With the display-sleep
+        // toggle off there is nothing left to keep, so drop it. With the
+        // toggle on, the display-sleep block stays; that is the opt-in.
+        if !preventDisplaySleep {
+            endCaptureActivity()
+        }
+    }
+
+    private func pauseCaptureForSleep() {
+        capturePausedForDisplaySleep = true
+        cursorTimer?.invalidate()
+        cursorTimer = nil
+        fpsTimer?.invalidate()
+        fpsTimer = nil
+        firstFrameTimer?.invalidate()
+        firstFrameTimer = nil
+        stopCaptureWatchdog()
+        // Nil the pipeline before stopping the stream so the stream's error
+        // callback does not see a live pipeline and call stop().
+        let pipelineToStop = pipeline
+        pipeline = nil
+        pipelineToStop?.stop()
+        captureDelegate = nil
+        if let directDisplayStream {
+            directDisplayStream.stop()
+            self.directDisplayStream = nil
+        }
+        if let stream = scStream {
+            stream.stopCapture(completionHandler: nil)
+            scStream = nil
+        }
+        liveMetrics.senderFPS = 0
+        senderFPS = 0
+        sentSnapshot = 0
+        cursorDisplayID = kCGNullDirectDisplay
+        lastCursorPacket = nil
+        // isStreaming stays true: wake still has a session to bring back.
+    }
+
+    /// The TCP session died while the display was asleep. Do not send
+    /// user_stop and do not destroy the virtual display. Wake redials.
+    private func noteLinkLostDuringDisplaySleep(_ detail: String) {
+        guard senderDisplaySleepReason != nil, !userInitiatedStop else { return }
+        NSLog("TargetBridge: link ended during display sleep (%@) — leaving the session for wake", detail)
+        wakeReconnectPending = true
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
+        connectTimeoutWorkItem?.cancel()
+        connectTimeoutWorkItem = nil
+        if pipeline != nil || scStream != nil || directDisplayStream != nil {
+            pauseCaptureForSleep()
+        }
+        let dead = connection
+        connection = nil
+        isConnected = false
+        dead?.stateUpdateHandler = nil
+        dead?.cancel()
+    }
+
+    private func leaveSessionForWake(detail: String) -> Bool {
+        let resumeWindow = resumeAfterSleepUntil.map { Date() < $0 } ?? false
+        let asleep = senderDisplaySleepReason != nil || resumeWindow
+        guard TBSleepSessionPolicy.shouldLeaveSessionForWake(
+            displayAsleep: asleep,
+            userInitiatedStop: userInitiatedStop
+        ) else { return false }
+        let stillAsleep = senderDisplaySleepReason != nil
+        if senderDisplaySleepReason == nil {
+            senderDisplaySleepReason = TBSleepSessionPolicy.displaySleep
+        }
+        noteLinkLostDuringDisplaySleep(detail)
+        // The machine is already awake and the link just died. Redial.
+        // While the display is still down, the wake notification does that.
+        if !stillAsleep {
+            scheduleDisplayWakeCommit()
+        }
+        return true
+    }
+
+    private func scheduleDisplayWakeCommit() {
+        pendingDisplayWake?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.commitDisplayWake()
+            }
+        }
+        pendingDisplayWake = work
+        // Lock settling delivers wake and then sleep again. A sleep in this
+        // window cancels the work item in handleDisplaySleep.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: work)
+    }
+
+    private func commitDisplayWake() {
+        pendingDisplayWake = nil
+        let latched = senderDisplaySleepReason != nil || capturePausedForDisplaySleep || wakeReconnectPending
+        guard latched else { return }
+        if userInitiatedStop {
+            senderDisplaySleepReason = nil
+            capturePausedForDisplaySleep = false
+            wakeReconnectPending = false
+            resumeAfterSleepUntil = nil
+            return
+        }
+        let reason = senderDisplaySleepReason ?? TBSleepSessionPolicy.displaySleep
+        senderDisplaySleepReason = nil
+        suppressGenericWakeRestartUntil = Date().addingTimeInterval(3)
+        resumeAfterSleepUntil = Date().addingTimeInterval(20)
+        beginCaptureActivity(wakeDisplay: false)
+        let sessionLatched = isStreaming || wakeReconnectPending || capturePausedForDisplaySleep
+        if isConnected, connection != nil {
+            sendSenderDisplaySleep(asleep: false, reason: reason)
+            capturePausedForDisplaySleep = false
+            wakeReconnectPending = false
+            guard TBSleepSessionPolicy.shouldReconnectAfterWake(
+                userInitiatedStop: userInitiatedStop,
+                autoRestartOnWake: autoRestartOnWake,
+                sessionLatched: sessionLatched
+            ) else { return }
+            if pipeline == nil, let profile = activeProfile, isStreaming {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let started = await self.startCapture(for: profile)
+                    if !started {
+                        NSLog("TargetBridge: capture resume after wake failed — reconnecting")
+                        self.reconnectSessionAfterSleep()
+                    }
+                }
+            } else {
+                scheduleCaptureRestart(reason: "display wake (\(reason))", delaySeconds: 0.0)
+            }
+            return
+        }
+        capturePausedForDisplaySleep = false
+        guard TBSleepSessionPolicy.shouldReconnectAfterWake(
+            userInitiatedStop: userInitiatedStop,
+            autoRestartOnWake: autoRestartOnWake,
+            sessionLatched: sessionLatched || wakeReconnectPending
+        ) else {
+            wakeReconnectPending = false
+            return
+        }
+        wakeReconnectPending = false
+        reconnectSessionAfterSleep()
+    }
+
+    /// The link did not survive the nap. Redial the same receiver. This is
+    /// not a user stop, so the receiver keeps the last frame until frames
+    /// return. The old virtual display is dropped first so connect() can
+    /// create one session, not two.
+    private func reconnectSessionAfterSleep() {
+        guard !userInitiatedStop else { return }
+        guard !receiverIP.isEmpty, !localInterfaceIP.isEmpty else {
+            NSLog("TargetBridge: wake reconnect skipped — no receiver address")
+            isStreaming = false
+            return
+        }
+        NSLog("TargetBridge: wake reconnect — redialing preserved receiver")
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
+        cursorTimer?.invalidate()
+        cursorTimer = nil
+        fpsTimer?.invalidate()
+        fpsTimer = nil
+        firstFrameTimer?.invalidate()
+        firstFrameTimer = nil
+        stopCaptureWatchdog()
+        let dead = connection
+        connection = nil
+        isConnected = false
+        isStreaming = false
+        dead?.stateUpdateHandler = nil
+        dead?.cancel()
+        pipeline?.stop()
+        pipeline = nil
+        captureDelegate = nil
+        if let stream = scStream {
+            stream.stopCapture(completionHandler: nil)
+            scStream = nil
+        }
+        if let directDisplayStream {
+            directDisplayStream.stop()
+            self.directDisplayStream = nil
+        }
+        let currentSession = session
+        session = ReceiverBackedVirtualDisplaySession()
+        Task { @MainActor in
+            currentSession.destroy()
+        }
+        activeProfile = nil
+        connect()
     }
 
     func restartCaptureNow() {
@@ -3731,6 +4070,7 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private func handleFirstEncodedFrame() {
+        resumeAfterSleepUntil = nil
         guard !sessionAckSent else { return }
         sessionAckSent = true
         firstFrameTimer?.invalidate()

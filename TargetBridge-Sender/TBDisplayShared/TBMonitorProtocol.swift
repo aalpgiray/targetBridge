@@ -19,6 +19,10 @@ enum TBMonitorPacketType: UInt8 {
     case volume = 0x37
     /// Night Shift / True Tone on the receiver's panel.
     case displayTweaks = 0x38
+    /// Whether this Mac's display is down, sender -> receiver.
+    /// Transitions only. The receiver keeps its last frame across the nap
+    /// and does not run the reconnect grace while `asleep` is true.
+    case senderDisplaySleep = 0x3A
     case testData = 0x40
 }
 
@@ -66,6 +70,13 @@ struct TBMonitorHeartbeat: Codable {
 }
 
 struct TBMonitorTeardown: Codable {
+    var reason: String
+}
+
+/// Payload for `senderDisplaySleep`. `reason` is `displaySleep` or
+/// `systemSleep`. The receiver keys the grace off `asleep`.
+struct TBMonitorSenderDisplaySleep: Codable {
+    var asleep: Bool
     var reason: String
 }
 

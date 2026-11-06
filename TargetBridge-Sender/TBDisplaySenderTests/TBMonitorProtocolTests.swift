@@ -327,4 +327,94 @@ final class TBMonitorProtocolTests: XCTestCase {
     func testInputEventEncoderParityExtremeValues() {
         assertEncoderParity(makeEvent(kind: "move", dx: Int.min, dy: Int.max))
     }
+
+    func testSenderDisplaySleepPacket() throws {
+        XCTAssertEqual(TBMonitorPacketType.senderDisplaySleep.rawValue, 0x3A)
+        let packet = try XCTUnwrap(TBMonitorProtocol.makeJSONPacket(
+            type: .senderDisplaySleep,
+            value: TBMonitorSenderDisplaySleep(asleep: true, reason: TBSleepSessionPolicy.displaySleep)
+        ))
+        var buffer = packet
+        let drained = try XCTUnwrap(TBMonitorProtocol.drainPacket(from: &buffer))
+        XCTAssertEqual(drained.0, .senderDisplaySleep)
+        let decoded = try XCTUnwrap(TBMonitorProtocol.decodeJSON(TBMonitorSenderDisplaySleep.self, from: drained.1))
+        XCTAssertTrue(decoded.asleep)
+        XCTAssertEqual(decoded.reason, "displaySleep")
+        XCTAssertTrue(buffer.isEmpty)
+    }
+
+    func testSleepSessionPolicyDoesNotHoldASleepAssertion() {
+        let streaming = TBSleepSessionPolicy.streamingPower(preventDisplaySleep: true)
+        XCTAssertTrue(streaming.allowIdleSystemSleep)
+        XCTAssertTrue(streaming.preventIdleDisplaySleep)
+        XCTAssertFalse(streaming.holdsSleepAssertion)
+
+        let sleeping = TBSleepSessionPolicy.streamingPower(preventDisplaySleep: false)
+        XCTAssertTrue(sleeping.allowIdleSystemSleep)
+        XCTAssertFalse(sleeping.preventIdleDisplaySleep)
+        XCTAssertFalse(sleeping.holdsSleepAssertion)
+    }
+
+    func testSleepTeardownReasonDistinguishesStopFromSleep() {
+        XCTAssertEqual(
+            TBSleepSessionPolicy.teardownReason(
+                userInitiatedStop: true,
+                requestedReason: "sender_internal_stop",
+                displayAsleepReason: TBSleepSessionPolicy.displaySleep
+            ),
+            "user_stop"
+        )
+        XCTAssertEqual(
+            TBSleepSessionPolicy.teardownReason(
+                userInitiatedStop: false,
+                requestedReason: "sender_internal_stop",
+                displayAsleepReason: TBSleepSessionPolicy.systemSleep
+            ),
+            "systemSleep"
+        )
+        XCTAssertEqual(
+            TBSleepSessionPolicy.teardownReason(
+                userInitiatedStop: false,
+                requestedReason: "sender_user_stop",
+                displayAsleepReason: nil
+            ),
+            "sender_user_stop"
+        )
+        XCTAssertTrue(TBSleepSessionPolicy.isExplicitUserStop("user_stop"))
+        XCTAssertTrue(TBSleepSessionPolicy.isExplicitUserStop("sender_stop"))
+        XCTAssertTrue(TBSleepSessionPolicy.isExplicitUserStop("sender_user_stop"))
+        XCTAssertFalse(TBSleepSessionPolicy.isExplicitUserStop("displaySleep"))
+        XCTAssertFalse(TBSleepSessionPolicy.isExplicitUserStop("systemSleep"))
+    }
+
+    func testWakeReconnectsUnlessTheUserStopped() {
+        XCTAssertFalse(TBSleepSessionPolicy.shouldLeaveSessionForWake(
+            displayAsleep: true,
+            userInitiatedStop: true
+        ))
+        XCTAssertTrue(TBSleepSessionPolicy.shouldLeaveSessionForWake(
+            displayAsleep: true,
+            userInitiatedStop: false
+        ))
+        XCTAssertFalse(TBSleepSessionPolicy.shouldReconnectAfterWake(
+            userInitiatedStop: true,
+            autoRestartOnWake: true,
+            sessionLatched: true
+        ))
+        XCTAssertTrue(TBSleepSessionPolicy.shouldReconnectAfterWake(
+            userInitiatedStop: false,
+            autoRestartOnWake: true,
+            sessionLatched: true
+        ))
+        XCTAssertFalse(TBSleepSessionPolicy.shouldReconnectAfterWake(
+            userInitiatedStop: false,
+            autoRestartOnWake: false,
+            sessionLatched: true
+        ))
+        XCTAssertFalse(TBSleepSessionPolicy.shouldReconnectAfterWake(
+            userInitiatedStop: false,
+            autoRestartOnWake: true,
+            sessionLatched: false
+        ))
+    }
 }
