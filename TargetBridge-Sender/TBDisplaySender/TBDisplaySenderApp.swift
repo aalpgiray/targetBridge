@@ -3,8 +3,19 @@ import ApplicationServices
 import Darwin
 import SwiftUI
 
+/// Puts the previous output device back if the process is disappearing
+/// while TargetBridge is still the default. The loopback socket dies with
+/// the process; restoring first is what keeps CoreAudio from picking an
+/// arbitrary device when the driver then removes ours.
+final class TBAudioOutputRestoreDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        TBDefaultOutputGuard.shared.restoreIfSelected()
+    }
+}
+
 @main
 struct TBDisplaySenderApp: App {
+    @NSApplicationDelegateAdaptor(TBAudioOutputRestoreDelegate.self) private var audioOutputRestoreDelegate
     @StateObject private var service: TBDisplaySenderService
     private let statusItemController: TBDisplaySenderStatusItemController
 

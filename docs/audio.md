@@ -118,3 +118,24 @@ Developers can tweak the following properties in `main.c` depending on hardware 
 2. **`cap_bytes` (Latency Threshold)**:
    - Configured at `28800` bytes (150ms) to cushion against ScreenCaptureKit variable delivery chunks and socket congestion.
    - If H.264 video decoding takes longer on a specific system, this can be adjusted to match video latency.
+
+---
+
+## Optional virtual output
+
+The Audio Driver addon can present the receiver's speakers as a normal output
+named **TargetBridge** in Sound settings. It is off until the addon is enabled,
+and the driver bundle is installed by hand (`TargetBridge-AudioDriver/README.md`).
+The receiver protocol does not change: the driver hands the sender 32-bit float
+frames on loopback, and the sender narrows them to the existing 16-bit
+`TB_PKT_AUDIO_FRAME` packets.
+
+The device is listed only while a session is actually streaming. The sender
+answers the driver's probe (UDP `127.0.0.1:51710`) only then, and for 8 seconds
+after the last session stops. The driver removes the device after three refused
+probes, about three seconds after that socket closes. A reconnect that is
+streaming again inside the 8 seconds never closes the socket, so the device
+does not disappear and reappear and the selected output is left where it is.
+
+With the addon on, ScreenCaptureKit audio capture is not started. Sound reaches
+the receiver only when an app (or the system) plays to the TargetBridge device.

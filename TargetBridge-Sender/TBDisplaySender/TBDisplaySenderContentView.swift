@@ -673,7 +673,7 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
                         }
                     }
 
-                    if service.audioRelayAvailable {
+                    if service.audioTransportAvailable {
                         settingRow(TBDisplaySenderL10n.streamAudio(service.language), details: audioDetails) {
                             Toggle("", isOn: $session.audioEnabled)
                                 .labelsHidden()
@@ -1084,11 +1084,11 @@ private struct TBDisplaySenderSessionSettingsSheet: View {
 
     private var audioDetails: String {
         switch service.language {
-        case .italian: return "Invia anche l'audio di sistema del sender al receiver per questa sessione."
-        case .english: return "Also send the sender’s system audio to the receiver for this session."
-        case .german: return "Überträgt für diese Sitzung auch den Systemton des Senders an den Empfänger."
-        case .french: return "Envoie aussi l’audio système du sender au receiver pour cette session."
-        case .chinese: return "同时将 sender 的系统音频传到此会话的 receiver。"
+        case .italian: return "Invia l'audio al receiver per questa sessione. Con il driver audio, è ciò che viene riprodotto sul dispositivo TargetBridge."
+        case .english: return "Send audio to the receiver for this session. With the audio driver, that is whatever is playing to the TargetBridge device."
+        case .german: return "Überträgt den Ton dieser Sitzung an den Empfänger. Mit dem Audiotreiber ist das alles, was auf dem Gerät TargetBridge wiedergegeben wird."
+        case .french: return "Envoie l’audio au receiver pour cette session. Avec le pilote audio, il s’agit de ce qui est lu sur le périphérique TargetBridge."
+        case .chinese: return "将此会话的音频发送到 receiver。启用音频驱动时，发送的是播放到 TargetBridge 设备的声音。"
         }
     }
 

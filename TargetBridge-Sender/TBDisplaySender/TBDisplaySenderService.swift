@@ -1225,6 +1225,11 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     @Published var receiverSupportsNightShift = false
     @Published var receiverSupportsTrueTone = false
     var audioAddonAvailable = true
+    /// When set, system-audio capture is left off and PCM arrives from the
+    /// virtual output device instead. The app owns the socket; this session
+    /// only forwards.
+    var audioDriverAvailable = false
+    private var audioVolumeObserver: TBAudioDeviceVolumeObserver?
     var receiverSupportsHEVCDecodeHint: Bool?
     var receiverInputMonitoringTrustedHint: Bool?
     var receiverAccessibilityTrustedHint: Bool?
@@ -3836,7 +3841,34 @@ final class TBDisplaySenderSession: NSObject, ObservableObject, Identifiable, @u
     }
 
     private var shouldRelayAudio: Bool {
-        audioEnabled && audioAddonAvailable
+        // The virtual device replaces ScreenCaptureKit audio. Capturing both
+        // would send the mix twice.
+        audioEnabled && audioAddonAvailable && !audioDriverAvailable
+    }
+
+    /// PCM from the app-level driver listener, already float32 stereo at 48 kHz.
+    /// Narrowed to the Int16 frames the receiver already accepts.
+    func acceptDriverAudio(_ pcm: Data) {
+        guard audioEnabled, isStreaming else { return }
+        let payload = TBAudioWireFormat.int16Data(fromFloat32: pcm)
+        send(TBMonitorProtocol.makePacket(type: .audioFrame, payload: payload))
+    }
+
+    func startAudioVolumeMirrorIfNeeded() {
+        guard audioDriverAvailable, audioVolumeObserver == nil else { return }
+        let observer = TBAudioDeviceVolumeObserver { [weak self] level in
+            Task { @MainActor in
+                guard let self else { return }
+                if abs(self.volume - level) > 0.005 { self.volume = level }
+            }
+        }
+        observer.start(deviceUID: TBAudioDriverReceiver.deviceUID)
+        audioVolumeObserver = observer
+    }
+
+    func stopAudioVolumeMirror() {
+        audioVolumeObserver?.stop()
+        audioVolumeObserver = nil
     }
 
     private func send(_ packet: Data) {

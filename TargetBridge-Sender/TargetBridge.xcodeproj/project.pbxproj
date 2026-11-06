@@ -9,6 +9,13 @@
 /* Begin PBXBuildFile section */
 		06E4F7B33C77762A5E2CB616 /* TBReceiverDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06BABA1447D1E8DD50A6C2F0 /* TBReceiverDiscovery.swift */; };
 		0D17E4E85D8E9CDAB8707EB6 /* audio-relay.json in Resources */ = {isa = PBXBuildFile; fileRef = A3964153C9F34085F90C2C26 /* audio-relay.json */; };
+		B7E3C91B04D25F6881C0E4A3 /* TBAudioWireFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7E3C91B04D25F6881C0E4A2 /* TBAudioWireFormat.swift */; };
+		D7E3C91B04D25F6881C0E4A5 /* TBAudioDevicePresence.swift in Sources */ = {isa = PBXBuildFile; fileRef = C7E3C91B04D25F6881C0E4A4 /* TBAudioDevicePresence.swift */; };
+		F7E3C91B04D25F6881C0E4A7 /* TBAudioDriverReceiver.swift in Sources */ = {isa = PBXBuildFile; fileRef = E7E3C91B04D25F6881C0E4A6 /* TBAudioDriverReceiver.swift */; };
+		B8E3C91B04D25F6881C0E4A9 /* TBAudioDeviceVolumeObserver.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8E3C91B04D25F6881C0E4A8 /* TBAudioDeviceVolumeObserver.swift */; };
+		D8E3C91B04D25F6881C0E4AB /* TBDefaultOutputGuard.swift in Sources */ = {isa = PBXBuildFile; fileRef = C8E3C91B04D25F6881C0E4AA /* TBDefaultOutputGuard.swift */; };
+		F8E3C91B04D25F6881C0E4AD /* audio-driver.json in Resources */ = {isa = PBXBuildFile; fileRef = E8E3C91B04D25F6881C0E4AC /* audio-driver.json */; };
+		B9E3C91B04D25F6881C0E4AF /* TBAudioDevicePresenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9E3C91B04D25F6881C0E4AE /* TBAudioDevicePresenceTests.swift */; };
 		0E118FC7EFBBF44A70799B03 /* TBInjectedClickStateTrackerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF17070AC1C6F9E9F3B4DFDF /* TBInjectedClickStateTrackerTests.swift */; };
 		15D142162EDD10261447EC43 /* TBInputBindingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37515A84B71F4B19C8EB65B4 /* TBInputBindingTests.swift */; };
 		198725EB3B2C7662DBB0B8D0 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1819A55F8D993D9347F0E407 /* Assets.xcassets */; };
@@ -113,6 +120,13 @@
 		9CEA5EB707F01E1708DA9170 /* TBDisplaySenderAutomation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBDisplaySenderAutomation.swift; sourceTree = "<group>"; };
 		9D063CAADA68CC48C54157FB /* TBDisplaySenderLocalization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBDisplaySenderLocalization.swift; sourceTree = "<group>"; };
 		A3964153C9F34085F90C2C26 /* audio-relay.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "audio-relay.json"; sourceTree = "<group>"; };
+		A7E3C91B04D25F6881C0E4A2 /* TBAudioWireFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBAudioWireFormat.swift; sourceTree = "<group>"; };
+		C7E3C91B04D25F6881C0E4A4 /* TBAudioDevicePresence.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBAudioDevicePresence.swift; sourceTree = "<group>"; };
+		E7E3C91B04D25F6881C0E4A6 /* TBAudioDriverReceiver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBAudioDriverReceiver.swift; sourceTree = "<group>"; };
+		A8E3C91B04D25F6881C0E4A8 /* TBAudioDeviceVolumeObserver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBAudioDeviceVolumeObserver.swift; sourceTree = "<group>"; };
+		C8E3C91B04D25F6881C0E4AA /* TBDefaultOutputGuard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBDefaultOutputGuard.swift; sourceTree = "<group>"; };
+		E8E3C91B04D25F6881C0E4AC /* audio-driver.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "audio-driver.json"; sourceTree = "<group>"; };
+		A9E3C91B04D25F6881C0E4AE /* TBAudioDevicePresenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBAudioDevicePresenceTests.swift; sourceTree = "<group>"; };
 		A3F0782C970AA23871AE73A6 /* TBConfigurationDiagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBConfigurationDiagnostics.swift; sourceTree = "<group>"; };
 		A51B69D318A85FF3061D6ED4 /* input-dockstation.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "input-dockstation.json"; sourceTree = "<group>"; };
 		A7086193EE5710E2C37F86F1 /* TBConfigurationDiagnosticsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TBConfigurationDiagnosticsTests.swift; sourceTree = "<group>"; };
@@ -145,6 +159,7 @@
 			isa = PBXGroup;
 			children = (
 				A3964153C9F34085F90C2C26 /* audio-relay.json */,
+				E8E3C91B04D25F6881C0E4AC /* audio-driver.json */,
 				A51B69D318A85FF3061D6ED4 /* input-dockstation.json */,
 				6579B499CBC11196966318EA /* network-link.json */,
 			);
@@ -155,6 +170,9 @@
 			isa = PBXGroup;
 			children = (
 				C242540F9DE94E1364F106F4 /* ReceiverBackedVirtualDisplaySession.swift */,
+				A8E3C91B04D25F6881C0E4A8 /* TBAudioDeviceVolumeObserver.swift */,
+				E7E3C91B04D25F6881C0E4A6 /* TBAudioDriverReceiver.swift */,
+				C8E3C91B04D25F6881C0E4AA /* TBDefaultOutputGuard.swift */,
 				3E8E93993FCAE2FCBA71C45B /* TBCaptureHealth.swift */,
 				A3F0782C970AA23871AE73A6 /* TBConfigurationDiagnostics.swift */,
 				4E4C95A1820A99E5DAED17DE /* TBDisplayProfile.swift */,
@@ -190,6 +208,7 @@
 		578C8E4277884577DC1F2820 /* TBDisplaySenderTests */ = {
 			isa = PBXGroup;
 			children = (
+				A9E3C91B04D25F6881C0E4AE /* TBAudioDevicePresenceTests.swift */,
 				C11B4EB862393E5CE95426D4 /* TBCaptureHealthTests.swift */,
 				A7086193EE5710E2C37F86F1 /* TBConfigurationDiagnosticsTests.swift */,
 				405452C4DA622D0B8887623E /* TBConnectionDiagnosticsTests.swift */,
@@ -211,6 +230,8 @@
 			isa = PBXGroup;
 			children = (
 				59E4D00FB492A41B5218CD52 /* TBAddonManifest.swift */,
+				C7E3C91B04D25F6881C0E4A4 /* TBAudioDevicePresence.swift */,
+				A7E3C91B04D25F6881C0E4A2 /* TBAudioWireFormat.swift */,
 				06D011FF8AF7BB6D26EDC25B /* TBAddonStore.swift */,
 				FD6EB41D253E67E350F5E25D /* TBConnectionDiagnostics.swift */,
 				80543A7A5A3B583C1543ABC7 /* TBInputDebugLog.swift */,
@@ -358,6 +379,7 @@
 			files = (
 				198725EB3B2C7662DBB0B8D0 /* Assets.xcassets in Resources */,
 				0D17E4E85D8E9CDAB8707EB6 /* audio-relay.json in Resources */,
+				F8E3C91B04D25F6881C0E4AD /* audio-driver.json in Resources */,
 				BF146F68BB365CFE5AA9A1BD /* check_localizations.sh in Resources */,
 				7F1AE9053DA59169FB761FAA /* de.json in Resources */,
 				96DDF119DE60DFBA437D32D2 /* en.json in Resources */,
@@ -397,6 +419,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B9E3C91B04D25F6881C0E4AF /* TBAudioDevicePresenceTests.swift in Sources */,
 				83FB3853596BEDEFAC5E129A /* TBCaptureHealthTests.swift in Sources */,
 				7528751850893B52660870E4 /* TBConfigurationDiagnosticsTests.swift in Sources */,
 				7F103818097EEBD191C5ADBF /* TBConnectionDiagnosticsTests.swift in Sources */,
@@ -419,6 +442,11 @@
 			files = (
 				337BD561622AA19F43D3B95B /* ReceiverBackedVirtualDisplaySession.swift in Sources */,
 				4B770D1232C53EF66F011F7F /* TBAddonManifest.swift in Sources */,
+				D7E3C91B04D25F6881C0E4A5 /* TBAudioDevicePresence.swift in Sources */,
+				B7E3C91B04D25F6881C0E4A3 /* TBAudioWireFormat.swift in Sources */,
+				B8E3C91B04D25F6881C0E4A9 /* TBAudioDeviceVolumeObserver.swift in Sources */,
+				F7E3C91B04D25F6881C0E4A7 /* TBAudioDriverReceiver.swift in Sources */,
+				D8E3C91B04D25F6881C0E4AB /* TBDefaultOutputGuard.swift in Sources */,
 				E81B28F81AE82FF904E0871F /* TBAddonStore.swift in Sources */,
 				50C6F9D35F964ABF03193C5B /* TBCaptureHealth.swift in Sources */,
 				2819CE06D15CA7EDD1069062 /* TBConfigurationDiagnostics.swift in Sources */,

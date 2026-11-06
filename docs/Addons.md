@@ -19,7 +19,19 @@ The current official manifests bundled with the app are:
 
 - `Network Link`
 - `Audio Relay`
+- `Audio Driver`
 - `Input Dockstation`
+
+Audio Driver
+------------
+
+`audio-driver` is off by default. It does not install anything by itself.
+
+Build and install `TargetBridge-AudioDriver` by hand, then enable the addon.
+The sender then publishes an output named TargetBridge only while a session is
+streaming to a connected receiver, and keeps it for a few seconds after the
+link drops so a short reconnect does not flicker the device. See
+`TargetBridge-AudioDriver/README.md`.
 
 Bundled official addon manifests also ship inside the app bundle and are mirrored to:
 
@@ -82,6 +94,7 @@ Current capability identifiers
 
 - `network-link`
 - `audio-relay`
+- `audio-driver`
 - `input-dockstation`
 
 Input Dockstation
