@@ -68,9 +68,11 @@ TEST_CFLAGS = -O2 -g -Wall -Wextra -Wno-unused-parameter -std=c11
 TEST_BIN = test_net_parser
 TEST_DPCM_BIN = test_dpcm
 TEST_HOLD_BIN = test_reconnect_hold
+# net.c asks SystemConfiguration which port macOS calls Thunderbolt.
+TEST_NET_LIBS = $(if $(filter Darwin,$(shell uname -s)),-framework SystemConfiguration -framework CoreFoundation,)
 
 $(TEST_BIN): tests/test_net_parser.c src/net.c src/net.h src/proto.h
-	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_parser.c src/net.c -o $@
+	$(CC) $(TEST_CFLAGS) -Isrc tests/test_net_parser.c src/net.c -o $@ $(TEST_NET_LIBS)
 
 $(TEST_DPCM_BIN): tests/test_dpcm.c $(CODEC)/tb_dpcm.c $(CODEC)/tb_dpcm.h
 	$(CC) $(TEST_CFLAGS) -I$(CODEC) tests/test_dpcm.c $(CODEC)/tb_dpcm.c -o $@
